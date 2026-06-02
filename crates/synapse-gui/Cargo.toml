@@ -1,0 +1,30 @@
+[package]
+name = "synapse-gui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Local web GUI for the Synapse distributed inference network"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { version = "0.7", features = ["ws", "macros"] }
+clap = { workspace = true }
+futures = { workspace = true }
+mime_guess = "2"
+rand = { workspace = true }
+rust-embed = "8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+synapse-core = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "net", "sync"] }
+toml = { workspace = true }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

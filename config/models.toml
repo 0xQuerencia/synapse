@@ -1,0 +1,7 @@
+[dev]
+id = "hf-internal-testing/tiny-random-LlamaForCausalLM"
+purpose = "Fast CI and localhost protocol validation"
+
+[demo]
+id = "HuggingFaceTB/SmolLM2-135M-Instruct"
+purpose = "First real LAN demo candidate after Candle wiring"

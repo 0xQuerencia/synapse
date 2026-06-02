@@ -1,0 +1,1461 @@
+use std::{collections::HashSet, sync::Arc, time::Instant};
+
+use libp2p::{PeerId, request_response};
+use tracing::{info, warn};
+
+use super::{
+    BatchPromptRequest, ChatEvent, GenerationRoutePlan, InFlightActivationHop, InFlightRequest,
+    MAX_BATCH_SIZE, StopReason, SynapseNode, SynapseRole, WORKER_HOP_TIMEOUT,
+    WorkerCapabilitySnapshot, WorkerRouteHop,
+};
+use crate::inference::{ToyLlama, payload_to_tensor, tensor_to_payload};
+use crate::{WeightedShardParticipant, plan_static_shards, plan_weighted_shards};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivationPass {
+    Prefill,
+    Decode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RouteParticipant {
+    Master,
+    Worker(PeerId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RouteWorkerCandidate {
+    peer_id: PeerId,
+    capability: Option<crate::NodeCapability>,
+}
+
+impl ActivationPass {
+    fn for_sequence_position(sequence_position: usize) -> Self {
+        if sequence_position == 0 {
+            Self::Prefill
+        } else {
+            Self::Decode
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+        }
+    }
+}
+
+fn activation_tokens_for_position(
+    token_ids: &[u32],
+    sequence_position: usize,
+) -> Result<(ActivationPass, Vec<u32>), String> {
+    if token_ids.is_empty() {
+        return Err("generation requires at least one token".to_owned());
+    }
+
+    let pass = ActivationPass::for_sequence_position(sequence_position);
+    let tokens = match pass {
+        ActivationPass::Prefill => token_ids.to_vec(),
+        ActivationPass::Decode => vec![
+            *token_ids
+                .last()
+                .ok_or_else(|| "decode requires at least one token".to_owned())?,
+        ],
+    };
+
+    Ok((pass, tokens))
+}
+
+fn activation_trace_id(sequence_position: usize, hop_index: usize) -> String {
+    format!("gen-step-{sequence_position}-hop-{hop_index}")
+}
+
+fn build_generation_route(
+    total_layers: usize,
+    master_capability: Option<crate::NodeCapability>,
+    workers_in_order: &[RouteWorkerCandidate],
+) -> Result<GenerationRoutePlan, String> {
+    let mut participants = Vec::with_capacity(workers_in_order.len() + 1);
+    participants.push(RouteParticipant::Master);
+    participants.extend(
+        workers_in_order
+            .iter()
+            .map(|worker| RouteParticipant::Worker(worker.peer_id)),
+    );
+
+    let weighted_inputs = master_capability.and_then(|master_capability| {
+        let mut weighted = Vec::with_capacity(workers_in_order.len() + 1);
+        weighted.push(WeightedShardParticipant {
+            participant: RouteParticipant::Master,
+            capability: master_capability,
+        });
+        for worker in workers_in_order {
+            let capability = worker.capability?;
+            weighted.push(WeightedShardParticipant {
+                participant: RouteParticipant::Worker(worker.peer_id),
+                capability,
+            });
+        }
+        Some(weighted)
+    });
+
+    let assignments = if let Some(weighted_inputs) = weighted_inputs {
+        plan_weighted_shards(total_layers, &weighted_inputs)
+            .map_err(|error| format!("failed to build weighted generation route: {error}"))?
+    } else {
+        plan_static_shards(total_layers, &participants)
+            .map_err(|error| format!("failed to build static generation route: {error}"))?
+    };
+
+    let mut master_layer_range = None;
+    let mut worker_hops = Vec::new();
+
+    for assignment in assignments {
+        match assignment.participant {
+            RouteParticipant::Master => {
+                master_layer_range = Some(assignment.layer_range);
+            }
+            RouteParticipant::Worker(peer_id) => worker_hops.push(WorkerRouteHop {
+                peer_id,
+                layer_range: assignment.layer_range,
+            }),
+        }
+    }
+
+    let master_layer_range = master_layer_range.ok_or_else(|| {
+        "invalid generation route: master shard was not assigned any layers".to_owned()
+    })?;
+
+    Ok(GenerationRoutePlan {
+        master_layer_range,
+        worker_hops,
+    })
+}
+
+fn ensure_worker_available(
+    peer_id: PeerId,
+    available_workers: &HashSet<PeerId>,
+) -> Result<(), String> {
+    if available_workers.contains(&peer_id) {
+        return Ok(());
+    }
+    Err(format!("expected worker {peer_id} unavailable"))
+}
+
+impl SynapseNode {
+    /// Called when a new prompt arrives from the CLI REPL channel.
+    pub(super) fn handle_new_prompt(&mut self, prompt: String) {
+        let tokenizer = match &self.tokenizer {
+            Some(tokenizer) => Arc::clone(tokenizer),
+            None => {
+                self.fail_generation("tokenizer not loaded");
+                return;
+            }
+        };
+
+        // Tokenize the prompt (already formatted with chat template by CLI)
+        let ids = match tokenizer.encode(&prompt, false) {
+            Ok(ids) => ids,
+            Err(error) => {
+                self.fail_generation(format!("failed to tokenize prompt: {error}"));
+                return;
+            }
+        };
+
+        info!(
+            token_count = ids.len(),
+            "prompt tokenized — starting generation"
+        );
+
+        self.begin_generation_from_ids(ids);
+    }
+
+    /// Shared generation setup used by both single-prompt and batch paths.
+    fn begin_generation_from_ids(&mut self, ids: Vec<u32>) {
+        self.generation_active = true;
+
+        let pipeline = match &self.pipeline {
+            Some(pipeline) => Arc::clone(pipeline),
+            None => {
+                self.fail_generation("model not loaded");
+                return;
+            }
+        };
+
+        if let Err(error) = pipeline.clear_kv_cache() {
+            self.fail_generation(format!(
+                "failed to reset master cache for new prompt: {error}"
+            ));
+            return;
+        }
+
+        // Reset draft cache for new conversation turn
+        self.draft_cache.clear();
+        self.pending_draft = None;
+
+        self.token_ids = ids;
+        self.tokens_generated = 0;
+        self.awaiting_clear_cache_ack = false;
+        self.pending_cache_reset_trace_id = None;
+        self.pending_cache_reset_peers.clear();
+        self.in_flight_activation_hop = None;
+
+        let workers_for_generation: Vec<_> = self
+            .worker_peers
+            .iter()
+            .copied()
+            .filter(|peer| self.authenticated_workers.contains(peer))
+            .map(|peer_id| RouteWorkerCandidate {
+                peer_id,
+                capability: self
+                    .worker_registry
+                    .capability_for(&peer_id)
+                    .as_ref()
+                    .and_then(WorkerCapabilitySnapshot::planner_capability),
+            })
+            .collect();
+        let route_plan = match build_generation_route(
+            self.total_layers,
+            self.local_capability
+                .as_ref()
+                .and_then(WorkerCapabilitySnapshot::planner_capability),
+            &workers_for_generation,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.fail_generation(error);
+                return;
+            }
+        };
+        self.split_point = route_plan.master_layer_range.end;
+        self.generation_route_plan = Some(route_plan.clone());
+
+        let cache_reset_peers: Vec<_> = route_plan
+            .worker_hops
+            .iter()
+            .map(|hop| hop.peer_id)
+            .collect();
+        if cache_reset_peers.is_empty() {
+            info!("no workers available for this generation; using local-only execution");
+            self.send_next_activation();
+        } else {
+            self.send_clear_cache_requests(&cache_reset_peers);
+        }
+    }
+
+    fn send_clear_cache_requests(&mut self, peers: &[PeerId]) {
+        if peers.is_empty() {
+            self.awaiting_clear_cache_ack = false;
+            self.pending_cache_reset_trace_id = None;
+            self.pending_cache_reset_peers.clear();
+            return;
+        }
+
+        self.cache_reset_nonce = self.cache_reset_nonce.wrapping_add(1);
+        let trace_id = format!(
+            "cache-reset-{}-{}",
+            self.cache_reset_nonce,
+            self.token_ids.len()
+        );
+
+        self.awaiting_clear_cache_ack = true;
+        self.pending_cache_reset_trace_id = Some(trace_id.clone());
+        self.pending_cache_reset_peers = peers.iter().copied().collect();
+
+        for peer in peers {
+            info!(%peer, trace_id, "master requesting worker cache reset");
+            self.swarm.behaviour_mut().request_response.send_request(
+                peer,
+                super::super::RequestMessage::ClearCache(crate::ClearCache {
+                    trace_id: trace_id.clone(),
+                }),
+            );
+        }
+    }
+
+    /// Run master layers on current token_ids and route ActivationRequest hops via workers.
+    fn send_next_activation(&mut self) {
+        if self.awaiting_clear_cache_ack {
+            info!(
+                pending_peers = self.pending_cache_reset_peers.len(),
+                "waiting for all ClearCacheAck messages before first activation"
+            );
+            return;
+        }
+
+        let pipeline = match &self.pipeline {
+            Some(pipeline) => Arc::clone(pipeline),
+            None => {
+                self.fail_generation("model not loaded");
+                return;
+            }
+        };
+
+        let route_plan = match self.generation_route_plan.clone() {
+            Some(plan) => plan,
+            None => {
+                self.fail_generation("generation route plan is missing");
+                return;
+            }
+        };
+
+        let (activation_pass, activation_tokens) =
+            match activation_tokens_for_position(&self.token_ids, self.tokens_generated) {
+                Ok(activation) => activation,
+                Err(error) => {
+                    self.fail_generation(error);
+                    return;
+                }
+            };
+
+        info!(
+            seq_len = activation_tokens.len(),
+            step = self.tokens_generated,
+            mode = activation_pass.as_str(),
+            "master running embed + layers"
+        );
+
+        // Create token tensor.
+        let token_ids =
+            match candle_core::Tensor::new(activation_tokens.as_slice(), &candle_core::Device::Cpu)
+            {
+                Ok(tensor) => match tensor.reshape((1, activation_tokens.len())) {
+                    Ok(tensor) => tensor,
+                    Err(error) => {
+                        self.fail_generation(format!("failed to reshape token IDs: {error}"));
+                        return;
+                    }
+                },
+                Err(error) => {
+                    self.fail_generation(format!("failed to create token ID tensor: {error}"));
+                    return;
+                }
+            };
+
+        // Embed + master layers.
+        let hidden = match pipeline.embed(&token_ids) {
+            Ok(hidden) => hidden,
+            Err(error) => {
+                self.fail_generation(format!("embedding failed: {error}"));
+                return;
+            }
+        };
+
+        let after_master = match activation_pass {
+            ActivationPass::Prefill => {
+                pipeline.forward_layers_prefill(&hidden, route_plan.master_layer_range.clone())
+            }
+            ActivationPass::Decode => {
+                pipeline.forward_layers_decode(&hidden, route_plan.master_layer_range.clone())
+            }
+        };
+        let after_master = match after_master {
+            Ok(hidden) => hidden,
+            Err(error) => {
+                self.fail_generation(format!(
+                    "master {} layer forward failed: {error}",
+                    activation_pass.as_str()
+                ));
+                return;
+            }
+        };
+
+        // Serialize for network transfer.
+        let payload = match tensor_to_payload(&after_master) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.fail_generation(format!("failed to serialize hidden state: {error}"));
+                return;
+            }
+        };
+
+        if route_plan.worker_hops.is_empty() {
+            self.in_flight_activation_hop = None;
+            self.process_final_activation_output(None, payload);
+            return;
+        }
+
+        self.dispatch_worker_hop(
+            &route_plan,
+            activation_pass,
+            self.tokens_generated,
+            0,
+            payload,
+        );
+    }
+
+    fn dispatch_worker_hop(
+        &mut self,
+        route_plan: &GenerationRoutePlan,
+        activation_pass: ActivationPass,
+        sequence_position: usize,
+        hop_index: usize,
+        payload: crate::TensorPayload,
+    ) {
+        let Some(hop) = route_plan.worker_hops.get(hop_index) else {
+            self.fail_generation(format!(
+                "missing worker hop {hop_index} in generation route"
+            ));
+            return;
+        };
+
+        if let Err(error) = ensure_worker_available(hop.peer_id, &self.authenticated_workers) {
+            self.fail_generation(format!("{error} for hop {hop_index}"));
+            return;
+        }
+
+        let trace_id = activation_trace_id(sequence_position, hop_index);
+        match activation_pass {
+            ActivationPass::Prefill => {
+                info!(
+                    peer = %hop.peer_id,
+                    hop = hop_index,
+                    layer_range = ?hop.layer_range,
+                    shape = ?payload.shape,
+                    bytes = payload.bytes.len(),
+                    "master routing prefill hidden state to worker"
+                );
+            }
+            ActivationPass::Decode => {
+                info!(
+                    peer = %hop.peer_id,
+                    hop = hop_index,
+                    layer_range = ?hop.layer_range,
+                    shape = ?payload.shape,
+                    bytes = payload.bytes.len(),
+                    "master routing decode hidden state to worker"
+                );
+            }
+        }
+
+        let request = crate::ActivationRequest {
+            trace_id: trace_id.clone(),
+            sequence_position,
+            layer_range: (hop.layer_range.start, hop.layer_range.end),
+            hidden_state: payload,
+        };
+
+        self.in_flight_activation_hop = Some(InFlightActivationHop {
+            sequence_position,
+            hop_index,
+            trace_id,
+            dispatch_time: Some(Instant::now()),
+        });
+
+        self.swarm.behaviour_mut().request_response.send_request(
+            &hop.peer_id,
+            super::super::RequestMessage::ActivationRequest(request),
+        );
+    }
+
+    fn process_final_activation_output(
+        &mut self,
+        peer: Option<PeerId>,
+        payload: crate::TensorPayload,
+    ) {
+        info!(
+            peer = ?peer,
+            shape = ?payload.shape,
+            "master received final activation payload — running lm_head"
+        );
+
+        let worker_output = match payload_to_tensor(&payload) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                self.fail_generation(format!("failed to deserialize worker output: {error}"));
+                return;
+            }
+        };
+
+        let pipeline = match &self.pipeline {
+            Some(pipeline) => Arc::clone(pipeline),
+            None => {
+                self.fail_generation("model not loaded");
+                return;
+            }
+        };
+
+        let logits = match pipeline.head(&worker_output) {
+            Ok(logits) => logits,
+            Err(error) => {
+                self.fail_generation(format!("lm_head inference failed: {error}"));
+                return;
+            }
+        };
+
+        let next_token = match ToyLlama::sample_argmax(&logits) {
+            Ok(token) => token,
+            Err(error) => {
+                self.fail_generation(format!("sampling failed: {error}"));
+                return;
+            }
+        };
+
+        let tokenizer = match &self.tokenizer {
+            Some(tokenizer) => Arc::clone(tokenizer),
+            None => {
+                self.fail_generation("tokenizer not loaded");
+                return;
+            }
+        };
+
+        let decoded = match tokenizer.decode(&[next_token], true) {
+            Ok(text) => text,
+            Err(error) => {
+                warn!(peer = ?peer, %error, token_id = next_token, "token decode failed");
+                format!("<tok:{next_token}>")
+            }
+        };
+        self.emit(ChatEvent::Token(decoded));
+
+        // Feed the N-gram draft cache for speculative decoding.
+        if self.speculative_enabled && self.token_ids.len() >= 2 {
+            self.draft_cache
+                .observe(&self.token_ids[..self.token_ids.len()], next_token);
+        }
+
+        self.token_ids.push(next_token);
+        self.tokens_generated += 1;
+        self.in_flight_activation_hop = None;
+
+        let max_tokens = self
+            .batch_active_max_tokens
+            .unwrap_or_else(|| match &self.role {
+                SynapseRole::Master { max_tokens, .. } => *max_tokens,
+                _ => 50,
+            });
+
+        let eos = tokenizer.eos_token_id();
+        let should_stop = self.tokens_generated >= max_tokens || eos == Some(next_token);
+
+        if should_stop {
+            let reason = if eos == Some(next_token) {
+                StopReason::Eos
+            } else {
+                StopReason::MaxTokens
+            };
+            self.emit(ChatEvent::GenerationDone {
+                tokens_generated: self.tokens_generated,
+                reason,
+            });
+            self.generation_active = false;
+            self.awaiting_clear_cache_ack = false;
+            self.pending_cache_reset_trace_id = None;
+            self.pending_cache_reset_peers.clear();
+            self.generation_route_plan = None;
+            self.batch_active_max_tokens = None;
+            // Process next batch request if any are queued.
+            self.drain_batch_queue();
+        } else {
+            self.send_next_activation();
+        }
+    }
+
+    pub(super) fn peer_required_for_active_generation(&self, peer: PeerId) -> bool {
+        self.pending_cache_reset_peers.contains(&peer)
+            || self
+                .generation_route_plan
+                .as_ref()
+                .is_some_and(|plan| plan.worker_hops.iter().any(|hop| hop.peer_id == peer))
+    }
+
+    pub(super) fn handle_activation_request(
+        &mut self,
+        peer: PeerId,
+        request: crate::ActivationRequest,
+        channel: request_response::ResponseChannel<super::super::ResponseMessage>,
+    ) {
+        if !matches!(self.role, SynapseRole::Worker { .. }) {
+            warn!(%peer, "master received ActivationRequest; rejecting");
+            self.reject(channel, "ActivationRequest is handled by workers");
+            return;
+        }
+
+        if let Err(error) = request.validate() {
+            warn!(%peer, %error, "ActivationRequest validation failed");
+            self.reject(channel, "invalid ActivationRequest");
+            return;
+        }
+
+        let activation_pass = ActivationPass::for_sequence_position(request.sequence_position);
+
+        info!(
+            %peer,
+            trace_id = %request.trace_id,
+            mode = activation_pass.as_str(),
+            layer_range = ?request.layer_range,
+            shape = ?request.hidden_state.shape,
+            "worker received ActivationRequest — running inference"
+        );
+
+        // Deserialize the hidden state tensor.
+        let hidden = match payload_to_tensor(&request.hidden_state) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                warn!(%peer, %error, "failed to deserialize hidden state tensor");
+                self.reject(channel, "tensor deserialization failed");
+                return;
+            }
+        };
+
+        // Run worker layers.
+        let pipeline = match &self.pipeline {
+            Some(pipeline) => Arc::clone(pipeline),
+            None => {
+                warn!(%peer, "model not loaded yet");
+                self.reject(channel, "model not loaded");
+                return;
+            }
+        };
+
+        let (layer_start, layer_end) = request.layer_range;
+        if layer_end > self.total_layers {
+            warn!(
+                %peer,
+                requested_range = ?request.layer_range,
+                available_layers = self.total_layers,
+                "requested layer range exceeds loaded model"
+            );
+            self.reject(channel, "requested layer range exceeds model depth");
+            return;
+        }
+
+        let result = match activation_pass {
+            ActivationPass::Prefill => {
+                pipeline.forward_layers_prefill(&hidden, layer_start..layer_end)
+            }
+            ActivationPass::Decode => {
+                pipeline.forward_layers_decode(&hidden, layer_start..layer_end)
+            }
+        };
+        let output = match result {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                warn!(
+                    %peer,
+                    %error,
+                    mode = activation_pass.as_str(),
+                    "worker inference failed"
+                );
+                self.reject(channel, "inference failed");
+                return;
+            }
+        };
+
+        // Serialize the output tensor.
+        let payload = match tensor_to_payload(&output) {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(%peer, %error, "failed to serialize output tensor");
+                self.reject(channel, "tensor serialization failed");
+                return;
+            }
+        };
+
+        match activation_pass {
+            ActivationPass::Prefill => {
+                info!(
+                    %peer,
+                    trace_id = %request.trace_id,
+                    output_shape = ?payload.shape,
+                    "worker prefill inference complete — sending response"
+                );
+            }
+            ActivationPass::Decode => {
+                info!(
+                    %peer,
+                    trace_id = %request.trace_id,
+                    output_shape = ?payload.shape,
+                    "worker decode inference complete — sending response (expected [1,1,hidden])"
+                );
+            }
+        }
+
+        let response = crate::ActivationResponse {
+            trace_id: request.trace_id,
+            logits: payload,
+        };
+
+        self.send_response(
+            channel,
+            super::super::ResponseMessage::ActivationResponse(response),
+        );
+        // Worker stays alive for more requests — never sets exchange_complete here.
+    }
+
+    pub(super) fn handle_clear_cache_request(
+        &mut self,
+        peer: PeerId,
+        request: crate::ClearCache,
+        channel: request_response::ResponseChannel<super::super::ResponseMessage>,
+    ) {
+        if !matches!(self.role, SynapseRole::Worker { .. }) {
+            warn!(%peer, "master received ClearCache request; rejecting");
+            self.reject(channel, "ClearCache is handled by workers");
+            return;
+        }
+
+        if let Err(error) = request.validate() {
+            warn!(%peer, %error, "ClearCache validation failed");
+            self.reject(channel, "invalid ClearCache request");
+            return;
+        }
+
+        let pipeline = match &self.pipeline {
+            Some(pipeline) => Arc::clone(pipeline),
+            None => {
+                warn!(%peer, "model not loaded yet");
+                self.reject(channel, "model not loaded");
+                return;
+            }
+        };
+
+        if let Err(error) = pipeline.clear_kv_cache() {
+            warn!(%peer, %error, "worker failed to clear KV cache");
+            self.reject(channel, "failed to clear KV cache");
+            return;
+        }
+
+        info!(
+            %peer,
+            trace_id = %request.trace_id,
+            "worker cleared KV cache and acknowledged request"
+        );
+        self.send_response(
+            channel,
+            super::super::ResponseMessage::ClearCacheAck(request),
+        );
+    }
+
+    pub(super) fn handle_inbound_response(
+        &mut self,
+        peer: PeerId,
+        response: super::super::ResponseMessage,
+    ) {
+        match response {
+            super::super::ResponseMessage::ChallengeIssued(challenge) => {
+                info!(%peer, "received challenge from master, signing and sending response");
+
+                let identity =
+                    crate::NodeIdentity::load_or_create().expect("identity must exist for worker");
+
+                let signing_payload = challenge.signing_payload();
+                let signature = match identity.sign(&signing_payload) {
+                    Ok(sig) => sig,
+                    Err(e) => {
+                        warn!(%e, "failed to sign challenge");
+                        return;
+                    }
+                };
+
+                let SynapseRole::Worker { pairing_code, .. } = &self.role else {
+                    return;
+                };
+
+                let pairing_code_hash = crate::hash_pairing_code(pairing_code);
+
+                let response = crate::ChallengeResponse {
+                    pairing_code_hash,
+                    nonce: challenge.nonce,
+                    signature,
+                    public_key: identity.public_key_bytes(),
+                };
+
+                self.swarm.behaviour_mut().request_response.send_request(
+                    &peer,
+                    super::super::RequestMessage::ChallengeResponse(response),
+                );
+            }
+            super::super::ResponseMessage::WeightTransfer(_transfer) => {
+                // Not implemented in this phase yet
+            }
+            super::super::ResponseMessage::Authenticated => {
+                info!(%peer, "worker authenticated by master");
+                self.reset_redial_backoff();
+            }
+            super::super::ResponseMessage::ActivationResponse(response) => {
+                if let Err(error) = response.validate() {
+                    self.fail_generation(format!(
+                        "invalid ActivationResponse from {peer}: {error}"
+                    ));
+                    return;
+                }
+
+                let in_flight = match self.in_flight_activation_hop.clone() {
+                    Some(in_flight) => in_flight,
+                    None => {
+                        self.fail_generation(format!(
+                            "unexpected ActivationResponse from {peer} without an in-flight hop"
+                        ));
+                        return;
+                    }
+                };
+                if in_flight.sequence_position != self.tokens_generated {
+                    self.fail_generation(format!(
+                        "stale ActivationResponse from {peer}: expected step {}, got {}",
+                        self.tokens_generated, in_flight.sequence_position
+                    ));
+                    return;
+                }
+                if response.trace_id != in_flight.trace_id {
+                    self.fail_generation(format!(
+                        "mismatched ActivationResponse trace from {peer}: expected {}, got {}",
+                        in_flight.trace_id, response.trace_id
+                    ));
+                    return;
+                }
+
+                let route_plan = match self.generation_route_plan.clone() {
+                    Some(plan) => plan,
+                    None => {
+                        self.fail_generation("missing generation route while processing response");
+                        return;
+                    }
+                };
+                let Some(current_hop) = route_plan.worker_hops.get(in_flight.hop_index) else {
+                    self.fail_generation(format!(
+                        "missing hop {} in generation route",
+                        in_flight.hop_index
+                    ));
+                    return;
+                };
+                if peer != current_hop.peer_id {
+                    self.fail_generation(format!(
+                        "ActivationResponse came from unexpected worker {peer}; expected {}",
+                        current_hop.peer_id
+                    ));
+                    return;
+                }
+
+                let next_hop_index = in_flight.hop_index + 1;
+                if route_plan.worker_hops.get(next_hop_index).is_some() {
+                    let activation_pass =
+                        ActivationPass::for_sequence_position(in_flight.sequence_position);
+                    self.dispatch_worker_hop(
+                        &route_plan,
+                        activation_pass,
+                        in_flight.sequence_position,
+                        next_hop_index,
+                        response.logits,
+                    );
+                } else {
+                    self.process_final_activation_output(Some(peer), response.logits);
+                }
+            }
+            super::super::ResponseMessage::ClearCacheAck(ack) => {
+                if let Err(error) = ack.validate() {
+                    warn!(%peer, %error, "invalid ClearCacheAck from peer");
+                    return;
+                }
+
+                if !self.generation_active {
+                    warn!(%peer, trace_id = %ack.trace_id, "ignoring ClearCacheAck without active generation");
+                    return;
+                }
+
+                if !self.awaiting_clear_cache_ack {
+                    warn!(%peer, trace_id = %ack.trace_id, "unexpected ClearCacheAck received");
+                    return;
+                }
+
+                let expected_trace = match &self.pending_cache_reset_trace_id {
+                    Some(trace_id) => trace_id,
+                    None => {
+                        warn!(%peer, trace_id = %ack.trace_id, "missing expected cache reset trace id");
+                        return;
+                    }
+                };
+
+                if ack.trace_id != *expected_trace {
+                    warn!(
+                        %peer,
+                        expected_trace_id = %expected_trace,
+                        actual_trace_id = %ack.trace_id,
+                        "ignoring stale ClearCacheAck"
+                    );
+                    return;
+                }
+
+                if !self.pending_cache_reset_peers.remove(&peer) {
+                    warn!(
+                        %peer,
+                        trace_id = %ack.trace_id,
+                        "received ClearCacheAck from peer outside pending cache reset set"
+                    );
+                    return;
+                }
+
+                if !self.pending_cache_reset_peers.is_empty() {
+                    info!(
+                        pending_peers = self.pending_cache_reset_peers.len(),
+                        trace_id = %ack.trace_id,
+                        "waiting for remaining cache reset acknowledgements"
+                    );
+                    return;
+                }
+
+                self.awaiting_clear_cache_ack = false;
+                self.pending_cache_reset_trace_id = None;
+                info!(
+                    %peer,
+                    trace_id = %ack.trace_id,
+                    "cache clear acknowledged — sending first activation"
+                );
+                if self.healing_in_progress {
+                    self.complete_healing();
+                } else {
+                    self.send_next_activation();
+                }
+            }
+            super::super::ResponseMessage::Rejected { reason } => {
+                self.fail_generation(format!("request rejected by peer {peer}: {reason}"));
+            }
+        }
+    }
+}
+
+// ─── Phase 8: Continuous Batching ────────────────────────────────────────────
+
+impl SynapseNode {
+    /// Accept a prompt request from the batch queue (multi-client path).
+    ///
+    /// Tokenizes the prompt, assigns a request ID, and enqueues it. If no
+    /// generation is currently active, starts processing the next queued
+    /// request immediately.
+    pub(super) fn handle_batch_prompt_request(&mut self, req: BatchPromptRequest) {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+
+        let tokenizer = match &self.tokenizer {
+            Some(t) => Arc::clone(t),
+            None => {
+                let _ = req.event_tx.try_send(ChatEvent::Token(
+                    "[generation-error] tokenizer not loaded".to_owned(),
+                ));
+                let _ = req.event_tx.try_send(ChatEvent::GenerationDone {
+                    tokens_generated: 0,
+                    reason: StopReason::Error,
+                });
+                return;
+            }
+        };
+
+        let ids = match tokenizer.encode(&req.prompt, false) {
+            Ok(ids) => ids,
+            Err(error) => {
+                let _ = req.event_tx.try_send(ChatEvent::Token(format!(
+                    "[generation-error] tokenization failed: {error}"
+                )));
+                let _ = req.event_tx.try_send(ChatEvent::GenerationDone {
+                    tokens_generated: 0,
+                    reason: StopReason::Error,
+                });
+                return;
+            }
+        };
+
+        if self.active_batch.len() >= MAX_BATCH_SIZE {
+            warn!(
+                batch_size = self.active_batch.len(),
+                max = MAX_BATCH_SIZE,
+                "batch queue full, rejecting prompt"
+            );
+            let _ = req.event_tx.try_send(ChatEvent::Token(
+                "[batch-full] server busy; try again shortly".to_owned(),
+            ));
+            let _ = req.event_tx.try_send(ChatEvent::GenerationDone {
+                tokens_generated: 0,
+                reason: StopReason::Error,
+            });
+            return;
+        }
+
+        self.active_batch.push_back(InFlightRequest {
+            request_id,
+            token_ids: ids,
+            max_tokens: req.max_tokens,
+            event_tx: req.event_tx,
+        });
+
+        info!(
+            request_id,
+            queue_depth = self.active_batch.len(),
+            "batch prompt request queued"
+        );
+
+        if !self.generation_active {
+            self.drain_batch_queue();
+        }
+    }
+
+    /// Dequeue the next batch request and start generation for it.
+    ///
+    /// Installs the per-request event channel so tokens stream back to
+    /// the originating client. Reuses the same generation pipeline as
+    /// the single-prompt REPL path.
+    fn drain_batch_queue(&mut self) {
+        if self.active_batch.is_empty() || self.generation_active {
+            return;
+        }
+
+        let req = self.active_batch.pop_front().expect("batch non-empty");
+        info!(
+            request_id = req.request_id,
+            token_count = req.token_ids.len(),
+            remaining = self.active_batch.len(),
+            "dequeuing batch request for generation"
+        );
+
+        // Install per-request event channel and max_tokens override.
+        self.event_tx = Some(req.event_tx);
+        self.batch_active_max_tokens = Some(req.max_tokens);
+
+        self.begin_generation_from_ids(req.token_ids);
+    }
+}
+
+// ─── Phase 9: Self-Healing Swarm ─────────────────────────────────────────────
+
+impl SynapseNode {
+    /// Periodic check for timed-out worker hops (called from the run loop).
+    ///
+    /// If the in-flight activation hop has been waiting longer than
+    /// `WORKER_HOP_TIMEOUT`, we assume the worker is dead and initiate
+    /// self-healing to reroute through remaining workers.
+    pub(super) fn check_worker_timeouts(&mut self) {
+        if !self.generation_active || self.healing_in_progress {
+            return;
+        }
+
+        let timed_out_peer = match &self.in_flight_activation_hop {
+            Some(hop) => match hop.dispatch_time {
+                Some(dispatch_time) if dispatch_time.elapsed() > WORKER_HOP_TIMEOUT => {
+                    let route_plan = match &self.generation_route_plan {
+                        Some(plan) => plan,
+                        None => return,
+                    };
+                    route_plan.worker_hops.get(hop.hop_index).map(|h| h.peer_id)
+                }
+                _ => None,
+            },
+            None => None,
+        };
+
+        if let Some(dead_peer) = timed_out_peer {
+            warn!(
+                %dead_peer,
+                "worker hop timed out — initiating self-healing"
+            );
+            self.initiate_healing(dead_peer);
+        }
+    }
+
+    /// Begin the self-healing process after a worker disconnect or timeout.
+    ///
+    /// Removes the dead peer, recomputes the route with remaining workers,
+    /// saves current generation state, clears caches on the new route, and
+    /// prepares for a fast prefill replay once acks arrive.
+    pub(super) fn initiate_healing(&mut self, dead_peer: PeerId) {
+        if self.healing_in_progress {
+            warn!("healing already in progress, ignoring duplicate request");
+            return;
+        }
+
+        info!(%dead_peer, "removing dead peer and recomputing route");
+
+        // Remove the dead peer from all tracking.
+        self.authenticated_workers.remove(&dead_peer);
+        self.worker_peers.retain(|p| *p != dead_peer);
+        self.worker_registry.mark_disconnected(dead_peer);
+        self.pending_cache_reset_peers.remove(&dead_peer);
+        self.in_flight_activation_hop = None;
+
+        // Save current generation state for replay.
+        self.healing_in_progress = true;
+        self.healing_saved_tokens = Some(self.token_ids.clone());
+        self.healing_saved_step = self.tokens_generated;
+
+        // Recompute route with remaining workers.
+        let workers_for_generation: Vec<_> = self
+            .worker_peers
+            .iter()
+            .copied()
+            .filter(|peer| self.authenticated_workers.contains(peer))
+            .map(|peer_id| RouteWorkerCandidate {
+                peer_id,
+                capability: self
+                    .worker_registry
+                    .capability_for(&peer_id)
+                    .as_ref()
+                    .and_then(WorkerCapabilitySnapshot::planner_capability),
+            })
+            .collect();
+
+        let route_plan = match build_generation_route(
+            self.total_layers,
+            self.local_capability
+                .as_ref()
+                .and_then(WorkerCapabilitySnapshot::planner_capability),
+            &workers_for_generation,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                warn!(%error, "self-healing route recomputation failed — falling back to fail");
+                self.healing_in_progress = false;
+                self.healing_saved_tokens = None;
+                self.fail_generation(format!("self-healing failed: {error}"));
+                return;
+            }
+        };
+
+        info!(
+            master_layers = ?route_plan.master_layer_range,
+            worker_count = route_plan.worker_hops.len(),
+            "self-healing: new route computed"
+        );
+
+        self.split_point = route_plan.master_layer_range.end;
+        self.generation_route_plan = Some(route_plan.clone());
+
+        // Clear caches on new route workers, then replay.
+        let cache_reset_peers: Vec<_> = route_plan
+            .worker_hops
+            .iter()
+            .map(|hop| hop.peer_id)
+            .collect();
+
+        // Clear master cache too for replay.
+        if let Some(pipeline) = &self.pipeline {
+            if let Err(error) = pipeline.clear_kv_cache() {
+                warn!(%error, "failed to clear master cache during healing");
+                self.healing_in_progress = false;
+                self.healing_saved_tokens = None;
+                self.fail_generation(format!("healing cache clear failed: {error}"));
+                return;
+            }
+        }
+
+        if cache_reset_peers.is_empty() {
+            // No workers in new route — complete healing immediately.
+            self.complete_healing();
+        } else {
+            self.send_clear_cache_requests(&cache_reset_peers);
+            // The ClearCacheAck handler will call complete_healing via
+            // send_next_activation, but we override it here: once all acks
+            // arrive during healing, we do a fast prefill replay instead.
+        }
+    }
+
+    /// Complete the self-healing process by replaying the prefill pass.
+    ///
+    /// Called once all ClearCacheAck messages are received for the new route.
+    /// Replays the full token sequence through the new route to rebuild
+    /// KV caches, then resumes normal decode from where we left off.
+    fn complete_healing(&mut self) {
+        let saved_tokens = match self.healing_saved_tokens.take() {
+            Some(tokens) => tokens,
+            None => {
+                warn!("healing complete but no saved tokens — resuming normal generation");
+                self.healing_in_progress = false;
+                self.send_next_activation();
+                return;
+            }
+        };
+
+        info!(
+            token_count = saved_tokens.len(),
+            saved_step = self.healing_saved_step,
+            "self-healing: replaying prefill through new route"
+        );
+
+        // Restore token state and restart generation from step 0.
+        // The prefill pass will rebuild all KV caches.
+        self.token_ids = saved_tokens;
+        self.tokens_generated = 0;
+        self.healing_in_progress = false;
+
+        // Resume normal generation — the first send_next_activation call
+        // will do a prefill (tokens_generated == 0), rebuilding KV caches.
+        self.send_next_activation();
+    }
+}
+
+// ─── Phase 10: Speculative Decoding (wiring into generation) ─────────────────
+
+// The core speculation logic (NgramDraftCache, verify_draft) lives in
+// speculation.rs and is already fully implemented. These methods wire the
+// draft/verify cycle into the generation loop.
+//
+// Current PoC integration:
+// - After each token, observe it in the draft cache (done above in
+//   process_final_activation_output).
+// - Draft tokens are available via self.draft_cache.draft() for future
+//   speculative passes.
+// - Speculative multi-token verification would require sending a
+//   [1, draft_len, hidden] tensor to workers and using
+//   forward_layers_speculative(). The pipeline already supports this.
+// - On mismatch, truncate_kv_cache() rolls back rejected tokens.
+//
+// The full speculative loop (draft → verify → accept/reject → rollback)
+// is scaffolded here for integration once the single-token path is stable.
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use libp2p::PeerId;
+
+    use super::{
+        ActivationPass, RouteWorkerCandidate, activation_tokens_for_position,
+        build_generation_route, ensure_worker_available,
+    };
+    use crate::NodeCapability;
+
+    #[test]
+    fn first_step_uses_prefill_tokens() {
+        let token_ids = vec![11_u32, 22, 33];
+        let (pass, active_tokens) =
+            activation_tokens_for_position(&token_ids, 0).expect("prefill selection should work");
+
+        assert_eq!(pass, ActivationPass::Prefill);
+        assert_eq!(active_tokens, token_ids);
+    }
+
+    #[test]
+    fn later_steps_use_single_decode_token() {
+        let token_ids = vec![11_u32, 22, 33, 44];
+        let (pass, active_tokens) =
+            activation_tokens_for_position(&token_ids, 1).expect("decode selection should work");
+
+        assert_eq!(pass, ActivationPass::Decode);
+        assert_eq!(active_tokens, vec![44_u32]);
+    }
+
+    #[test]
+    fn activation_requires_non_empty_tokens() {
+        let err =
+            activation_tokens_for_position(&[], 0).expect_err("empty token sequence should fail");
+        assert!(
+            err.contains("requires at least one token"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn multi_hop_route_is_ordered_and_contiguous_end_to_end() {
+        let worker_a = PeerId::random();
+        let worker_b = PeerId::random();
+        let worker_c = PeerId::random();
+        let worker_d = PeerId::random();
+        let workers = vec![
+            RouteWorkerCandidate {
+                peer_id: worker_a,
+                capability: None,
+            },
+            RouteWorkerCandidate {
+                peer_id: worker_b,
+                capability: None,
+            },
+            RouteWorkerCandidate {
+                peer_id: worker_c,
+                capability: None,
+            },
+            RouteWorkerCandidate {
+                peer_id: worker_d,
+                capability: None,
+            },
+        ];
+
+        let route_plan =
+            build_generation_route(17, None, &workers).expect("route planning should succeed");
+
+        let routed_workers: Vec<_> = route_plan
+            .worker_hops
+            .iter()
+            .map(|hop| hop.peer_id)
+            .collect();
+        assert_eq!(routed_workers, vec![worker_a, worker_b, worker_c, worker_d]);
+
+        assert_eq!(route_plan.master_layer_range.start, 0);
+        assert!(route_plan.master_layer_range.start < route_plan.master_layer_range.end);
+
+        let mut cursor = route_plan.master_layer_range.end;
+        for hop in &route_plan.worker_hops {
+            assert_eq!(hop.layer_range.start, cursor);
+            assert!(hop.layer_range.start < hop.layer_range.end);
+            cursor = hop.layer_range.end;
+        }
+        assert_eq!(cursor, 17);
+    }
+
+    #[test]
+    fn assigns_layer_range_per_worker_hop() {
+        let worker_a = PeerId::random();
+        let worker_b = PeerId::random();
+        let route_plan = build_generation_route(
+            8,
+            None,
+            &[
+                RouteWorkerCandidate {
+                    peer_id: worker_a,
+                    capability: None,
+                },
+                RouteWorkerCandidate {
+                    peer_id: worker_b,
+                    capability: None,
+                },
+            ],
+        )
+        .expect("route planning should work");
+
+        assert_eq!(route_plan.master_layer_range, 0..3);
+        assert_eq!(route_plan.worker_hops[0].peer_id, worker_a);
+        assert_eq!(route_plan.worker_hops[0].layer_range, 3..6);
+        assert_eq!(route_plan.worker_hops[1].peer_id, worker_b);
+        assert_eq!(route_plan.worker_hops[1].layer_range, 6..8);
+    }
+
+    #[test]
+    fn route_planner_uses_weighted_capabilities_when_available() {
+        let worker_a = PeerId::random();
+        let worker_b = PeerId::random();
+        let worker_c = PeerId::random();
+
+        let workers = [
+            RouteWorkerCandidate {
+                peer_id: worker_a,
+                capability: Some(NodeCapability {
+                    compute_score: 3,
+                    available_ram_mb: 100,
+                }),
+            },
+            RouteWorkerCandidate {
+                peer_id: worker_b,
+                capability: Some(NodeCapability {
+                    compute_score: 2,
+                    available_ram_mb: 200,
+                }),
+            },
+            RouteWorkerCandidate {
+                peer_id: worker_c,
+                capability: Some(NodeCapability {
+                    compute_score: 1,
+                    available_ram_mb: 300,
+                }),
+            },
+        ];
+
+        let first = build_generation_route(
+            15,
+            Some(NodeCapability {
+                compute_score: 9,
+                available_ram_mb: 500,
+            }),
+            &workers,
+        )
+        .expect("weighted route planning should work");
+        let second = build_generation_route(
+            15,
+            Some(NodeCapability {
+                compute_score: 9,
+                available_ram_mb: 500,
+            }),
+            &workers,
+        )
+        .expect("weighted route planning should be deterministic");
+
+        assert_eq!(first, second);
+        assert_eq!(first.master_layer_range.start, 0);
+        assert_eq!(
+            first
+                .worker_hops
+                .iter()
+                .map(|hop| hop.peer_id)
+                .collect::<Vec<_>>(),
+            vec![worker_a, worker_b, worker_c]
+        );
+
+        let total_layer_sum = (first.master_layer_range.end - first.master_layer_range.start)
+            + first
+                .worker_hops
+                .iter()
+                .map(|hop| hop.layer_range.end - hop.layer_range.start)
+                .sum::<usize>();
+        assert_eq!(total_layer_sum, 15);
+
+        let mut cursor = first.master_layer_range.end;
+        for hop in &first.worker_hops {
+            assert_eq!(hop.layer_range.start, cursor);
+            assert!(hop.layer_range.start < hop.layer_range.end);
+            cursor = hop.layer_range.end;
+        }
+        assert_eq!(cursor, 15);
+    }
+
+    #[test]
+    fn route_planner_falls_back_to_static_when_capabilities_missing() {
+        let worker_a = PeerId::random();
+        let worker_b = PeerId::random();
+
+        let route_plan = build_generation_route(
+            8,
+            Some(NodeCapability {
+                compute_score: 10,
+                available_ram_mb: 4_096,
+            }),
+            &[
+                RouteWorkerCandidate {
+                    peer_id: worker_a,
+                    capability: None,
+                },
+                RouteWorkerCandidate {
+                    peer_id: worker_b,
+                    capability: Some(NodeCapability {
+                        compute_score: 1,
+                        available_ram_mb: 4_096,
+                    }),
+                },
+            ],
+        )
+        .expect("fallback route planning should work");
+
+        assert_eq!(route_plan.master_layer_range, 0..3);
+        assert_eq!(route_plan.worker_hops[0].layer_range, 3..6);
+        assert_eq!(route_plan.worker_hops[1].layer_range, 6..8);
+    }
+
+    #[test]
+    fn reports_failure_when_expected_worker_is_unavailable() {
+        let worker_a = PeerId::random();
+        let worker_b = PeerId::random();
+        let route_plan = build_generation_route(
+            8,
+            None,
+            &[
+                RouteWorkerCandidate {
+                    peer_id: worker_a,
+                    capability: None,
+                },
+                RouteWorkerCandidate {
+                    peer_id: worker_b,
+                    capability: None,
+                },
+            ],
+        )
+        .expect("route planning should work");
+
+        let available_workers: HashSet<_> = [worker_a].into_iter().collect();
+        assert!(
+            ensure_worker_available(route_plan.worker_hops[0].peer_id, &available_workers).is_ok()
+        );
+
+        let err = ensure_worker_available(route_plan.worker_hops[1].peer_id, &available_workers)
+            .expect_err("missing worker should fail availability check");
+        assert!(
+            err.contains(&route_plan.worker_hops[1].peer_id.to_string()),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("unavailable"), "unexpected error: {err}");
+    }
+}

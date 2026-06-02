@@ -1,0 +1,25 @@
+/target/
+/.env
+/.env.*
+/models/
+/checkpoints/
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+
+# synapse-gui
+/crates/synapse-gui/web/node_modules/
+/crates/synapse-gui/web/dist/
+
+# identity key
+*.key
+*.key.bak
+
+# local editor state
+/.claude/settings.local.json
+/.cursor/settings.json
+
+# TypeScript incremental build cache
+*.tsbuildinfo

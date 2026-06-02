@@ -1,0 +1,6 @@
+# DHT bootstrap peers for global discovery.
+# Each entry must be a full multiaddr ending in /p2p/<peer-id>.
+# Entries without a /p2p component are skipped at load time.
+# Example:
+#   peers = ["/dns4/bootstrap.example.com/udp/4001/quic-v1/p2p/12D3KooW..."]
+peers = []

@@ -1,0 +1,40 @@
+[workspace]
+members = [
+    "crates/synapse-cli",
+    "crates/synapse-core",
+    "crates/synapse-gui",
+]
+resolver = "3"
+
+[workspace.package]
+authors = ["Synapse contributors"]
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bincode = "1"
+bytemuck = { version = "1.14", features = ["derive"] }
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+hf-hub = { version = "0.4", features = ["tokio"] }
+half = "2"
+libp2p = { version = "0.56", features = [
+    "autonat", "dns", "dcutr", "identify", "kad", "macros", "mdns",
+    "noise", "ping", "quic", "relay", "request-response", "tcp", "tokio", "yamux",
+] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+synapse-core = { path = "crates/synapse-core" }
+thiserror = "2"
+toml = "0.8"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

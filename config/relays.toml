@@ -1,0 +1,7 @@
+# Relay servers for NAT traversal (run one with `synapse relay`).
+# Each entry must be a full multiaddr ending in /p2p/<peer-id>.
+# A NAT'd master dials these and listens on <relay>/p2p-circuit so remote
+# workers can reach it. Entries without a /p2p component are skipped.
+# Example:
+#   relays = ["/dns4/relay.example.com/udp/4001/quic-v1/p2p/12D3KooW..."]
+relays = []
