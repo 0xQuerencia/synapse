@@ -5,3 +5,7 @@ purpose = "Fast CI and localhost protocol validation"
 [demo]
 id = "HuggingFaceTB/SmolLM2-135M-Instruct"
 purpose = "First real LAN demo candidate after Candle wiring"
+
+[ollama-gemma]
+id = "ollama:gemma4:e2b-it-qat"
+purpose = "Fast single-node inference via local ollama (Gemma 4 e2b, Q4 QAT)"
