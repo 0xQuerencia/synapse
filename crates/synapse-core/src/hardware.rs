@@ -42,3 +42,47 @@ pub struct HardwareProbe {
     pub vram_free_bytes: Option<u64>,
     /// Total VRAM in bytes (if known).
     pub vram_total_bytes: Option<u64>,
+    /// Heuristic FP16 dense matmul TFLOPS. We don't have a portable
+    /// micro-benchmark; this is a coarse lookup by GPU model name.
+    /// `None` on CPU or when the model is unknown.
+    pub estimated_fp16_tflops: Option<f32>,
+    /// Number of CPU cores (logical). Always populated; useful for
+    /// the planner even on CPU-only boxes.
+    pub cpu_threads: u16,
+}
+
+impl HardwareProbe {
+    /// Detect everything in one call. The cost is one syscall on
+    /// each backend (or no syscall on CPU-only builds), so it's fine
+    /// to run at startup or on every heartbeat.
+    pub fn detect() -> Self {
+        let cpu_threads = std::thread::available_parallelism()
+            .map(|n| n.get().min(u16::MAX as usize) as u16)
+            .unwrap_or(1);
+
+        // Try CUDA first (Linux/Windows). Compile-time gated so
+        // CPU-only builds don't pull in the bindings.
+        #[cfg(feature = "cuda")]
+        {
+            if candle_core::utils::cuda_is_available() {
+                let caps = cuda_caps();
+                return Self {
+                    backend: ComputeBackend::Cuda,
+                    has_accelerator: true,
+                    cpu_threads,
+                    vram_free_bytes: caps.as_ref().and_then(|c| c.vram_free_bytes),
+                    vram_total_bytes: caps.as_ref().and_then(|c| c.vram_total_bytes),
+                    estimated_fp16_tflops: caps.and_then(|c| c.estimated_fp16_tflops),
+                };
+            }
+        }
+
+        // Then Metal (macOS).
+        #[cfg(feature = "metal")]
+        {
+            if candle_core::utils::metal_is_available() {
+                return Self {
+                    backend: ComputeBackend::Metal,
+                    has_accelerator: true,
+                    cpu_threads,
+                    vram_free_bytes: None,
