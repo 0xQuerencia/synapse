@@ -28,13 +28,13 @@ impl ModelIdentity {
             validate_printable("model revision", revision, 1, MAX_REVISION_LEN)?;
         }
 
-        if let Some(sha256) = &self.sha256 {
-            if sha256.len() != SHA256_HEX_LEN || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(ProtocolError::InvalidField {
-                    field: "model sha256",
-                    reason: "expected 64 lowercase or uppercase hex characters",
-                });
-            }
+        if let Some(sha256) = &self.sha256
+            && (sha256.len() != SHA256_HEX_LEN || !sha256.chars().all(|c| c.is_ascii_hexdigit()))
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "model sha256",
+                reason: "expected 64 lowercase or uppercase hex characters",
+            });
         }
 
         Ok(())
