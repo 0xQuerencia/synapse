@@ -25,6 +25,10 @@ impl LayerRange {
     pub fn len(self) -> u32 {
         self.end - self.start
     }
+
+    pub fn is_empty(self) -> bool {
+        self.end == self.start
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
