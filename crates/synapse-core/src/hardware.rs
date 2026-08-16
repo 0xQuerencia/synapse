@@ -86,3 +86,47 @@ impl HardwareProbe {
                     has_accelerator: true,
                     cpu_threads,
                     vram_free_bytes: None,
+                    vram_total_bytes: None,
+                    estimated_fp16_tflops: None,
+                };
+            }
+        }
+
+        // Fallback: CPU.
+        Self {
+            backend: ComputeBackend::Cpu,
+            has_accelerator: false,
+            vram_free_bytes: None,
+            vram_total_bytes: None,
+            estimated_fp16_tflops: None,
+            cpu_threads,
+        }
+    }
+
+    /// Best-effort stable string for the host platform (used in the
+    /// `NodeHello.platform` field).
+    pub fn platform_str() -> &'static str {
+        std::env::consts::OS
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct CudaCaps {
+    vram_free_bytes: Option<u64>,
+    vram_total_bytes: Option<u64>,
+    estimated_fp16_tflops: Option<f32>,
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_caps() -> Option<CudaCaps> {
+    use cudarc::driver::{CudaDevice, result::DriverError};
+    let device = CudaDevice::new(0).ok()?;
+    let mem = device.mem_get_info().ok();
+    let name = device.name().unwrap_or_default();
+    Some(CudaCaps {
+        vram_free_bytes: mem.as_ref().map(|(f, _)| *f as u64),
+        vram_total_bytes: mem.as_ref().map(|(_, t)| *t as u64),
+        estimated_fp16_tflops: Some(estimate_tflops(&name)),
+    })
+}
+
