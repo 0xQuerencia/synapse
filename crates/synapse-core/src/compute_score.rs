@@ -40,3 +40,45 @@ pub const MODEL_LAYER_FOOTPRINT_MB: u64 = 50;
 ///
 /// The function is pure: same inputs → same output. The caller is
 /// responsible for providing a real measured score from
+/// `run_micro_benchmark`. Unit-testable.
+pub fn blend_compute_score(measured: u64, ram_free_mb: u64, probe: &HardwareProbe) -> u64 {
+    let ram_factor = {
+        let min_ram = MODEL_LAYER_FOOTPRINT_MB.saturating_mul(4); // 200 MB
+        if ram_free_mb >= min_ram {
+            1.0_f64
+        } else if ram_free_mb == 0 {
+            0.1_f64
+        } else {
+            (ram_free_mb as f64 / min_ram as f64).max(0.1)
+        }
+    };
+
+    let gpu_factor: f64 = if probe.has_accelerator {
+        probe
+            .estimated_fp16_tflops
+            .map(|tflops| ((tflops as f64) / 10.0).max(1.5))
+            .unwrap_or(2.0) // GPU with unknown TFLOPS → 2× bonus
+    } else {
+        1.0
+    };
+
+    let blended = (measured as f64) * ram_factor * gpu_factor;
+    (blended.round() as u64).clamp(1, MAX_COMPUTE_SCORE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hardware::{ComputeBackend, HardwareProbe};
+
+    fn cpu_probe(threads: u16) -> HardwareProbe {
+        HardwareProbe {
+            backend: ComputeBackend::Cpu,
+            has_accelerator: false,
+            vram_free_bytes: None,
+            vram_total_bytes: None,
+            estimated_fp16_tflops: None,
+            cpu_threads: threads,
+        }
+    }
+
