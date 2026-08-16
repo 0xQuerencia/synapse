@@ -16,7 +16,8 @@ rust-version = "1.94"
 anyhow = "1"
 async-trait = "0.1"
 bincode = "1"
-bytemuck = { version = "1.14", features = ["derive"] }
+bytecheck = "0.8"
+bytemuck = { version = "1.14", features = ["derive", "extern_crate_alloc"] }
 candle-core = "0.8"
 candle-nn = "0.8"
 candle-transformers = "0.8"
