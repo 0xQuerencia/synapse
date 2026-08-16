@@ -41,3 +41,24 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+zstd = { version = "0.13", default-features = false }
+
+# Optimize third-party dependencies (candle, gemm, libp2p, …) in dev builds.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Optimize the workspace crates themselves in dev builds too. Without this,
+# `synapse-core` (the ToyLlama forward pass, RoPE, causal-mask construction,
+# repeat_kv, and all tensor<->wire byte casting) compiles at opt-level=0 while
+# candle's primitives run at 3 — leaving the per-matmul orchestration
+# unoptimized. opt-level=2 keeps incremental compiles reasonable while removing
+# the debug-build inference tax. Use `--release` for absolute best throughput.
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
