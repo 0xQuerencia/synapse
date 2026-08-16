@@ -8,22 +8,29 @@ rust-version.workspace = true
 
 [features]
 default = []
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "dep:cudarc"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+# GPU-aware capability advertising. CPU-only builds still work; the
+# probe just reports `ComputeBackend::Cpu`.
+gpu-advertise = []
 
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 bincode.workspace = true
+bytecheck.workspace = true
 bytemuck.workspace = true
 candle-core.workspace = true
 candle-nn.workspace = true
 candle-transformers.workspace = true
+cudarc = { version = "0.11", optional = true, default-features = false, features = ["driver"] }
 futures.workspace = true
 half.workspace = true
 hf-hub.workspace = true
 libp2p.workspace = true
+lz4_flex.workspace = true
 rand.workspace = true
+rkyv.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
