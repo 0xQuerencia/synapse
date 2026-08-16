@@ -82,3 +82,45 @@ mod tests {
         }
     }
 
+    fn gpu_probe(tflops: f32) -> HardwareProbe {
+        HardwareProbe {
+            backend: ComputeBackend::Cuda,
+            has_accelerator: true,
+            vram_free_bytes: Some(80 * 1024 * 1024 * 1024),
+            vram_total_bytes: Some(80 * 1024 * 1024 * 1024),
+            estimated_fp16_tflops: Some(tflops),
+            cpu_threads: 1,
+        }
+    }
+
+    #[test]
+    fn clamp_to_minimum() {
+        let score = blend_compute_score(0, 0, &cpu_probe(1));
+        assert_eq!(score, 1);
+    }
+
+    #[test]
+    fn clamp_to_maximum() {
+        let probe = gpu_probe(989.0); // H100
+        let score = blend_compute_score(9_999_999, 1_000_000, &probe);
+        assert_eq!(score, MAX_COMPUTE_SCORE);
+    }
+
+    #[test]
+    fn bigger_measured_yields_larger_score() {
+        let probe = cpu_probe(4);
+        let low = blend_compute_score(50, 16_000, &probe);
+        let high = blend_compute_score(200, 16_000, &probe);
+        assert!(high > low);
+    }
+
+    #[test]
+    fn more_ram_yields_larger_score() {
+        let probe = cpu_probe(4);
+        let low = blend_compute_score(100, 100, &probe); // < 200 MB → penalty
+        let high = blend_compute_score(100, 16_000, &probe);
+        assert!(high > low);
+    }
+
+    #[test]
+    fn gpu_scores_higher_than_cpu_with_equal_measured() {
