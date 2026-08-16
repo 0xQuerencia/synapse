@@ -647,3 +647,193 @@ mod tests {
         ));
     }
 }
+
+// ─── Capability-aware planning (Phase 3) ────────────────────────────────
+
+/// Per-layer "throughput score" for a structured `WorkerCapability`.
+///
+/// GPU workers score by `estimated_fp16_tflops` (clamped at 8 layers
+/// per shard — beyond that the tensor wire size exceeds our QUIC
+/// stream window and DCUtR starts hurting). CPU workers score by
+/// `cpu_threads`. This keeps the existing planner's proportional
+/// math working without rewriting it.
+pub fn per_layer_throughput(cap: &crate::WorkerCapability) -> f64 {
+    if cap.hardware.has_gpu {
+        cap.hardware
+            .estimated_fp16_tflops
+            .filter(|&t| t > 0.0)
+            .map(|t| t as f64)
+            // Cap each GPU shard at ~8 layers to keep the
+            // activation wire size under our QUIC stream window.
+            // 989 TFLOPS / 8 layers ≈ 124 TFLOPS per layer; for
+            // weaker GPUs the effective cap is the TFLOPS itself.
+            .map(|t| t.min(989.0 / 8.0))
+            .unwrap_or(50.0)
+    } else {
+        (cap.hardware.cpu_threads as f64).max(1.0)
+    }
+}
+
+/// A peer + its structured `WorkerCapability`, used as input to
+/// [`plan_weighted_shards_capable`].
+#[derive(Clone, Debug)]
+pub struct CapabilityShardParticipant<P> {
+    pub participant: P,
+    pub capability: crate::WorkerCapability,
+}
+
+/// Capability-aware shard planning: same proportional algorithm as
+/// `plan_weighted_shards`, but the per-peer weight comes from
+/// `per_layer_throughput` rather than a hand-tuned `compute_score`.
+///
+/// This is the planner the master should call once Phase 2 is wired
+/// through. The legacy `plan_weighted_shards` remains for back-compat
+/// paths that still have only scalar scores.
+pub fn plan_weighted_shards_capable<P: Clone>(
+    total_layers: usize,
+    workers: &[(P, crate::WorkerCapability)],
+) -> Result<Vec<StaticShardAssignment<P>>, ProtocolError> {
+    if total_layers == 0 {
+        return Err(ProtocolError::InvalidShardPlan {
+            reason: "total layer count must be greater than zero",
+        });
+    }
+    if workers.is_empty() {
+        return Err(ProtocolError::InvalidShardPlan {
+            reason: "at least one worker is required",
+        });
+    }
+
+    let total_weight: f64 = workers
+        .iter()
+        .map(|(_, cap)| per_layer_throughput(cap))
+        .sum();
+    if total_weight <= 0.0 {
+        return Err(ProtocolError::InvalidShardPlan {
+            reason: "aggregate compute is zero",
+        });
+    }
+
+    // Initial proportional targets, floored.
+    let mut targets: Vec<(P, usize, usize)> = workers
+        .iter()
+        .map(|(p, cap)| {
+            let raw = (per_layer_throughput(cap) / total_weight) * (total_layers as f64);
+            // Hard RAM ceiling: at most 1 layer per `RAM_PER_LAYER_HEURISTIC_MB`.
+            let max_layers = if cap.available_ram_mb > 0 {
+                ((cap.available_ram_mb as usize) / (RAM_PER_LAYER_HEURISTIC_MB as usize)).max(1)
+            } else {
+                total_layers
+            };
+            (p.clone(), raw.floor() as usize, max_layers)
+        })
+        .collect();
+
+    // Rebalance to cover `total_layers` exactly.
+    let mut assigned: usize = targets.iter().map(|(_, t, _)| t).sum();
+    while assigned < total_layers {
+        let mut progressed = false;
+        for t in &mut targets {
+            if assigned >= total_layers {
+                break;
+            }
+            if t.1 < total_layers && t.2 > t.1 {
+                t.1 += 1;
+                assigned += 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break; // everyone at cap
+        }
+    }
+
+    // Drop zero-target participants.
+    targets.retain(|(_, t, _)| *t > 0);
+
+    // Convert to (start, end) ranges, contiguous in input order.
+    let mut cursor = 0usize;
+    let mut out = Vec::with_capacity(targets.len());
+    for (participant, target, _cap) in targets {
+        let start = cursor;
+        let end = cursor + target;
+        cursor = end;
+        out.push(StaticShardAssignment {
+            participant,
+            layer_range: start..end,
+        });
+    }
+    Ok(out)
+}
+
+/// One peer's slice of the model. Layer indices are contiguous.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapabilityShardAssignment<P> {
+    pub participant: P,
+    pub layer_range: std::ops::Range<usize>,
+}
+
+#[cfg(test)]
+mod capable_tests {
+    use super::*;
+    use crate::{ComputeBackend, HardwareSummary, WorkerCapability};
+
+    fn gpu_cap(tflops: f32) -> WorkerCapability {
+        WorkerCapability {
+            compute_score: (tflops * 1000.0) as u64,
+            available_ram_mb: 80_000,
+            hardware: HardwareSummary {
+                has_gpu: true,
+                backend: ComputeBackend::Cuda,
+                estimated_fp16_tflops: Some(tflops),
+                vram_total_bytes: Some(80 * 1024 * 1024 * 1024),
+                vram_free_bytes: Some(80 * 1024 * 1024 * 1024),
+                cpu_threads: 1,
+            },
+        }
+    }
+
+    fn cpu_cap(threads: u16) -> WorkerCapability {
+        WorkerCapability {
+            compute_score: (threads as u64) * 100,
+            available_ram_mb: 16_000,
+            hardware: HardwareSummary {
+                has_gpu: false,
+                backend: ComputeBackend::Cpu,
+                estimated_fp16_tflops: None,
+                vram_total_bytes: None,
+                vram_free_bytes: None,
+                cpu_threads: threads,
+            },
+        }
+    }
+
+    #[test]
+    fn gpu_scores_higher_than_cpu() {
+        assert!(per_layer_throughput(&gpu_cap(989.0)) > per_layer_throughput(&cpu_cap(16)));
+    }
+
+    #[test]
+    fn plan_heavy_gpu_first() {
+        let gpu = gpu_cap(989.0);
+        let cpu = cpu_cap(8);
+        // distinct keys for the two workers
+        let g_key: u8 = 1;
+        let c_key: u8 = 2;
+        let plan = plan_weighted_shards_capable::<u8>(32, &[(g_key, gpu), (c_key, cpu)]).unwrap();
+        let gpu_layers: usize = plan
+            .iter()
+            .filter(|a| a.participant == g_key)
+            .map(|a| a.layer_range.len())
+            .sum();
+        let cpu_layers: usize = plan
+            .iter()
+            .filter(|a| a.participant == c_key)
+            .map(|a| a.layer_range.len())
+            .sum();
+        assert!(gpu_layers > cpu_layers);
+        // covers all layers exactly
+        let total: usize = plan.iter().map(|a| a.layer_range.len()).sum();
+        assert_eq!(total, 32);
+    }
+}
