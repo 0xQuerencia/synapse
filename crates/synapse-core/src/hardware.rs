@@ -130,3 +130,48 @@ fn cuda_caps() -> Option<CudaCaps> {
     })
 }
 
+/// Coarse lookup table. Values are FP16 dense matmul TFLOPS (no
+/// sparsity). Replace with a proper micro-benchmark in a follow-up.
+#[cfg(feature = "cuda")]
+fn estimate_tflops(model_name: &str) -> f32 {
+    let upper = model_name.to_ascii_uppercase();
+    if upper.contains("H100") {
+        989.0
+    } else if upper.contains("A100") {
+        312.0
+    } else if upper.contains("L40S") {
+        362.0
+    } else if upper.contains("RTX 4090") {
+        165.0
+    } else if upper.contains("RTX 3090") {
+        71.0
+    } else if upper.contains("RTX 4080") {
+        97.0
+    } else if upper.contains("V100") {
+        125.0
+    } else if upper.contains("T4") {
+        65.0
+    } else {
+        50.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_is_cpu_on_unaccelerated_build() {
+        let p = HardwareProbe::detect();
+        assert_eq!(p.backend, ComputeBackend::Cpu);
+        assert!(!p.has_accelerator);
+        assert!(p.cpu_threads >= 1);
+    }
+
+    #[test]
+    fn backend_as_str_is_stable() {
+        assert_eq!(ComputeBackend::Cpu.as_str(), "cpu");
+        assert_eq!(ComputeBackend::Cuda.as_str(), "cuda");
+        assert_eq!(ComputeBackend::Metal.as_str(), "metal");
+    }
+}
