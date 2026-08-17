@@ -308,7 +308,7 @@ mod tests {
         let payload = tensor_to_payload(&original).unwrap();
         assert_eq!(payload.dtype, DType::F32);
         assert_eq!(payload.shape, vec![2, 2]);
-        assert_eq!(payload.bytes.len(), 4 * 4); // 4 floats × 4 bytes
+        assert_eq!(payload.data.len(), 4 * 4); // 4 floats × 4 bytes
 
         let restored = payload_to_tensor(&payload).unwrap();
         assert!(restored.device().is_cpu());
