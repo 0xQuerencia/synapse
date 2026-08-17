@@ -180,25 +180,42 @@ pub fn bytes_to_tensor_owned(shape: &[usize], dtype: DType, bytes: Vec<u8>) -> R
     );
 
     let tensor = match dtype {
-        DType::F32 => {
-            let data = decode_f32(bytes)?;
-            Tensor::from_slice(data.as_slice(), shape, &Device::Cpu)?
-        }
-        DType::I64 => {
-            let data = decode_i64(bytes)?;
-            Tensor::from_slice(data.as_slice(), shape, &Device::Cpu)?
-        }
-        DType::F16 => {
-            let data = decode_f16(bytes)?;
-            Tensor::from_slice(data.as_slice(), shape, &Device::Cpu)?
-        }
-        DType::BF16 => {
-            let data = decode_bf16(bytes)?;
-            Tensor::from_slice(data.as_slice(), shape, &Device::Cpu)?
-        }
+        DType::F32 => match bytemuck::try_cast_vec::<u8, f32>(bytes) {
+            Ok(data) => Tensor::from_vec(data, shape, &Device::Cpu)?,
+            Err((_, original_bytes)) => {
+                let data = decode_f32(&original_bytes)?;
+                Tensor::from_slice(data.as_slice(), shape, &Device::Cpu)?
+            }
+        },
+        DType::I64 => match bytemuck::try_cast_vec::<u8, i64>(bytes) {
+            Ok(data) => Tensor::from_vec(data, shape, &Device::Cpu)?,
+            Err((_, original_bytes)) => {
+                let data = decode_i64(&original_bytes)?;
+                Tensor::from_slice(data.as_slice(), shape, &Device::Cpu)?
+            }
+        },
+        DType::F16 => match bytemuck::try_cast_vec::<u8, half::f16>(bytes) {
+            Ok(data) => Tensor::from_vec(data, shape, &Device::Cpu)?,
+            Err((_, original_bytes)) => {
+                let data = decode_f16(&original_bytes)?;
+                Tensor::from_slice(data.as_slice(), shape, &Device::Cpu)?
+            }
+        },
+        DType::BF16 => match bytemuck::try_cast_vec::<u8, half::bf16>(bytes) {
+            Ok(data) => Tensor::from_vec(data, shape, &Device::Cpu)?,
+            Err((_, original_bytes)) => {
+                let data = decode_bf16(&original_bytes)?;
+                Tensor::from_slice(data.as_slice(), shape, &Device::Cpu)?
+            }
+        },
     };
 
     Ok(tensor)
+}
+
+/// Reconstruct a candle `Tensor` from raw shape, dtype, and bytes.
+pub fn bytes_to_tensor(shape: &[usize], dtype: DType, bytes: &[u8]) -> Result<Tensor> {
+    bytes_to_tensor_owned(shape, dtype, bytes.to_vec())
 }
 
 fn decode_f32(bytes: &[u8]) -> Result<Vec<f32>> {
