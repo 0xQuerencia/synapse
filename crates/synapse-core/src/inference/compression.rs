@@ -64,3 +64,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lz4_roundtrip_preserves_bytes() {
+        // Realistic-ish activation bytes: floats clustered around 0.
+        // lz4 achieves 2-3x on this; random bytes would not compress
+        // at all, which is the right outcome (we test that elsewhere).
+        let mut floats: Vec<f32> = Vec::with_capacity(262_144);
+        let mut x: f32 = 0.0;
+        for _ in 0..262_144 {
+            x = (x * 1.13 + 0.07).fract() * 2.0 - 1.0;
+            floats.push(x);
+        }
+        let big: Vec<u8> = bytemuck::cast_slice(&floats).to_vec();
+        let compressed = compress(&big, CompressionCodec::Lz4).unwrap();
+        assert!(
+            compressed.len() < big.len() / 2,
+            "lz4 should shrink activation-like bytes at least 2x; got {} -> {}",
+            big.len(),
+            compressed.len()
+        );
+        let back = decompress(&compressed, CompressionCodec::Lz4).unwrap();
+        assert_eq!(back, big);
+    }
+
+    #[test]
+    fn zstd_roundtrip_preserves_bytes() {
+        let big: Vec<u8> = (0..4096_u32)
+            .flat_map(|i| (i ^ 0x55).to_le_bytes())
+            .collect();
+        let compressed = compress(&big, CompressionCodec::Zstd { level: 3 }).unwrap();
+        let back = decompress(&compressed, CompressionCodec::Zstd { level: 3 }).unwrap();
+        assert_eq!(back, big);
+    }
+
+    #[test]
