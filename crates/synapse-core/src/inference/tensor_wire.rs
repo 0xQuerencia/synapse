@@ -371,4 +371,36 @@ mod tests {
         let err = bytes_to_tensor(&[2], DType::F32, &[0_u8; 4]).unwrap_err();
         assert!(err.to_string().contains("tensor byte length mismatch"));
     }
+
+    /// Phase 5: activation hops downcast f32 → bf16 before the wire and
+    /// upcast back to f32 on receipt (see `generation.rs`). This exercises
+    /// that exact cast → serialize → deserialize → cast round trip and
+    /// checks the payload actually shrank and the precision loss stayed
+    /// within bf16's ~3-decimal-digit precision.
+    #[test]
+    fn bf16_wire_roundtrip_shrinks_payload_within_precision_budget() {
+        let original = Tensor::new(&[1.0_f32, -2.5, 3.14159, 100.25], &Device::Cpu)
+            .unwrap()
+            .reshape((2, 2))
+            .unwrap();
+
+        let wire_tensor = original.to_dtype(candle_core::DType::BF16).unwrap();
+        let payload = tensor_to_payload(&wire_tensor).unwrap();
+        assert_eq!(payload.dtype, DType::BF16);
+        assert_eq!(payload.data.len(), 4 * 2, "bf16 halves the f32 byte count");
+
+        let restored = payload_to_tensor(&payload)
+            .unwrap()
+            .to_dtype(candle_core::DType::F32)
+            .unwrap();
+
+        let orig_values = original.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let rest_values = restored.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (a, b) in orig_values.iter().zip(rest_values.iter()) {
+            assert!(
+                (a - b).abs() < 0.5,
+                "bf16 round trip drifted too far: {a} vs {b}"
+            );
+        }
+    }
 }
