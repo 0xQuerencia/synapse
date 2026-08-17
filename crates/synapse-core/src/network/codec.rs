@@ -60,7 +60,7 @@ impl request_response::Codec for ProtocolCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_bincode(io, &req).await
+        write_compressed_bincode(io, &req).await
     }
 
     async fn write_response<T>(
