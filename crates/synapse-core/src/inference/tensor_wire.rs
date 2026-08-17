@@ -1,12 +1,29 @@
 //! Zero-copy tensor serialization between candle `Tensor` and wire `TensorPayload`.
 //!
-//! Uses `bytemuck::cast_slice` for fast f32↔u8 conversion. Both sides are assumed
-//! little-endian (ARM64 + x86_64), which covers all practical deployment targets.
+//! Two paths:
+//!
+//! 1. **CPU tensor + `CompressionCodec::None`** — [`encode_tensor`]
+//!    returns a `Borrowed` variant that points directly at the
+//!    candle storage. The wire serializer copies once into the
+//!    archive; the receive side memory-maps the archive for true
+//!    zero-copy access. This is the fast path for the typical
+//!    `master → worker` hop on a CPU build.
+//!
+//! 2. **Accelerator tensor OR explicit compression** — falls back to
+//!    [`encode_with_compression`] which copies through CPU and
+//!    optionally compresses. Compressed tensors typically shrink
+//!    2-3× on Llama-class hidden states, so this wins when the
+//!    wire is the bottleneck.
+//!
+//! Both paths use `bytemuck::cast_slice` for f32↔u8 conversion. Both
+//! sides are assumed little-endian (ARM64 + x86_64), which covers
+//! all practical deployment targets.
 
 use anyhow::{Context, Result, bail, ensure};
 use candle_core::{Device, Tensor};
 
-use crate::protocol::{DType, TensorPayload};
+use crate::inference::compression;
+use crate::protocol::{CompressionCodec, DType, TensorPayload};
 
 /// Convert a protocol `DType` to a candle `DType`.
 pub fn to_candle_dtype(dtype: DType) -> candle_core::DType {
