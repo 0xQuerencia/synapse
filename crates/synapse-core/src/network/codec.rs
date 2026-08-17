@@ -48,7 +48,7 @@ impl request_response::Codec for ProtocolCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_bincode(io).await
+        read_compressed_bincode(io).await
     }
 
     async fn write_request<T>(
