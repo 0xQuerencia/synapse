@@ -124,3 +124,45 @@ mod tests {
 
     #[test]
     fn gpu_scores_higher_than_cpu_with_equal_measured() {
+        let cpu = cpu_probe(16);
+        let gpu = gpu_probe(50.0); // modest GPU
+        let cpu_score = blend_compute_score(100, 16_000, &cpu);
+        let gpu_score = blend_compute_score(100, 16_000, &gpu);
+        assert!(
+            gpu_score > cpu_score,
+            "GPU score {gpu_score} should exceed CPU score {cpu_score}"
+        );
+    }
+
+    #[test]
+    fn gpu_with_unknown_tflops_still_gets_bonus() {
+        let gpu_unknown = HardwareProbe {
+            backend: ComputeBackend::Metal,
+            has_accelerator: true,
+            vram_free_bytes: None,
+            vram_total_bytes: None,
+            estimated_fp16_tflops: None,
+            cpu_threads: 8,
+        };
+        let cpu = cpu_probe(8);
+        let gpu_score = blend_compute_score(100, 16_000, &gpu_unknown);
+        let cpu_score = blend_compute_score(100, 16_000, &cpu);
+        assert!(gpu_score > cpu_score);
+    }
+
+    #[test]
+    fn ram_starvation_penalty_applies() {
+        let probe = cpu_probe(4);
+        let starved = blend_compute_score(100, 50, &probe); // < 200 MB
+        let well_fed = blend_compute_score(100, 16_000, &probe);
+        assert!(starved < well_fed);
+    }
+
+    #[test]
+    fn deterministic() {
+        let probe = cpu_probe(8);
+        let a = blend_compute_score(42, 8_192, &probe);
+        let b = blend_compute_score(42, 8_192, &probe);
+        assert_eq!(a, b);
+    }
+}
