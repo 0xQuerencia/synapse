@@ -97,3 +97,37 @@ mod tests {
     }
 
     #[test]
+    fn none_codec_is_passthrough() {
+        let data = vec![1, 2, 3, 4, 5];
+        assert_eq!(compress(&data, CompressionCodec::None).unwrap(), data);
+        assert_eq!(decompress(&data, CompressionCodec::None).unwrap(), data);
+    }
+
+    #[test]
+    fn zstd_level_validation() {
+        assert!(validate_codec(CompressionCodec::Zstd { level: 0 }).is_err());
+        assert!(validate_codec(CompressionCodec::Zstd { level: 23 }).is_err());
+        assert!(validate_codec(CompressionCodec::Zstd { level: 1 }).is_ok());
+        assert!(validate_codec(CompressionCodec::Zstd { level: 22 }).is_ok());
+    }
+
+    #[test]
+    fn activations_compress_well() {
+        // Realistic-ish Llama hidden state: floats clustered around 0
+        // with a normal distribution. lz4 typically achieves 2-3x.
+        let mut state: Vec<f32> = Vec::with_capacity(4096);
+        let mut x: f32 = 0.0;
+        for _ in 0..4096 {
+            // Cheap LCG-ish PRNG to avoid pulling in `rand` here.
+            x = (x * 1.13 + 0.07).fract() * 2.0 - 1.0;
+            state.push(x);
+        }
+        let raw = bytemuck::cast_slice::<f32, u8>(&state).to_vec();
+        let compressed = compress(&raw, CompressionCodec::Lz4).unwrap();
+        let ratio = compressed.len() as f32 / raw.len() as f32;
+        assert!(
+            ratio < 0.9,
+            "lz4 should compress activations < 10%; got {ratio:.2}"
+        );
+    }
+}
