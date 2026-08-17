@@ -279,22 +279,20 @@ mod tests {
     use super::*;
 
     fn maybe_test_accelerator_device() -> Option<Device> {
-        if std::env::var_os("SYNAPSE_TEST_ACCEL").is_none() {
-            return None;
-        }
+        std::env::var_os("SYNAPSE_TEST_ACCEL")?;
         if !cfg!(any(feature = "cuda", feature = "metal")) {
             return None;
         }
 
-        if candle_core::utils::cuda_is_available() {
-            if let Ok(device) = Device::new_cuda(0) {
-                return Some(device);
-            }
+        if candle_core::utils::cuda_is_available()
+            && let Ok(device) = Device::new_cuda(0)
+        {
+            return Some(device);
         }
-        if candle_core::utils::metal_is_available() {
-            if let Ok(device) = Device::new_metal(0) {
-                return Some(device);
-            }
+        if candle_core::utils::metal_is_available()
+            && let Ok(device) = Device::new_metal(0)
+        {
+            return Some(device);
         }
         None
     }
