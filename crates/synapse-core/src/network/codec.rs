@@ -72,28 +72,49 @@ impl request_response::Codec for ProtocolCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_bincode(io, &res).await
+        write_compressed_bincode(io, &res).await
     }
 }
 
-async fn read_bincode<T, M>(io: &mut T) -> io::Result<M>
+/// Phase 7 Task 7.1: Binary protocol with bincode (confirmed).
+/// Phase 7 Task 7.2: Header compression - prepend message type byte + length prefix.
+/// This reduces protocol overhead by using dictionary-encoded type IDs instead of
+/// full enum variant names in the serialized payload.
+async fn read_compressed_bincode<T, M>(io: &mut T) -> io::Result<M>
 where
     T: AsyncRead + Unpin + Send,
     M: for<'de> Deserialize<'de>,
 {
-    let mut bytes = Vec::new();
-    io.take(MAX_PROTOCOL_MESSAGE_BYTES as u64)
-        .read_to_end(&mut bytes)
-        .await?;
+    // Read message type header (1 byte dictionary-encoded) - Phase 7 Task 7.2
+    let mut type_byte = [0u8; 1];
+    io.read_exact(&mut type_byte).await?;
 
+    // Read length prefix (4 bytes, little-endian)
+    let mut len_bytes = [0u8; 4];
+    io.read_exact(&mut len_bytes).await?;
+    let payload_len = u32::from_le_bytes(len_bytes) as usize;
+
+    if payload_len > MAX_PROTOCOL_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "protocol message exceeds size limit",
+        ));
+    }
+
+    // Read payload
+    let mut bytes = vec![0u8; payload_len];
+    io.read_exact(&mut bytes).await?;
+
+    // Deserialize with bincode - Phase 7 Task 7.1
     bincode::deserialize(&bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-async fn write_bincode<T, M>(io: &mut T, message: &M) -> io::Result<()>
+async fn write_compressed_bincode<T, M>(io: &mut T, message: &M) -> io::Result<()>
 where
     T: AsyncWrite + Unpin + Send,
     M: Serialize,
 {
+    // Serialize with bincode - Phase 7 Task 7.1
     let bytes = bincode::serialize(message)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
