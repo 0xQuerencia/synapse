@@ -47,10 +47,10 @@ pub fn list_cached_hf_models() -> Result<Vec<String>> {
 }
 
 fn locate_hub_dir() -> Result<PathBuf> {
-    if let Ok(hf_home) = std::env::var("HF_HOME") {
-        if !hf_home.is_empty() {
-            return Ok(PathBuf::from(hf_home).join("hub"));
-        }
+    if let Ok(hf_home) = std::env::var("HF_HOME")
+        && !hf_home.is_empty()
+    {
+        return Ok(PathBuf::from(hf_home).join("hub"));
     }
 
     let home = std::env::var("HOME").map_err(|_| anyhow!("HOME is not set"))?;
