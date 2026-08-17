@@ -31,3 +31,36 @@ pub fn compress(input: &[u8], codec: CompressionCodec) -> Result<Vec<u8>> {
         CompressionCodec::Zstd { level } => {
             let level = level.clamp(1, 22);
             zstd::stream::encode_all(input, level).context("zstd encode failed")
+        }
+    }
+}
+
+/// Inverse of [`compress`].
+pub fn decompress(input: &[u8], codec: CompressionCodec) -> Result<Vec<u8>> {
+    match codec {
+        CompressionCodec::None => Ok(input.to_vec()),
+        CompressionCodec::Lz4 => {
+            lz4_flex::block::decompress_size_prepended(input).context("lz4 decode failed")
+        }
+        CompressionCodec::Zstd { .. } => {
+            zstd::stream::decode_all(input).context("zstd decode failed")
+        }
+    }
+}
+
+/// Reject obviously-bogus zstd levels before we hand them to the
+/// compressor (which would silently clamp but log nothing).
+pub fn validate_codec(codec: CompressionCodec) -> Result<()> {
+    if let CompressionCodec::Zstd { level } = codec
+        && !(1..=22).contains(&level)
+    {
+        bail!("zstd level out of range: {level} (must be 1..=22)");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
