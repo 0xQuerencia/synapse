@@ -1,4 +1,6 @@
 pub mod cache;
+pub mod compression;
+pub mod kv_cache;
 pub mod model_loader;
 pub mod pipeline;
 pub mod prompt_format;
