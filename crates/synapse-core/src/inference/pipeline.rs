@@ -1249,8 +1249,30 @@ impl ToyLlama {
     pub fn head(&self, hidden: &Tensor) -> Result<Tensor> {
         let hidden = self.to_model_device(hidden, "lm_head hidden state")?;
         let normed = self.norm.forward(&hidden)?;
-        let logits = normed.broadcast_matmul(&self.lm_head.t()?)?;
+        let logits = normed.broadcast_matmul(&self.lm_head)?;
         info!(shape = ?logits.dims(), "lm_head complete");
+        Ok(logits)
+    }
+
+    /// Run RmsNorm + lm_head for the **last sequence position only**.
+    ///
+    /// Autoregressive sampling only ever reads the final position's logits
+    /// (see [`Self::sample_argmax`]), but `lm_head` is the single most
+    /// expensive matmul in the model (`hidden_size × vocab_size`, and vocab
+    /// is ~49k for SmolLM2). Running it across the whole prompt during
+    /// prefill wastes `(seq_len - 1) / seq_len` of that work — e.g. ~98% on a
+    /// 50-token prompt. Slicing to the last position first makes
+    /// time-to-first-token roughly independent of prompt length.
+    ///
+    /// Input shape:  `[batch, seq_len, hidden_size]`
+    /// Output shape: `[batch, 1, vocab_size]`
+    pub fn head_last_token(&self, hidden: &Tensor) -> Result<Tensor> {
+        let hidden = self.to_model_device(hidden, "lm_head hidden state")?;
+        let seq_len = hidden.dim(1)?;
+        let last_hidden = hidden.narrow(1, seq_len - 1, 1)?;
+        let normed = self.norm.forward(&last_hidden)?;
+        let logits = normed.broadcast_matmul(&self.lm_head)?;
+        trace!(shape = ?logits.dims(), "lm_head (last-token) complete");
         Ok(logits)
     }
 
@@ -1260,7 +1282,8 @@ impl ToyLlama {
     /// - Output logits shape: `[batch, seq_len, vocab_size]`
     pub fn forward_prefill(&self, token_ids: &Tensor) -> Result<Tensor> {
         let hidden = self.embed(token_ids)?;
-        let hidden = self.forward_layers_prefill(&hidden, 0..self.layers.len())?;
+        let window = self.layer_offset..self.layer_offset + self.layers.len();
+        let hidden = self.forward_layers_prefill(&hidden, window)?;
         let logits = self.head(&hidden)?;
         Ok(logits)
     }
