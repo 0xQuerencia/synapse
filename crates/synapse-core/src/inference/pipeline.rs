@@ -977,10 +977,12 @@ impl ToyLlama {
         // Handle tied word embeddings: SmolLM2 doesn't have a separate lm_head
         let lm_head = if config.tie_word_embeddings {
             info!("using tied embeddings for lm_head");
-            embed_tokens.clone()
+            embed_tokens.t()?.contiguous()?
         } else {
             vb.get((config.vocab_size, config.hidden_size), "lm_head.weight")
                 .context("failed to load lm_head")?
+                .t()?
+                .contiguous()?
         };
 
         let rope = RotaryEmbedding::new(
