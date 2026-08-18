@@ -712,10 +712,10 @@ impl LlamaLayer {
 
         // Post-norm → MLP → residual
         let normed = self.post_attention_layernorm.forward(&after_attn)?;
-        let gate = normed.broadcast_matmul(&self.gate_proj.t()?)?;
+        let gate = normed.broadcast_matmul(&self.gate_proj)?;
         let gate = candle_nn::ops::silu(&gate)?;
-        let up = normed.broadcast_matmul(&self.up_proj.t()?)?;
-        let mlp_out = (gate * up)?.broadcast_matmul(&self.down_proj.t()?)?;
+        let up = normed.broadcast_matmul(&self.up_proj)?;
+        let mlp_out = (gate * up)?.broadcast_matmul(&self.down_proj)?;
 
         let output = (after_attn + mlp_out)?;
         Ok(output)
