@@ -914,21 +914,27 @@ impl ToyLlama {
                     (config.intermediate_size, config.hidden_size),
                     &format!("{prefix}.mlp.gate_proj.weight"),
                 )
-                .context(format!("failed to load gate_proj for layer {i}"))?;
+                .context(format!("failed to load gate_proj for layer {i}"))?
+                .t()?
+                .contiguous()?;
 
             let up = vb
                 .get(
                     (config.intermediate_size, config.hidden_size),
                     &format!("{prefix}.mlp.up_proj.weight"),
                 )
-                .context(format!("failed to load up_proj for layer {i}"))?;
+                .context(format!("failed to load up_proj for layer {i}"))?
+                .t()?
+                .contiguous()?;
 
             let down = vb
                 .get(
                     (config.hidden_size, config.intermediate_size),
                     &format!("{prefix}.mlp.down_proj.weight"),
                 )
-                .context(format!("failed to load down_proj for layer {i}"))?;
+                .context(format!("failed to load down_proj for layer {i}"))?
+                .t()?
+                .contiguous()?;
 
             let post_ln_w = vb
                 .get(
