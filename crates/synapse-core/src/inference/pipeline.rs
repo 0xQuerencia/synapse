@@ -511,16 +511,32 @@ impl CausalSelfAttention {
     }
 }
 
-/// Apply causal mask (upper triangle = -inf) to attention weights.
-fn apply_causal_mask(attn: &Tensor, seq_len: usize) -> Result<Tensor> {
-    if seq_len <= 1 {
+/// Apply a causal mask to attention weights.
+///
+/// Query `i` (0-based within this block) may attend to every cached key
+/// position (`j < past_len`) and to block keys up to and including its own
+/// position (`j <= past_len + i`); everything else is masked to `-inf`.
+///
+/// With `past_len == 0` this degenerates to the classic lower-triangular
+/// prefill mask. With `seq_len == 1 && past_len > 0` every cached key is
+/// visible, which matches single-token decode attention.
+fn apply_causal_mask(attn: &Tensor, seq_len: usize, past_len: usize) -> Result<Tensor> {
+    if seq_len <= 1 && past_len == 0 {
         return Ok(attn.clone());
     }
-    // Create a lower-triangular mask
-    let mask: Vec<f32> = (0..seq_len)
-        .flat_map(|i| (0..seq_len).map(move |j| if j <= i { 0.0_f32 } else { f32::NEG_INFINITY }))
-        .collect();
-    let mask = Tensor::new(mask.as_slice(), attn.device())?.reshape((1, 1, seq_len, seq_len))?;
+    let key_len = attn.dim(3)?;
+    let mut mask = Vec::with_capacity(seq_len * key_len);
+    for i in 0..seq_len {
+        mask.extend(std::iter::repeat(0.0_f32).take(key_len.min(past_len)));
+        mask.extend((past_len..key_len).map(|j| {
+            if j <= past_len + i {
+                0.0_f32
+            } else {
+                f32::NEG_INFINITY
+            }
+        }));
+    }
+    let mask = Tensor::new(mask.as_slice(), attn.device())?.reshape((1, 1, seq_len, key_len))?;
     let result = attn.broadcast_add(&mask)?;
     Ok(result)
 }
