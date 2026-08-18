@@ -1294,7 +1294,8 @@ impl ToyLlama {
     /// - Output logits shape: `[batch, 1, vocab_size]`
     pub fn forward_decode(&self, token_ids: &Tensor) -> Result<Tensor> {
         let hidden = self.embed(token_ids)?;
-        let hidden = self.forward_layers_decode(&hidden, 0..self.layers.len())?;
+        let window = self.layer_offset..self.layer_offset + self.layers.len();
+        let hidden = self.forward_layers_decode(&hidden, window)?;
         let logits = self.head(&hidden)?;
         Ok(logits)
     }
