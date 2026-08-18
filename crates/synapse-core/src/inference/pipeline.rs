@@ -1367,7 +1367,7 @@ impl ToyLlama {
 
             if step + 1 < max_new_tokens {
                 // Decode: process newest token only, while reusing + appending KV cache.
-                let decode = Tensor::new(&[next_token], &device)?.reshape((1, 1))?;
+                let decode = Tensor::new(&[next_token], device)?.reshape((1, 1))?;
                 logits = self.forward_decode(&decode)?;
             }
         }
