@@ -1087,8 +1087,9 @@ impl ToyLlama {
 
         let mut h = hidden;
         for i in layer_range.clone() {
-            h = self.layers[i].forward_prefill(&h, &self.rope)?;
-            info!(layer = i, shape = ?h.dims(), "prefill layer forward complete");
+            let li = self.local_layer_index(i)?;
+            h = self.layers[li].forward_prefill(&h, &self.rope)?;
+            trace!(layer = i, shape = ?h.dims(), "prefill layer forward complete");
         }
         Ok(h)
     }
