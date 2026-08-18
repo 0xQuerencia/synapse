@@ -1433,12 +1433,12 @@ impl ToyLlama {
 
     /// Run a subset of transformer layers in speculative mode.
     ///
-    /// Like prefill, processes multiple tokens at once, but appends to existing
+    /// Processes multiple tokens at once while **appending** to the existing
     /// KV cache instead of replacing it. Used for speculative decoding
     /// verification passes where we need to process draft_len tokens in one go
     /// while preserving the cache from previous decode steps.
     ///
-    /// - Input shape: `[batch, draft_len, hidden_size]`
+    /// - Input shape: `[batch, draft_len >= 1, hidden_size]`
     /// - Output shape: `[batch, draft_len, hidden_size]`
     /// - Cache behavior: appends draft_len tokens to existing per-layer KV cache.
     pub fn forward_layers_speculative(
