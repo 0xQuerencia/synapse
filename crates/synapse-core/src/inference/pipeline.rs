@@ -813,18 +813,45 @@ pub struct ToyLlama {
     norm: RmsNorm,
     lm_head: Tensor,
     rope: RotaryEmbedding,
+    /// Global index of the first owned transformer block (0 for full loads).
+    layer_offset: usize,
     pub config: ToyLlamaConfig,
 }
 
 impl ToyLlama {
-    /// Load from safetensors weights and config.
+    /// Load the full model from safetensors weights and config.
     pub fn load(config: &ToyLlamaConfig, weights_path: &Path) -> Result<Self> {
-        info!(?weights_path, "loading Llama weights from safetensors");
+        Self::load_range(config, weights_path, 0..config.num_hidden_layers)
+    }
+
+    /// Slice-only construction: loads embed, final norm, LM head and *only*
+    /// the transformer blocks in `range`. Every other block is skipped at
+    /// load time, so a worker's resident memory stays proportional to its
+    /// slice of the model — a 32-layer model split across 4 nodes loads a
+    /// quarter of the blocks per node, not the whole checkpoint.
+    ///
+    /// Multi-shard checkpoints (`model.safetensors.index.json` next to the
+    /// weights file) are resolved automatically and only referenced shard
+    /// files are mmap'd.
+    pub fn load_range(
+        config: &ToyLlamaConfig,
+        weights_path: &Path,
+        range: Range<usize>,
+    ) -> Result<Self> {
+        info!(
+            ?weights_path,
+            ?range,
+            "loading Llama weights from safetensors"
+        );
 
         let device = get_best_device().context("failed to select inference device")?;
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path.to_path_buf()], DType::F32, &device)?
+        let dtype = match config.torch_dtype.as_str() {
+            "bfloat16" => DType::BF16,
+            "float16" | "half" => DType::F16,
+            _ => DType::F32,
         };
+        let shards = shard_files(weights_path)?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&shards, dtype, &device)? };
 
         let embed_tokens = vb
             .get(
