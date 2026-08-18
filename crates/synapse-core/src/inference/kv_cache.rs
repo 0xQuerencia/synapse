@@ -84,3 +84,46 @@ impl Default for IncrementalKVCache {
 /// Allows the master to track what has been sent for each active generation
 /// and extract deltas for subsequent hops.
 #[derive(Default)]
+pub struct KVCacheTracker {
+    /// Active KV-cache states indexed by trace ID.
+    caches: HashMap<String, IncrementalKVCache>,
+}
+
+impl KVCacheTracker {
+    /// Create a new empty tracker.
+    pub fn new() -> Self {
+        Self {
+            caches: HashMap::new(),
+        }
+    }
+
+    /// Get or create a KV-cache for the given trace ID.
+    pub fn get_or_create(&mut self, trace_id: &str) -> &mut IncrementalKVCache {
+        self.caches.entry(trace_id.to_owned()).or_default()
+    }
+
+    /// Remove a completed generation's KV-cache.
+    pub fn remove(&mut self, trace_id: &str) -> Option<IncrementalKVCache> {
+        self.caches.remove(trace_id)
+    }
+
+    /// Clear all tracked caches (e.g., on node reset).
+    pub fn clear(&mut self) {
+        self.caches.clear();
+    }
+
+    /// Get the number of active generations being tracked.
+    pub fn len(&self) -> usize {
+        self.caches.len()
+    }
+
+    /// Check if any generations are being tracked.
+    pub fn is_empty(&self) -> bool {
+        self.caches.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
