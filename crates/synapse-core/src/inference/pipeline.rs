@@ -426,7 +426,83 @@ impl CausalSelfAttention {
             self.num_heads * self.head_dim,
         ))?;
 
-        let output = attn_output.broadcast_matmul(&self.o_proj.t()?)?;
+        let output = attn_output.broadcast_matmul(&self.o_proj)?;
+        Ok(AttentionForward {
+            output,
+            key: cache_k,
+            value: cache_v,
+        })
+    }
+
+    /// Multi-token extend: append `seq_len` positions to the existing cache.
+    ///
+    /// Used by speculative decoding verification passes, which feed
+    /// `[last_committed_token, draft_1, ..., draft_k]` in one forward while
+    /// keeping every previously cached position visible. Identical to
+    /// [`Self::forward_decode`] when `seq_len == 1`.
+    fn forward_extend(
+        &self,
+        hidden: &Tensor,
+        rope: &RotaryEmbedding,
+        kv_cache: &LayerKvCache,
+    ) -> Result<AttentionForward> {
+        let (batch, seq_len, _) = hidden.dims3()?;
+        if seq_len == 0 {
+            bail!("extend attention received an empty sequence");
+        }
+
+        let past_seq_len = kv_cache.sequence_len()?.unwrap_or(0);
+
+        // Project Q, K, V for the new block of tokens.
+        let q = hidden.broadcast_matmul(&self.q_proj)?;
+        let k = hidden.broadcast_matmul(&self.k_proj)?;
+        let v = hidden.broadcast_matmul(&self.v_proj)?;
+
+        // [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
+        let q = q
+            .reshape((batch, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        // New tokens occupy positions [past_seq_len, past_seq_len + seq_len).
+        let q = rope.apply_with_offset(&q, past_seq_len, seq_len)?;
+        let new_k = rope.apply_with_offset(&k, past_seq_len, seq_len)?;
+        let new_v = v;
+
+        // Append the new block onto the cached historical sequence.
+        let (cache_k, cache_v) = kv_cache.merge_with_appended(&new_k, &new_v)?;
+
+        // Repeat KV heads for GQA.
+        let (k, v) = if self.num_kv_heads != self.num_heads {
+            let repeats = self.num_heads / self.num_kv_heads;
+            let k = repeat_kv(&cache_k, repeats)?;
+            let v = repeat_kv(&cache_v, repeats)?;
+            (k, v)
+        } else {
+            (cache_k.clone(), cache_v.clone())
+        };
+
+        // Each new query attends to all cached keys plus block keys up to
+        // its own position.
+        let scale = (self.head_dim as f64).sqrt();
+        let attn_weights = q.broadcast_matmul(&k.transpose(2, 3)?)?;
+        let attn_weights = (attn_weights / scale)?;
+        let attn_weights = apply_causal_mask(&attn_weights, seq_len, past_seq_len)?;
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_output = attn_weights.broadcast_matmul(&v)?;
+
+        let attn_output = attn_output.transpose(1, 2)?.reshape((
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ))?;
+
+        let output = attn_output.broadcast_matmul(&self.o_proj)?;
         Ok(AttentionForward {
             output,
             key: cache_k,
