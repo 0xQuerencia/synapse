@@ -1222,7 +1222,8 @@ impl ToyLlama {
     pub fn clear_kv_cache_range(&self, layer_range: Range<usize>) -> Result<()> {
         self.validate_layer_range(&layer_range)?;
         for i in layer_range {
-            self.layers[i].clear_kv_cache()?;
+            let li = self.local_layer_index(i)?;
+            self.layers[li].clear_kv_cache()?;
         }
         Ok(())
     }
