@@ -1051,7 +1051,7 @@ impl ToyLlama {
             flat_hidden.unsqueeze(0)?
         };
 
-        info!(shape = ?hidden.dims(), "embedding complete");
+        trace!(shape = ?hidden.dims(), "embedding complete");
         Ok(hidden)
     }
 
