@@ -43,6 +43,15 @@ pub struct ToyLlamaConfig {
     pub max_position_embeddings: usize,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
+    /// Declared weight dtype (`torch_dtype` in config.json). Real checkpoints
+    /// store weights as `bfloat16`/`float16`; we honor that at load time so
+    /// large models don't double in RAM when forced to f32.
+    #[serde(default = "default_torch_dtype", rename = "torch_dtype")]
+    pub torch_dtype: String,
+}
+
+fn default_torch_dtype() -> String {
+    "float32".to_owned()
 }
 
 fn default_num_heads() -> usize {
