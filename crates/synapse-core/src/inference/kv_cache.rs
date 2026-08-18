@@ -41,3 +41,46 @@ impl IncrementalKVCache {
     /// Advances the `last_sent_length` watermark to the current cache size.
     /// The first call returns the entire cache; subsequent calls return only
     /// new additions.
+    pub fn get_delta(&mut self) -> &[u8] {
+        let delta = &self.full_cache[self.last_sent_length..];
+        self.last_sent_length = self.full_cache.len();
+        delta
+    }
+
+    /// Append a delta received from another node to the local cache.
+    ///
+    /// This reconstructs the full KV-cache incrementally as deltas arrive
+    /// from upstream hops.
+    pub fn apply_delta(&mut self, delta: &[u8]) {
+        self.full_cache.extend_from_slice(delta);
+    }
+
+    /// Get the full accumulated KV-cache.
+    pub fn full_cache(&self) -> &[u8] {
+        &self.full_cache
+    }
+
+    /// Get the current size of the full cache in bytes.
+    pub fn size(&self) -> usize {
+        self.full_cache.len()
+    }
+
+    /// Reset the cache to empty (used when starting a new generation).
+    pub fn reset(&mut self) {
+        self.full_cache.clear();
+        self.last_sent_length = 0;
+    }
+}
+
+impl Default for IncrementalKVCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-generation KV-cache tracker for the master node.
+///
+/// Maps generation trace IDs to their incremental KV-cache state.
+/// Allows the master to track what has been sent for each active generation
+/// and extract deltas for subsequent hops.
+#[derive(Default)]
