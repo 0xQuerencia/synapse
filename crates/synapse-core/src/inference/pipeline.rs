@@ -1418,12 +1418,14 @@ impl ToyLlama {
                 layer_range.end
             );
         }
-        if layer_range.end > self.layers.len() {
+        let global_end = self.layer_offset + self.layers.len();
+        if layer_range.start < self.layer_offset || layer_range.end > global_end {
             bail!(
-                "layer range {}..{} out of bounds (num_layers={})",
+                "layer range {}..{} out of bounds for slice window ({}..{})",
                 layer_range.start,
                 layer_range.end,
-                self.layers.len()
+                self.layer_offset,
+                global_end
             );
         }
         Ok(())
