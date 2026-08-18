@@ -9,17 +9,19 @@
 //!   num_attention_heads, num_key_value_heads, rms_norm_eps,
 //!   tie_word_embeddings, max_position_embeddings, rope_theta
 
+use std::fs::File;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-use candle_core::{DType, Device, Tensor};
+use candle_core::quantized::{QMatMul, gguf_file};
+use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::VarBuilder;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
