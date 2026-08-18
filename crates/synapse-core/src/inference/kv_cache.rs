@@ -127,3 +127,46 @@ impl KVCacheTracker {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_incremental_kv_cache_delta() {
+        let mut cache = IncrementalKVCache::new();
+
+        // Start with initial data
+        cache.full_cache = vec![1, 2, 3, 4];
+
+        // First delta returns everything
+        let delta1 = cache.get_delta();
+        assert_eq!(delta1, &[1, 2, 3, 4]);
+
+        // Add more data
+        cache.apply_delta(&[5, 6]);
+
+        // Second delta returns only new data
+        let delta2 = cache.get_delta();
+        assert_eq!(delta2, &[5, 6]);
+
+        // Full cache contains everything
+        assert_eq!(cache.full_cache(), &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_kv_cache_tracker() {
+        let mut tracker = KVCacheTracker::new();
+
+        // Create cache for trace1
+        let cache1 = tracker.get_or_create("trace1");
+        cache1.full_cache = vec![1, 2, 3];
+
+        // Create cache for trace2
+        let cache2 = tracker.get_or_create("trace2");
+        cache2.full_cache = vec![4, 5, 6];
+
+        assert_eq!(tracker.len(), 2);
+
+        // Remove trace1
+        let removed = tracker.remove("trace1");
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().full_cache, vec![1, 2, 3]);
+        assert_eq!(tracker.len(), 1);
+    }
+}
