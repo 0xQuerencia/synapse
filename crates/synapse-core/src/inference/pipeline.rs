@@ -380,9 +380,9 @@ impl CausalSelfAttention {
         let past_seq_len = kv_cache.sequence_len()?.unwrap_or(0);
 
         // Project Q, K, V for newest token only.
-        let q = hidden.broadcast_matmul(&self.q_proj.t()?)?;
-        let k = hidden.broadcast_matmul(&self.k_proj.t()?)?;
-        let v = hidden.broadcast_matmul(&self.v_proj.t()?)?;
+        let q = hidden.broadcast_matmul(&self.q_proj)?;
+        let k = hidden.broadcast_matmul(&self.k_proj)?;
+        let v = hidden.broadcast_matmul(&self.v_proj)?;
 
         // [batch, seq=1, heads, head_dim] -> [batch, heads, seq=1, head_dim]
         let q = q
