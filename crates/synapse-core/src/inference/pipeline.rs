@@ -1009,6 +1009,7 @@ impl ToyLlama {
             },
             lm_head,
             rope,
+            layer_offset: range.start,
             config: config.clone(),
         })
     }
