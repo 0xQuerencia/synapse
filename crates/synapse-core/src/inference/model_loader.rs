@@ -139,6 +139,6 @@ mod tests {
             .expect("should download tiny model");
 
         assert!(files.config.exists(), "config.json should exist");
-        assert!(files.weights.exists(), "model.safetensors should exist");
+        assert!(files.weights.exists(), "weights should exist");
     }
 }
