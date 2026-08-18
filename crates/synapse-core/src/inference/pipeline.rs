@@ -880,25 +880,33 @@ impl ToyLlama {
                     (q_size, config.hidden_size),
                     &format!("{prefix}.self_attn.q_proj.weight"),
                 )
-                .context(format!("failed to load q_proj for layer {i}"))?;
+                .context(format!("failed to load q_proj for layer {i}"))?
+                .t()?
+                .contiguous()?;
             let k_proj = vb
                 .get(
                     (kv_size, config.hidden_size),
                     &format!("{prefix}.self_attn.k_proj.weight"),
                 )
-                .context(format!("failed to load k_proj for layer {i}"))?;
+                .context(format!("failed to load k_proj for layer {i}"))?
+                .t()?
+                .contiguous()?;
             let v_proj = vb
                 .get(
                     (kv_size, config.hidden_size),
                     &format!("{prefix}.self_attn.v_proj.weight"),
                 )
-                .context(format!("failed to load v_proj for layer {i}"))?;
+                .context(format!("failed to load v_proj for layer {i}"))?
+                .t()?
+                .contiguous()?;
             let o_proj = vb
                 .get(
                     (config.hidden_size, q_size),
                     &format!("{prefix}.self_attn.o_proj.weight"),
                 )
-                .context(format!("failed to load o_proj for layer {i}"))?;
+                .context(format!("failed to load o_proj for layer {i}"))?
+                .t()?
+                .contiguous()?;
 
             // MLP projections
             let gate = vb
