@@ -1351,7 +1351,7 @@ impl ToyLlama {
         self.clear_kv_cache()?;
 
         // Prefill: process the full prompt once and seed all layer KV caches.
-        let prefill = Tensor::new(ids.as_slice(), &device)?.reshape((1, ids.len()))?;
+        let prefill = Tensor::new(ids.as_slice(), device)?.reshape((1, ids.len()))?;
         let mut logits = self.forward_prefill(&prefill)?;
 
         for step in 0..max_new_tokens {
