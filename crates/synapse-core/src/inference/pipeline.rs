@@ -301,9 +301,9 @@ impl CausalSelfAttention {
         let (batch, seq_len, _) = hidden.dims3()?;
 
         // Project Q, K, V
-        let q = hidden.broadcast_matmul(&self.q_proj.t()?)?;
-        let k = hidden.broadcast_matmul(&self.k_proj.t()?)?;
-        let v = hidden.broadcast_matmul(&self.v_proj.t()?)?;
+        let q = hidden.broadcast_matmul(&self.q_proj)?;
+        let k = hidden.broadcast_matmul(&self.k_proj)?;
+        let v = hidden.broadcast_matmul(&self.v_proj)?;
 
         // Reshape to [batch, seq, num_heads, head_dim] → [batch, num_heads, seq, head_dim]
         let q = q
