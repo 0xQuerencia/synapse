@@ -340,7 +340,7 @@ impl CausalSelfAttention {
         let attn_weights = (attn_weights / scale)?;
 
         // Causal mask: fill upper triangle with -inf
-        let attn_weights = apply_causal_mask(&attn_weights, seq_len)?;
+        let attn_weights = apply_causal_mask(&attn_weights, seq_len, 0)?;
 
         // Softmax
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
