@@ -1134,8 +1134,58 @@ impl ToyLlama {
 
         let mut h = hidden;
         for i in layer_range.clone() {
-            h = self.layers[i].forward_decode(&h, &self.rope)?;
-            info!(layer = i, shape = ?h.dims(), "decode layer forward complete");
+            let li = self.local_layer_index(i)?;
+            h = self.layers[li].forward_decode(&h, &self.rope)?;
+            trace!(layer = i, shape = ?h.dims(), "decode layer forward complete");
+        }
+        Ok(h)
+    }
+
+    /// Run a subset of transformer layers in multi-token extend mode.
+    ///
+    /// Appends every input position to the per-layer KV caches while
+    /// keeping previously cached positions visible. This is the compute
+    /// primitive behind speculative decoding verification passes, which
+    /// feed `[last_committed_token, draft_1, ..., draft_k]` in a single
+    /// forward. Callers must truncate the cache back when some positions
+    /// are rejected (see [`Self::truncate_kv_cache`]).
+    ///
+    /// - Input shape: `[batch, seq_len >= 1, hidden_size]`
+    /// - Output shape: `[batch, seq_len, hidden_size]`
+    /// - Cache behavior: appends `seq_len` tokens to per-layer KV cache.
+    pub fn forward_layers_extend(
+        &self,
+        hidden: &Tensor,
+        layer_range: Range<usize>,
+    ) -> Result<Tensor> {
+        let hidden = self.to_model_device(hidden, "extend hidden state")?;
+        self.validate_layer_range(&layer_range)?;
+        let (batch, seq_len, hidden_size) = hidden
+            .dims3()
+            .context("extend path expects hidden shape [batch, seq_len, hidden_size]")?;
+        if seq_len == 0 {
+            bail!("extend path received an empty sequence");
+        }
+        if hidden_size != self.config.hidden_size {
+            bail!(
+                "extend hidden_size mismatch: expected {}, got {}",
+                self.config.hidden_size,
+                hidden_size
+            );
+        }
+        info!(
+            batch,
+            seq_len,
+            hidden_size,
+            layers = format!("{}..{}", layer_range.start, layer_range.end),
+            "running extend layers"
+        );
+
+        let mut h = hidden;
+        for i in layer_range.clone() {
+            let li = self.local_layer_index(i)?;
+            h = self.layers[li].forward_extend(&h, &self.rope)?;
+            trace!(layer = i, shape = ?h.dims(), "extend layer forward complete");
         }
         Ok(h)
     }
