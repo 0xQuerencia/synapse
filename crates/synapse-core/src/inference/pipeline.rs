@@ -860,8 +860,8 @@ impl ToyLlama {
             )
             .context("failed to load embed_tokens")?;
 
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for i in 0..config.num_hidden_layers {
+        let mut layers = Vec::with_capacity(range.end.saturating_sub(range.start));
+        for i in range.clone() {
             let prefix = format!("model.layers.{i}");
 
             let input_ln_w = vb
