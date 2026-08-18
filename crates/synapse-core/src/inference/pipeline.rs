@@ -1375,11 +1375,36 @@ impl ToyLlama {
         Ok(ids)
     }
 
+    /// Map a global layer index (index in the *full* model) to the local index
+    /// inside this slice's `layers` vector. Sliced loads start at
+    /// `layer_offset > 0`; full loads (offset 0) map identity.
+    ///
+    /// Errors when `global_idx` falls outside this slice's window
+    /// `layer_offset .. layer_offset + layers.len()`.
+    pub fn local_layer_index(&self, global_idx: usize) -> Result<usize> {
+        let global_end = self.layer_offset + self.layers.len();
+        if global_idx < self.layer_offset || global_idx >= global_end {
+            bail!(
+                "global layer index {} out of this slice's window ({}..{})",
+                global_idx,
+                self.layer_offset,
+                global_end
+            );
+        }
+        Ok(global_idx - self.layer_offset)
+    }
+
+    /// Resolve a global layer index to this slice's local `LlamaLayer`.
+    ///
+    /// Sliced loads (`layer_offset > 0`) own a window of the full model, so
+    /// global index `g` lives at local `g - layer_offset`. Full loads are the
+    /// identity (offset 0).
     fn layer(&self, layer_idx: usize) -> Result<&LlamaLayer> {
-        self.layers.get(layer_idx).ok_or_else(|| {
+        let local = self.local_layer_index(layer_idx)?;
+        self.layers.get(local).ok_or_else(|| {
             anyhow!(
-                "layer index {} out of bounds (num_layers={})",
-                layer_idx,
+                "local layer index {} out of bounds (owned_layers={})",
+                local,
                 self.layers.len()
             )
         })
