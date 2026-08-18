@@ -356,7 +356,7 @@ impl CausalSelfAttention {
         ))?;
 
         // Output projection
-        let output = attn_output.broadcast_matmul(&self.o_proj.t()?)?;
+        let output = attn_output.broadcast_matmul(&self.o_proj)?;
         Ok(AttentionForward {
             output,
             key: cache_k,
