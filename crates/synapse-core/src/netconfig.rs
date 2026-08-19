@@ -7,7 +7,7 @@
 
 use std::{fs, path::Path};
 
-use libp2p::Multiaddr;
+use libp2p::{Multiaddr, multiaddr::Protocol};
 use serde::Deserialize;
 use tracing::warn;
 
