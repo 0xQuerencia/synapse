@@ -34,3 +34,15 @@ impl SynapseNode {
         {
             let peer = worker_hop.peer_id;
             if let Some(latencies) = self.worker_latencies.get(&peer)
+                && !latencies.is_empty()
+            {
+                let sum: Duration = latencies.iter().sum();
+                let avg = sum / latencies.len() as u32;
+                return avg * 2;
+            }
+        }
+
+        // No historical data — use static timeout
+        WORKER_HOP_TIMEOUT
+    }
+}
