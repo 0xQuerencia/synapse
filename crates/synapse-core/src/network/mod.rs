@@ -34,20 +34,20 @@ pub fn parse_listen_addr(input: &str) -> Result<Multiaddr, String> {
         .map_err(|_| "port must be a valid u16".to_owned())?;
 
     if host == "0.0.0.0" {
-        return Ok(format!("/ip4/0.0.0.0/udp/{port}/quic-v1")
+        return format!("/ip4/0.0.0.0/udp/{port}/quic-v1")
             .parse()
-            .map_err(|error| format!("{error}"))?);
+            .map_err(|error| format!("{error}"));
     }
 
     if host == "127.0.0.1" || host == "localhost" {
-        return Ok(format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+        return format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
             .parse()
-            .map_err(|error| format!("{error}"))?);
+            .map_err(|error| format!("{error}"));
     }
 
-    Ok(format!("/dns4/{host}/udp/{port}/quic-v1")
+    format!("/dns4/{host}/udp/{port}/quic-v1")
         .parse()
-        .map_err(|error| format!("{error}"))?)
+        .map_err(|error| format!("{error}"))
 }
 
 #[cfg(test)]
