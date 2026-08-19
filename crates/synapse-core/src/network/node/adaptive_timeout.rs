@@ -22,3 +22,15 @@ impl SynapseNode {
             && !latencies.is_empty()
         {
             let sum: Duration = latencies.iter().sum();
+            let avg = sum / latencies.len() as u32;
+            // 2× safety margin
+            return avg * 2;
+        }
+
+        // Fall back to the in-flight worker's historical latency
+        if let Some(_hop) = &self.in_flight_activation_hop
+            && let Some(route_plan) = &self.generation_route_plan
+            && let Some(worker_hop) = route_plan.worker_hops.get(hop_index)
+        {
+            let peer = worker_hop.peer_id;
+            if let Some(latencies) = self.worker_latencies.get(&peer)
