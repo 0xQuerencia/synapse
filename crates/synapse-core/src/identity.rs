@@ -159,10 +159,10 @@ impl NodeIdentity {
 /// separate terminals) that need distinct libp2p PeerIds, since
 /// libp2p refuses connections to a peer's own ID.
 fn default_key_path() -> Result<PathBuf, IdentityError> {
-    if let Ok(p) = std::env::var("SYNAPSE_IDENTITY_PATH") {
-        if !p.is_empty() {
-            return Ok(PathBuf::from(p));
-        }
+    if let Ok(p) = std::env::var("SYNAPSE_IDENTITY_PATH")
+        && !p.is_empty()
+    {
+        return Ok(PathBuf::from(p));
     }
     let home = home_dir().ok_or(IdentityError::NoHomeDir)?;
     Ok(home.join(SYNAPSE_DIR).join(IDENTITY_FILE))
