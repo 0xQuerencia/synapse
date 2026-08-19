@@ -247,3 +247,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_prewarm_adds_new_peers() {
+        let mut pool = ConnectionPool::new();
+        let peers: Vec<PeerId> = (0..3).map(|_| PeerId::random()).collect();
+
+        pool.prewarm(&peers);
+        assert_eq!(pool.warm_connections.len(), 3);
+
+        for peer in &peers {
+            assert!(pool.has_warm_connection(peer));
+        }
+    }
+
+    #[test]
+    fn test_prewarm_removes_old_peers() {
+        let mut pool = ConnectionPool::with_capacity(2);
+        let old_peers: Vec<PeerId> = (0..2).map(|_| PeerId::random()).collect();
+        let new_peers: Vec<PeerId> = (0..2).map(|_| PeerId::random()).collect();
+
+        pool.prewarm(&old_peers);
+        assert_eq!(pool.warm_connections.len(), 2);
+
+        pool.prewarm(&new_peers);
+        assert_eq!(pool.warm_connections.len(), 2);
+
+        for peer in &new_peers {
+            assert!(pool.has_warm_connection(peer));
+        }
+        for peer in &old_peers {
+            assert!(!pool.has_warm_connection(peer));
+        }
+    }
+
+    #[test]
+    fn test_health_updates() {
+        let mut pool = ConnectionPool::new();
+        let peer = PeerId::random();
+        pool.prewarm(&[peer]);
+
+        assert!(pool.has_warm_connection(&peer));
+
+        // First failure shouldn't mark as unhealthy
+        pool.update_peer_health(&peer, false);
+        assert!(pool.has_warm_connection(&peer));
+
+        // Third failure should mark as unhealthy
+        pool.update_peer_health(&peer, false);
+        pool.update_peer_health(&peer, false);
+        assert!(!pool.has_warm_connection(&peer));
+
+        // Success should restore health
+        pool.update_peer_health(&peer, true);
+        assert!(pool.has_warm_connection(&peer));
+    }
+
+    #[test]
+    fn test_mark_connection_used() {
+        let mut pool = ConnectionPool::new();
+        let peer = PeerId::random();
+        pool.prewarm(&[peer]);
+
+        pool.mark_connection_used(&peer);
+        let state = pool.warm_connections.get(&peer).unwrap();
+        assert_eq!(state.request_count, 1);
+
+        pool.mark_connection_used(&peer);
+        let state = pool.warm_connections.get(&peer).unwrap();
+        assert_eq!(state.request_count, 2);
+    }
+
+    #[test]
+    fn test_pool_stats() {
+        let mut pool = ConnectionPool::new();
+        let peers: Vec<PeerId> = (0..3).map(|_| PeerId::random()).collect();
+        pool.prewarm(&peers);
+
+        pool.mark_connection_used(&peers[0]);
+        pool.mark_connection_used(&peers[1]);
+
+        let stats = pool.stats();
+        assert_eq!(stats.total_connections, 3);
+        assert_eq!(stats.healthy_connections, 3);
+        assert_eq!(stats.total_requests, 2);
+    }
+}
