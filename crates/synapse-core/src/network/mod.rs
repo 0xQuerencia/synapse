@@ -1,13 +1,17 @@
 mod codec;
+mod connection_pool;
 mod messages;
 mod node;
+mod peer_cache;
 
 pub use codec::{ProtocolCodec, SynapseProtocol};
+pub use connection_pool::{ConnectionPool, ConnectionState, PoolStats};
 pub use messages::{RequestMessage, ResponseMessage};
 pub use node::{
-    BatchPromptRequest, ChatEvent, NetworkError, PeerSummary, RedialStatus, RouteHopView,
-    RoutePlanView, StopReason, SynapseBehaviour, SynapseNode, SynapseRole,
+    BatchPromptRequest, ChatEvent, NetworkError, NodeStatusSnapshot, PeerSummary, RedialStatus,
+    RouteHopView, RoutePlanView, StopReason, SynapseBehaviour, SynapseNode, SynapseRole,
 };
+pub use peer_cache::PeerCache;
 
 use libp2p::Multiaddr;
 
