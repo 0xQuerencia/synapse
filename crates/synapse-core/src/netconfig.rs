@@ -30,6 +30,40 @@ pub struct NetConfig {
     pub relays: Vec<Multiaddr>,
 }
 
+/// Relay metadata with region and latency tracking.
+#[derive(Debug, Clone)]
+pub struct RelayInfo {
+    pub addr: Multiaddr,
+    pub region: Option<String>,
+    pub measured_latency_ms: Option<u64>,
+}
+
+impl RelayInfo {
+    pub fn new(addr: Multiaddr) -> Self {
+        let region = Self::parse_region(&addr);
+        Self {
+            addr,
+            region,
+            measured_latency_ms: None,
+        }
+    }
+
+    /// Extract region from DNS name like /dns4/relay-eu.synapse.network/...
+    pub fn parse_region(addr: &Multiaddr) -> Option<String> {
+        for component in addr.iter() {
+            if let Protocol::Dns4(hostname) | Protocol::Dns6(hostname) = component {
+                // Look for "relay-<region>" pattern
+                if let Some(region_part) = hostname.strip_prefix("relay-")
+                    && let Some(region_code) = region_part.split('.').next()
+                {
+                    return Some(region_code.to_string());
+                }
+            }
+        }
+        None
+    }
+}
+
 impl NetConfig {
     /// Load from the given config directory, falling back to empty lists.
     pub fn load(config_dir: &Path) -> Self {
