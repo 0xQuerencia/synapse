@@ -88,39 +88,27 @@ pub struct PairingRateLimiter {
     attempts: HashMap<String, PairingAttemptState>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct PairingAttemptState {
     count: u8,
     locked_until: Option<Instant>,
 }
 
-impl Default for PairingAttemptState {
-    fn default() -> Self {
-        Self {
-            count: 0,
-            locked_until: None,
-        }
-    }
-}
-
 impl PairingRateLimiter {
     pub fn check(&self, peer_key: &str) -> Result<(), Duration> {
-        if let Some(state) = self.attempts.get(peer_key) {
-            if let Some(locked_until) = state.locked_until {
-                let now = Instant::now();
-                if now < locked_until {
-                    return Err(locked_until - now);
-                }
+        if let Some(state) = self.attempts.get(peer_key)
+            && let Some(locked_until) = state.locked_until
+        {
+            let now = Instant::now();
+            if now < locked_until {
+                return Err(locked_until - now);
             }
         }
         Ok(())
     }
 
     pub fn record_failure(&mut self, peer_key: &str) {
-        let state = self
-            .attempts
-            .entry(peer_key.to_owned())
-            .or_insert_with(PairingAttemptState::default);
+        let state = self.attempts.entry(peer_key.to_owned()).or_default();
 
         state.count = state.count.saturating_add(1);
 
