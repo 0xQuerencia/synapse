@@ -138,3 +138,50 @@ impl PeerCache {
     /// Prune stale entries older than TTL.
     pub fn prune_stale(&mut self) {
         let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        for entries in self.providers.values_mut() {
+            entries.retain(|e| now - e.cached_at < CACHE_TTL.as_secs());
+        }
+        self.providers.retain(|_, v| !v.is_empty());
+    }
+
+    fn cache_path() -> Result<PathBuf, std::io::Error> {
+        let home = std::env::var("HOME")
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME not set"))?;
+        Ok(Path::new(&home).join(".synapse").join(CACHE_FILE_NAME))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_ttl_filtering() {
+        let mut cache = PeerCache::default();
+        let peer_id = PeerId::random();
+        let addr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+
+        cache.add_provider("model-a".to_string(), peer_id, vec![addr]);
+
+        // Should be fresh
+        let providers = cache.get_providers("model-a");
+        assert_eq!(providers.len(), 1);
+
+        // Manually set to expired
+        cache
+            .providers
+            .get_mut("model-a")
+            .unwrap()
+            .first_mut()
+            .unwrap()
+            .cached_at = 0;
+
+        // Should be filtered out
+        let providers = cache.get_providers("model-a");
+        assert_eq!(providers.len(), 0);
+    }
+}
