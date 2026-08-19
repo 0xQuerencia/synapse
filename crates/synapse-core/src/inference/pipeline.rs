@@ -1446,10 +1446,960 @@ impl ToyLlama {
         hidden: &Tensor,
         layer_range: Range<usize>,
     ) -> Result<Tensor> {
-        // For PoC, speculative verification reuses the prefill path.
-        // The KV cache will grow by draft_len tokens. The caller must
-        // roll back the cache if draft tokens are rejected.
+        // The KV cache grows by draft_len tokens. The caller must roll back
+        // the cache if draft tokens are rejected (truncate_kv_cache).
+        self.forward_layers_extend(hidden, layer_range)
+    }
+}
+
+// ─── Multi-shard checkpoints ─────────────────────────────────────────────────
+
+/// Resolve the safetensors shard files for a weights path.
+///
+/// A single-file checkpoint (`model.safetensors`) has exactly one shard. A
+/// multi-shard checkpoint publishes `model.safetensors.index.json` next to it
+/// whose `weight_map` lists every shard file; that map is read to build the
+/// full shard list. Shard names are validated as plain filenames (no path
+/// separators, no `..`) before being joined to the model directory.
+pub fn shard_files(weights_path: &Path) -> Result<Vec<PathBuf>> {
+    let index_path = weights_path.with_file_name("model.safetensors.index.json");
+    if !index_path.exists() {
+        return Ok(vec![weights_path.to_path_buf()]);
+    }
+    let content = std::fs::read_to_string(&index_path)
+        .with_context(|| format!("failed to read shard index {}", index_path.display()))?;
+    let index: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("shard index {} is not valid JSON", index_path.display()))?;
+    let weight_map = index
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .context("shard index is missing its weight_map")?;
+    let dir = weights_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut shards: Vec<PathBuf> = weight_map
+        .values()
+        .filter_map(serde_json::Value::as_str)
+        .map(|name| {
+            if name.contains('/')
+                || name.contains('\\')
+                || name == ".."
+                || name.starts_with("../")
+                || name.contains("..")
+            {
+                bail!("shard index lists an unsafe path: {name}");
+            }
+            Ok(dir.join(name))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if shards.is_empty() {
+        bail!("shard index contains no shard files");
+    }
+    shards.sort();
+    shards.dedup();
+    info!(
+        shard_count = shards.len(),
+        ?dir,
+        "resolved multi-shard checkpoint"
+    );
+    Ok(shards)
+}
+
+// ─── ShardedModel trait ─────────────────────────────────────────────────────
+
+/// Common inference surface shared by every model backend (safetensors
+/// `ToyLlama` and quantized GGUF `ToyLlamaGGUF`).
+///
+/// Node code schedules work in *global* layer indices — the logical layer
+/// numbers of the full checkpoint — and each implementation maps those into
+/// its own slice via [`ShardedModel::local_layer_index`]. Slice-only worker
+/// loads therefore keep the exact same scheduling logic as a full master
+/// load; the only difference is which window of layers each node owns.
+pub trait ShardedModel: Send + Sync {
+    /// Backend name for logging ("llama-safetensors" / "llama-gguf").
+    fn name(&self) -> &'static str;
+    /// Token IDs `[batch, seq]` → hidden states `[batch, seq, hidden]`.
+    fn embed(&self, token_ids: &Tensor) -> Result<Tensor>;
+    /// Run a window of layers in prefill mode.
+    fn forward_layers_prefill(&self, hidden: &Tensor, layer_range: Range<usize>) -> Result<Tensor>;
+    /// Run a window of layers in decode mode.
+    fn forward_layers_decode(&self, hidden: &Tensor, layer_range: Range<usize>) -> Result<Tensor>;
+    /// Run a window of layers in speculative verification mode: append the
+    /// whole activation block to the existing KV caches.
+    fn forward_layers_speculative(
+        &self,
+        hidden: &Tensor,
+        layer_range: Range<usize>,
+    ) -> Result<Tensor>;
+    /// Truncate all owned layer KV caches to `target_seq_len` tokens
+    /// (speculative rollback of rejected draft positions).
+    fn truncate_kv_cache(&self, target_seq_len: usize) -> Result<()>;
+    /// Full final norm + LM head: `[batch, seq, hidden]` → logits.
+    fn head(&self, hidden: &Tensor) -> Result<Tensor>;
+    /// LM head over the last token only: `[batch, seq, hidden]` → `[batch, 1, vocab]`.
+    fn head_last_token(&self, hidden: &Tensor) -> Result<Tensor>;
+    /// Reset all owned layer KV caches.
+    fn clear_kv_cache(&self) -> Result<()>;
+    /// Reset KV caches for a window of layers (global indices).
+    fn clear_kv_cache_range(&self, layer_range: Range<usize>) -> Result<()>;
+    /// Full prefill pass over all owned layers.
+    fn forward_prefill(&self, token_ids: &Tensor) -> Result<Tensor>;
+    /// Full decode pass over all owned layers.
+    fn forward_decode(&self, token_ids: &Tensor) -> Result<Tensor>;
+    /// Map a global layer index to this slice's local index.
+    fn local_layer_index(&self, global_idx: usize) -> Result<usize>;
+    /// Global index of the first owned transformer block (0 for full loads).
+    fn layer_offset(&self) -> usize;
+    /// Number of transformer blocks owned by this slice.
+    fn owned_layers(&self) -> usize;
+    /// Device the weights live on.
+    fn model_device(&self) -> &Device;
+}
+
+impl ShardedModel for ToyLlama {
+    fn name(&self) -> &'static str {
+        "llama-safetensors"
+    }
+
+    fn embed(&self, token_ids: &Tensor) -> Result<Tensor> {
+        self.embed(token_ids)
+    }
+
+    fn forward_layers_prefill(&self, hidden: &Tensor, layer_range: Range<usize>) -> Result<Tensor> {
         self.forward_layers_prefill(hidden, layer_range)
+    }
+
+    fn forward_layers_decode(&self, hidden: &Tensor, layer_range: Range<usize>) -> Result<Tensor> {
+        self.forward_layers_decode(hidden, layer_range)
+    }
+
+    fn forward_layers_speculative(
+        &self,
+        hidden: &Tensor,
+        layer_range: Range<usize>,
+    ) -> Result<Tensor> {
+        self.forward_layers_speculative(hidden, layer_range)
+    }
+
+    fn truncate_kv_cache(&self, target_seq_len: usize) -> Result<()> {
+        self.truncate_kv_cache(target_seq_len)
+    }
+
+    fn head(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.head(hidden)
+    }
+
+    fn head_last_token(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.head_last_token(hidden)
+    }
+
+    fn clear_kv_cache(&self) -> Result<()> {
+        self.clear_kv_cache()
+    }
+
+    fn clear_kv_cache_range(&self, layer_range: Range<usize>) -> Result<()> {
+        self.clear_kv_cache_range(layer_range)
+    }
+
+    fn forward_prefill(&self, token_ids: &Tensor) -> Result<Tensor> {
+        self.forward_prefill(token_ids)
+    }
+
+    fn forward_decode(&self, token_ids: &Tensor) -> Result<Tensor> {
+        self.forward_decode(token_ids)
+    }
+
+    fn local_layer_index(&self, global_idx: usize) -> Result<usize> {
+        self.local_layer_index(global_idx)
+    }
+
+    fn layer_offset(&self) -> usize {
+        self.layer_offset
+    }
+
+    fn owned_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn model_device(&self) -> &Device {
+        self.model_device()
+    }
+}
+
+// ─── Quantized GGUF llama ────────────────────────────────────────────────────
+
+/// One transformer block of a quantized GGUF llama. Mirrors `LlamaLayer` but
+/// uses `QMatMul` projections so Q4_K_M / Q8_0 weights stay quantized in
+/// memory and dequantize on the fly during matmul.
+struct GGUFLlamaLayer {
+    input_layernorm: RmsNorm,
+    attn_q: QMatMul,
+    attn_k: QMatMul,
+    attn_v: QMatMul,
+    attn_output: QMatMul,
+    post_attention_layernorm: RmsNorm,
+    ffn_gate: QMatMul,
+    ffn_up: QMatMul,
+    ffn_down: QMatMul,
+    kv_cache: Mutex<LayerKvCache>,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+}
+
+impl GGUFLlamaLayer {
+    fn forward_prefill(&self, hidden: &Tensor, rope: &RotaryEmbedding) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(hidden)?;
+        let attn = self.attention_prefill(&normed, rope)?;
+        self.set_kv_cache(&attn.key, &attn.value)?;
+        let after_attn = (hidden + attn.output)?;
+
+        let normed = self.post_attention_layernorm.forward(&after_attn)?;
+        let gate = self.ffn_gate.forward(&normed)?;
+        let gate = candle_nn::ops::silu(&gate)?;
+        let up = self.ffn_up.forward(&normed)?;
+        let mlp_out = self.ffn_down.forward(&(gate * up)?)?;
+
+        let output = (after_attn + mlp_out)?;
+        Ok(output)
+    }
+
+    fn forward_decode(&self, hidden: &Tensor, rope: &RotaryEmbedding) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(hidden)?;
+        let cache = self.kv_cache()?;
+        let attn = self.attention_decode(&normed, rope, &cache)?;
+        self.set_kv_cache(&attn.key, &attn.value)?;
+        let after_attn = (hidden + attn.output)?;
+
+        let normed = self.post_attention_layernorm.forward(&after_attn)?;
+        let gate = self.ffn_gate.forward(&normed)?;
+        let gate = candle_nn::ops::silu(&gate)?;
+        let up = self.ffn_up.forward(&normed)?;
+        let mlp_out = self.ffn_down.forward(&(gate * up)?)?;
+
+        let output = (after_attn + mlp_out)?;
+        Ok(output)
+    }
+
+    /// Multi-token KV-append forward (speculative verification, GGUF).
+    fn forward_extend(&self, hidden: &Tensor, rope: &RotaryEmbedding) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(hidden)?;
+        let cache = self.kv_cache()?;
+        let attn = self.attention_extend(&normed, rope, &cache)?;
+        self.set_kv_cache(&attn.key, &attn.value)?;
+        let after_attn = (hidden + attn.output)?;
+
+        let normed = self.post_attention_layernorm.forward(&after_attn)?;
+        let gate = self.ffn_gate.forward(&normed)?;
+        let gate = candle_nn::ops::silu(&gate)?;
+        let up = self.ffn_up.forward(&normed)?;
+        let mlp_out = self.ffn_down.forward(&(gate * up)?)?;
+
+        let output = (after_attn + mlp_out)?;
+        Ok(output)
+    }
+
+    fn attention_prefill(
+        &self,
+        hidden: &Tensor,
+        rope: &RotaryEmbedding,
+    ) -> Result<AttentionForward> {
+        let (batch, seq_len, _) = hidden.dims3()?;
+
+        let q = self.attn_q.forward(hidden)?;
+        let k = self.attn_k.forward(hidden)?;
+        let v = self.attn_v.forward(hidden)?;
+
+        let q = q
+            .reshape((batch, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        let q = rope.apply(&q, seq_len)?;
+        let k = rope.apply(&k, seq_len)?;
+        let cache_k = k.clone();
+        let cache_v = v.clone();
+
+        let (k, v) = if self.num_kv_heads != self.num_heads {
+            let repeats = self.num_heads / self.num_kv_heads;
+            (repeat_kv(&k, repeats)?, repeat_kv(&v, repeats)?)
+        } else {
+            (k, v)
+        };
+
+        let scale = (self.head_dim as f64).sqrt();
+        let attn_weights = q.broadcast_matmul(&k.transpose(2, 3)?)?;
+        let attn_weights = (attn_weights / scale)?;
+        let attn_weights = apply_causal_mask(&attn_weights, seq_len, 0)?;
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_output = attn_weights.broadcast_matmul(&v)?;
+
+        let attn_output = attn_output.transpose(1, 2)?.reshape((
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ))?;
+        let output = self.attn_output.forward(&attn_output)?;
+        Ok(AttentionForward {
+            output,
+            key: cache_k,
+            value: cache_v,
+        })
+    }
+
+    fn attention_decode(
+        &self,
+        hidden: &Tensor,
+        rope: &RotaryEmbedding,
+        kv_cache: &LayerKvCache,
+    ) -> Result<AttentionForward> {
+        let (batch, seq_len, _) = hidden.dims3()?;
+        if seq_len != 1 {
+            bail!(
+                "decode attention expects hidden shape [batch, 1, hidden_size], got seq_len={seq_len}"
+            );
+        }
+        let past_seq_len = kv_cache.sequence_len()?.unwrap_or(0);
+
+        let q = self.attn_q.forward(hidden)?;
+        let k = self.attn_k.forward(hidden)?;
+        let v = self.attn_v.forward(hidden)?;
+
+        let q = q
+            .reshape((batch, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        let q = rope.apply_with_offset(&q, past_seq_len, seq_len)?;
+        let new_k = rope.apply_with_offset(&k, past_seq_len, seq_len)?;
+        let new_v = v;
+
+        let (cache_k, cache_v) = kv_cache.merge_with_appended(&new_k, &new_v)?;
+
+        let (k, v) = if self.num_kv_heads != self.num_heads {
+            let repeats = self.num_heads / self.num_kv_heads;
+            (repeat_kv(&cache_k, repeats)?, repeat_kv(&cache_v, repeats)?)
+        } else {
+            (cache_k.clone(), cache_v.clone())
+        };
+
+        let scale = (self.head_dim as f64).sqrt();
+        let attn_weights = q.broadcast_matmul(&k.transpose(2, 3)?)?;
+        let attn_weights = (attn_weights / scale)?;
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_output = attn_weights.broadcast_matmul(&v)?;
+
+        let attn_output = attn_output.transpose(1, 2)?.reshape((
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ))?;
+        let output = self.attn_output.forward(&attn_output)?;
+        Ok(AttentionForward {
+            output,
+            key: cache_k,
+            value: cache_v,
+        })
+    }
+
+    /// Multi-token KV-append attention for speculative verification
+    /// (GGUF backend). Mirrors [`Self::attention_decode`] but processes a
+    /// block of `m ≥ 1` positions with RoPE offsets and causal masking
+    /// relative to the cached prefix.
+    fn attention_extend(
+        &self,
+        hidden: &Tensor,
+        rope: &RotaryEmbedding,
+        kv_cache: &LayerKvCache,
+    ) -> Result<AttentionForward> {
+        let (batch, seq_len, _) = hidden.dims3()?;
+        if seq_len == 0 {
+            bail!("extend attention received an empty sequence");
+        }
+        let past_seq_len = kv_cache.sequence_len()?.unwrap_or(0);
+
+        let q = self.attn_q.forward(hidden)?;
+        let k = self.attn_k.forward(hidden)?;
+        let v = self.attn_v.forward(hidden)?;
+
+        let q = q
+            .reshape((batch, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        let q = rope.apply_with_offset(&q, past_seq_len, seq_len)?;
+        let new_k = rope.apply_with_offset(&k, past_seq_len, seq_len)?;
+        let new_v = v;
+
+        let (cache_k, cache_v) = kv_cache.merge_with_appended(&new_k, &new_v)?;
+
+        let (k, v) = if self.num_kv_heads != self.num_heads {
+            let repeats = self.num_heads / self.num_kv_heads;
+            (repeat_kv(&cache_k, repeats)?, repeat_kv(&cache_v, repeats)?)
+        } else {
+            (cache_k.clone(), cache_v.clone())
+        };
+
+        let scale = (self.head_dim as f64).sqrt();
+        let attn_weights = q.broadcast_matmul(&k.transpose(2, 3)?)?;
+        let attn_weights = (attn_weights / scale)?;
+        let attn_weights = apply_causal_mask(&attn_weights, seq_len, past_seq_len)?;
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_output = attn_weights.broadcast_matmul(&v)?;
+
+        let attn_output = attn_output.transpose(1, 2)?.reshape((
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ))?;
+        let output = self.attn_output.forward(&attn_output)?;
+        Ok(AttentionForward {
+            output,
+            key: cache_k,
+            value: cache_v,
+        })
+    }
+
+    fn kv_cache(&self) -> Result<LayerKvCache> {
+        Ok(self
+            .kv_cache
+            .lock()
+            .map_err(|_| anyhow!("layer KV cache lock poisoned"))?
+            .clone())
+    }
+
+    fn set_kv_cache(&self, key: &Tensor, value: &Tensor) -> Result<()> {
+        *self
+            .kv_cache
+            .lock()
+            .map_err(|_| anyhow!("layer KV cache lock poisoned"))? = LayerKvCache {
+            key: Some(key.clone()),
+            value: Some(value.clone()),
+        };
+        Ok(())
+    }
+
+    fn clear_kv_cache(&self) -> Result<()> {
+        *self
+            .kv_cache
+            .lock()
+            .map_err(|_| anyhow!("layer KV cache lock poisoned"))? = LayerKvCache::default();
+        Ok(())
+    }
+}
+
+/// Quantized GGUF llama with the same slice-only semantics as `ToyLlama`.
+///
+/// Weights are read through `candle_core::quantized::gguf_file`; quantized
+/// matmuls (Q4_K_M, Q8_0, ...) stay compressed in RAM and dequantize on the
+/// fly. KV cache activations are plain f32 tensors.
+pub struct ToyLlamaGGUF {
+    embed_tokens: Tensor,
+    layers: Vec<GGUFLlamaLayer>,
+    norm: RmsNorm,
+    lm_head: QMatMul,
+    rope: RotaryEmbedding,
+    /// Global index of the first owned transformer block (0 for full loads).
+    layer_offset: usize,
+    pub config: ToyLlamaConfig,
+}
+
+fn gguf_u64(content: &gguf_file::Content, key: &str) -> Result<u64> {
+    content
+        .metadata
+        .get(key)
+        .with_context(|| format!("GGUF metadata missing {key}"))?
+        .to_u64()
+        .with_context(|| format!("GGUF metadata {key} is not an integer"))
+}
+
+/// Read the layer count (`llama.block_count`) from a GGUF file header.
+///
+/// The node loader uses this to compute the static shard plan before
+/// constructing a `ToyLlamaGGUF` slice, since quantized files carry all
+/// model metadata in the header rather than in an HF `config.json`.
+pub fn gguf_layer_count(path: &Path) -> Result<usize> {
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let content = gguf_file::Content::read(&mut file).context("failed to parse GGUF header")?;
+    gguf_u64(&content, "llama.block_count").map(|n| n as usize)
+}
+
+fn gguf_u64_or(content: &gguf_file::Content, key: &str, default: u64) -> u64 {
+    content
+        .metadata
+        .get(key)
+        .and_then(|v| v.to_u64().ok())
+        .unwrap_or(default)
+}
+
+fn gguf_f64_or(content: &gguf_file::Content, key: &str, default: f64) -> f64 {
+    content
+        .metadata
+        .get(key)
+        .and_then(|v| v.to_f64().ok())
+        .unwrap_or(default)
+}
+
+impl ToyLlamaGGUF {
+    /// Load the full quantized model.
+    pub fn load(path: &Path) -> Result<Self> {
+        let device = get_best_device().context("failed to select inference device")?;
+        let mut file =
+            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let content = gguf_file::Content::read(&mut file).context("failed to parse GGUF header")?;
+        let n_layers = gguf_u64(&content, "llama.block_count")? as usize;
+        drop(file);
+        Self::load_range(path, 0..n_layers, &device)
+    }
+
+    /// Slice-only construction of a quantized GGUF llama: loads the embed,
+    /// final norm, LM head and only the transformer blocks in `range`.
+    pub fn load_range(path: &Path, range: Range<usize>, device: &Device) -> Result<Self> {
+        info!(?path, ?range, "loading quantized GGUF llama weights");
+        let mut file =
+            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let content = gguf_file::Content::read(&mut file).context("failed to parse GGUF header")?;
+
+        let hidden = gguf_u64(&content, "llama.embedding_length")? as usize;
+        let n_layers = gguf_u64(&content, "llama.block_count")? as usize;
+        let n_heads = gguf_u64(&content, "llama.attention.head_count")? as usize;
+        let vocab = gguf_u64(&content, "llama.vocab_size")? as usize;
+        if range.end > n_layers {
+            bail!(
+                "layer range {}..{} exceeds GGUF block_count {}",
+                range.start,
+                range.end,
+                n_layers
+            );
+        }
+        let head_dim = hidden / n_heads;
+        let rope_dim =
+            gguf_u64_or(&content, "llama.rope.dimension_count", head_dim as u64) as usize;
+        if rope_dim != head_dim {
+            bail!(
+                "unsupported partial rotary dimension {rope_dim} (head_dim={head_dim}); \
+                 only full head-dim RoPE is supported"
+            );
+        }
+        let n_kv_heads =
+            gguf_u64_or(&content, "llama.attention.head_count_kv", n_heads as u64) as usize;
+        let eps = gguf_f64_or(&content, "llama.attention.layer_norm_rms_epsilon", 1e-5);
+        let intermediate =
+            gguf_u64_or(&content, "llama.feed_forward_length", (4 * hidden) as u64) as usize;
+        let max_pos = gguf_u64_or(&content, "llama.context_length", 4096) as usize;
+        let rope_theta = gguf_f64_or(&content, "llama.rope.freq_base", 10_000.0);
+        if !hidden.is_multiple_of(n_heads) {
+            bail!("hidden_size {hidden} not divisible by head_count {n_heads}");
+        }
+
+        let config = ToyLlamaConfig {
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            num_hidden_layers: n_layers,
+            vocab_size: vocab,
+            rms_norm_eps: eps,
+            num_attention_heads: n_heads,
+            num_key_value_heads: n_kv_heads,
+            tie_word_embeddings: false,
+            max_position_embeddings: max_pos,
+            rope_theta,
+            torch_dtype: "float32".to_owned(),
+        };
+
+        let embed_tokens = content
+            .tensor(&mut file, "token_embd.weight", device)?
+            .dequantize(device)?;
+        if embed_tokens.dims() != [vocab, hidden] {
+            bail!(
+                "token_embd.weight shape {:?} != [{vocab}, {hidden}]",
+                embed_tokens.dims()
+            );
+        }
+
+        let mut layers = Vec::with_capacity(range.end.saturating_sub(range.start));
+        for i in range.clone() {
+            let input_layernorm = RmsNorm {
+                weight: content
+                    .tensor(&mut file, &format!("blk.{i}.attn_norm.weight"), device)?
+                    .dequantize(device)?,
+                eps,
+            };
+            let attn_q = QMatMul::from_qtensor(content.tensor(
+                &mut file,
+                &format!("blk.{i}.attn_q.weight"),
+                device,
+            )?)?;
+            let attn_k = QMatMul::from_qtensor(content.tensor(
+                &mut file,
+                &format!("blk.{i}.attn_k.weight"),
+                device,
+            )?)?;
+            let attn_v = QMatMul::from_qtensor(content.tensor(
+                &mut file,
+                &format!("blk.{i}.attn_v.weight"),
+                device,
+            )?)?;
+            let attn_output = QMatMul::from_qtensor(content.tensor(
+                &mut file,
+                &format!("blk.{i}.attn_output.weight"),
+                device,
+            )?)?;
+            let post_attention_layernorm = RmsNorm {
+                weight: content
+                    .tensor(&mut file, &format!("blk.{i}.ffn_norm.weight"), device)?
+                    .dequantize(device)?,
+                eps,
+            };
+            let ffn_gate = QMatMul::from_qtensor(content.tensor(
+                &mut file,
+                &format!("blk.{i}.ffn_gate.weight"),
+                device,
+            )?)?;
+            let ffn_up = QMatMul::from_qtensor(content.tensor(
+                &mut file,
+                &format!("blk.{i}.ffn_up.weight"),
+                device,
+            )?)?;
+            let ffn_down = QMatMul::from_qtensor(content.tensor(
+                &mut file,
+                &format!("blk.{i}.ffn_down.weight"),
+                device,
+            )?)?;
+            layers.push(GGUFLlamaLayer {
+                input_layernorm,
+                attn_q,
+                attn_k,
+                attn_v,
+                attn_output,
+                post_attention_layernorm,
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+                kv_cache: Mutex::new(LayerKvCache::default()),
+                num_heads: n_heads,
+                num_kv_heads: n_kv_heads,
+                head_dim,
+            });
+        }
+
+        let norm = RmsNorm {
+            weight: content
+                .tensor(&mut file, "output_norm.weight", device)?
+                .dequantize(device)?,
+            eps,
+        };
+
+        // `output.weight` may be absent when the LM head is tied to the
+        // embeddings; fall back to the dequantized embed matrix.
+        let lm_head = match content.tensor(&mut file, "output.weight", device) {
+            Ok(qt) => QMatMul::from_qtensor(qt)?,
+            Err(_) => QMatMul::Tensor(embed_tokens.clone()),
+        };
+
+        let rope = RotaryEmbedding::new(head_dim, max_pos.min(4096), rope_theta, device)?;
+
+        info!(
+            hidden,
+            n_layers, n_heads, n_kv_heads, vocab, "GGUF llama loaded"
+        );
+        Ok(ToyLlamaGGUF {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            rope,
+            layer_offset: range.start,
+            config,
+        })
+    }
+
+    fn model_device(&self) -> &Device {
+        self.embed_tokens.device()
+    }
+
+    fn to_model_device(&self, tensor: &Tensor, tensor_name: &str) -> Result<Tensor> {
+        let device = self.model_device();
+        if tensor.device().same_device(device) {
+            return Ok(tensor.clone());
+        }
+        tensor
+            .to_device(device)
+            .with_context(|| format!("failed to move {tensor_name} tensor to model device"))
+    }
+
+    /// Validate a global layer range against this slice's window.
+    fn validate_window(&self, layer_range: &Range<usize>) -> Result<()> {
+        if layer_range.start > layer_range.end {
+            bail!(
+                "invalid layer range {}..{}: start must be <= end",
+                layer_range.start,
+                layer_range.end
+            );
+        }
+        let global_end = self.layer_offset + self.layers.len();
+        if layer_range.start < self.layer_offset || layer_range.end > global_end {
+            bail!(
+                "layer range {}..{} out of bounds for slice window ({}..{})",
+                layer_range.start,
+                layer_range.end,
+                self.layer_offset,
+                global_end
+            );
+        }
+        Ok(())
+    }
+
+    pub fn embed(&self, token_ids: &Tensor) -> Result<Tensor> {
+        let token_ids = self.to_model_device(token_ids, "token_ids")?;
+        let dims = token_ids.dims().to_vec();
+        let flat_ids = if dims.len() > 1 {
+            token_ids.flatten_all()?
+        } else {
+            token_ids.clone()
+        };
+        let flat_hidden = self.embed_tokens.embedding(&flat_ids)?;
+        let hidden = if dims.len() > 1 {
+            let batch = dims[0];
+            let seq_len = dims[1];
+            flat_hidden.reshape((batch, seq_len, self.config.hidden_size))?
+        } else {
+            flat_hidden.unsqueeze(0)?
+        };
+        trace!(shape = ?hidden.dims(), "GGUF embedding complete");
+        Ok(hidden)
+    }
+
+    pub fn forward_layers_prefill(
+        &self,
+        hidden: &Tensor,
+        layer_range: Range<usize>,
+    ) -> Result<Tensor> {
+        self.validate_window(&layer_range)?;
+        let hidden = self.to_model_device(hidden, "prefill hidden state")?;
+        info!(
+            layers = format!("{}..{}", layer_range.start, layer_range.end),
+            "running GGUF prefill layers"
+        );
+        let mut h = hidden;
+        for i in layer_range.clone() {
+            let li = self.local_layer_index(i)?;
+            h = self.layers[li].forward_prefill(&h, &self.rope)?;
+        }
+        Ok(h)
+    }
+
+    pub fn forward_layers_decode(
+        &self,
+        hidden: &Tensor,
+        layer_range: Range<usize>,
+    ) -> Result<Tensor> {
+        self.validate_window(&layer_range)?;
+        let hidden = self.to_model_device(hidden, "decode hidden state")?;
+        info!(
+            layers = format!("{}..{}", layer_range.start, layer_range.end),
+            "running GGUF decode layers"
+        );
+        let mut h = hidden;
+        for i in layer_range.clone() {
+            let li = self.local_layer_index(i)?;
+            h = self.layers[li].forward_decode(&h, &self.rope)?;
+            trace!(layer = i, shape = ?h.dims(), "GGUF decode layer forward complete");
+        }
+        Ok(h)
+    }
+
+    pub fn head(&self, hidden: &Tensor) -> Result<Tensor> {
+        let hidden = self.to_model_device(hidden, "lm_head hidden state")?;
+        let normed = self.norm.forward(&hidden)?;
+        let logits = self.lm_head.forward(&normed)?;
+        trace!(shape = ?logits.dims(), "GGUF lm_head complete");
+        Ok(logits)
+    }
+
+    pub fn head_last_token(&self, hidden: &Tensor) -> Result<Tensor> {
+        let hidden = self.to_model_device(hidden, "lm_head hidden state")?;
+        let seq_len = hidden.dim(1)?;
+        let last_hidden = hidden.narrow(1, seq_len - 1, 1)?;
+        let normed = self.norm.forward(&last_hidden)?;
+        let logits = self.lm_head.forward(&normed)?;
+        trace!(shape = ?logits.dims(), "GGUF lm_head (last-token) complete");
+        Ok(logits)
+    }
+
+    pub fn forward_prefill(&self, token_ids: &Tensor) -> Result<Tensor> {
+        let hidden = self.embed(token_ids)?;
+        let window = self.layer_offset..self.layer_offset + self.layers.len();
+        let hidden = self.forward_layers_prefill(&hidden, window)?;
+        let logits = self.head(&hidden)?;
+        Ok(logits)
+    }
+
+    pub fn forward_decode(&self, token_ids: &Tensor) -> Result<Tensor> {
+        let hidden = self.embed(token_ids)?;
+        let window = self.layer_offset..self.layer_offset + self.layers.len();
+        let hidden = self.forward_layers_decode(&hidden, window)?;
+        let logits = self.head(&hidden)?;
+        Ok(logits)
+    }
+
+    pub fn clear_kv_cache(&self) -> Result<()> {
+        for layer in &self.layers {
+            layer.clear_kv_cache()?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_kv_cache_range(&self, layer_range: Range<usize>) -> Result<()> {
+        self.validate_window(&layer_range)?;
+        for i in layer_range {
+            let li = self.local_layer_index(i)?;
+            self.layers[li].clear_kv_cache()?;
+        }
+        Ok(())
+    }
+
+    /// Truncate all owned GGUF layer KV caches to `target_seq_len` tokens
+    /// (speculative rollback).
+    pub fn truncate_kv_cache(&self, target_seq_len: usize) -> Result<()> {
+        for layer in &self.layers {
+            layer
+                .kv_cache
+                .lock()
+                .map_err(|_| anyhow!("layer KV cache lock poisoned"))?
+                .truncate(target_seq_len)?;
+        }
+        Ok(())
+    }
+
+    /// Multi-token extend pass over a window of GGUF layers.
+    pub fn forward_layers_extend(
+        &self,
+        hidden: &Tensor,
+        layer_range: Range<usize>,
+    ) -> Result<Tensor> {
+        self.validate_window(&layer_range)?;
+        let hidden = self.to_model_device(hidden, "extend hidden state")?;
+        let seq_len = hidden.dim(1)?;
+        if seq_len == 0 {
+            bail!("extend path received an empty sequence");
+        }
+        info!(
+            layers = format!("{}..{}", layer_range.start, layer_range.end),
+            seq_len, "running GGUF extend layers"
+        );
+        let mut h = hidden;
+        for i in layer_range.clone() {
+            let li = self.local_layer_index(i)?;
+            h = self.layers[li].forward_extend(&h, &self.rope)?;
+            trace!(layer = i, shape = ?h.dims(), "GGUF extend layer forward complete");
+        }
+        Ok(h)
+    }
+
+    /// Speculative verification alias — appends the block to the KV caches.
+    pub fn forward_layers_speculative(
+        &self,
+        hidden: &Tensor,
+        layer_range: Range<usize>,
+    ) -> Result<Tensor> {
+        self.forward_layers_extend(hidden, layer_range)
+    }
+
+    pub fn local_layer_index(&self, global_idx: usize) -> Result<usize> {
+        let global_end = self.layer_offset + self.layers.len();
+        if global_idx < self.layer_offset || global_idx >= global_end {
+            bail!(
+                "global layer index {} out of this slice's window ({}..{})",
+                global_idx,
+                self.layer_offset,
+                global_end
+            );
+        }
+        Ok(global_idx - self.layer_offset)
+    }
+}
+
+impl ShardedModel for ToyLlamaGGUF {
+    fn name(&self) -> &'static str {
+        "llama-gguf"
+    }
+
+    fn embed(&self, token_ids: &Tensor) -> Result<Tensor> {
+        self.embed(token_ids)
+    }
+
+    fn forward_layers_prefill(&self, hidden: &Tensor, layer_range: Range<usize>) -> Result<Tensor> {
+        self.forward_layers_prefill(hidden, layer_range)
+    }
+
+    fn forward_layers_decode(&self, hidden: &Tensor, layer_range: Range<usize>) -> Result<Tensor> {
+        self.forward_layers_decode(hidden, layer_range)
+    }
+
+    fn forward_layers_speculative(
+        &self,
+        hidden: &Tensor,
+        layer_range: Range<usize>,
+    ) -> Result<Tensor> {
+        self.forward_layers_speculative(hidden, layer_range)
+    }
+
+    fn truncate_kv_cache(&self, target_seq_len: usize) -> Result<()> {
+        self.truncate_kv_cache(target_seq_len)
+    }
+
+    fn head(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.head(hidden)
+    }
+
+    fn head_last_token(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.head_last_token(hidden)
+    }
+
+    fn clear_kv_cache(&self) -> Result<()> {
+        self.clear_kv_cache()
+    }
+
+    fn clear_kv_cache_range(&self, layer_range: Range<usize>) -> Result<()> {
+        self.clear_kv_cache_range(layer_range)
+    }
+
+    fn forward_prefill(&self, token_ids: &Tensor) -> Result<Tensor> {
+        self.forward_prefill(token_ids)
+    }
+
+    fn forward_decode(&self, token_ids: &Tensor) -> Result<Tensor> {
+        self.forward_decode(token_ids)
+    }
+
+    fn local_layer_index(&self, global_idx: usize) -> Result<usize> {
+        self.local_layer_index(global_idx)
+    }
+
+    fn layer_offset(&self) -> usize {
+        self.layer_offset
+    }
+
+    fn owned_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn model_device(&self) -> &Device {
+        self.model_device()
     }
 }
 
