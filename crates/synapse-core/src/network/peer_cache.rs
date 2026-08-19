@@ -44,3 +44,50 @@ impl PeerCache {
                         cache
                     }
                     Err(error) => {
+                        warn!(%error, "failed to parse peer cache, starting fresh");
+                        Self::default()
+                    }
+                },
+                Err(_) => {
+                    info!("no existing peer cache, starting fresh");
+                    Self::default()
+                }
+            },
+            Err(error) => {
+                warn!(%error, "failed to determine cache path");
+                Self::default()
+            }
+        }
+    }
+
+    /// Save cache to disk.
+    pub fn save(&self) {
+        match Self::cache_path() {
+            Ok(path) => {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                match serde_json::to_string_pretty(self) {
+                    Ok(json) => {
+                        if let Err(error) = fs::write(&path, json) {
+                            warn!(%error, "failed to write peer cache");
+                        } else {
+                            info!(path = %path.display(), "saved peer cache");
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, "failed to serialize peer cache");
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(%error, "failed to determine cache path");
+            }
+        }
+    }
+
+    /// Get fresh cached peers for a model (TTL < 5 minutes).
+    pub fn get_providers(&self, model_id: &str) -> Vec<(PeerId, Vec<Multiaddr>)> {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
