@@ -81,3 +81,86 @@ impl ConnectionState {
 #[derive(Debug)]
 pub struct ConnectionPool {
     /// Map of peer_id to connection state.
+    warm_connections: HashMap<PeerId, ConnectionState>,
+    /// Maximum number of connections to maintain.
+    max_pool_size: usize,
+    /// When the last health check sweep was performed.
+    last_health_check: Instant,
+}
+
+impl ConnectionPool {
+    /// Create a new connection pool with default size.
+    pub fn new() -> Self {
+        Self::with_capacity(WARM_POOL_SIZE)
+    }
+
+    /// Create a connection pool with custom capacity.
+    pub fn with_capacity(max_pool_size: usize) -> Self {
+        Self {
+            warm_connections: HashMap::with_capacity(max_pool_size),
+            max_pool_size,
+            last_health_check: Instant::now(),
+        }
+    }
+
+    /// Pre-warm connections to top N peers.
+    ///
+    /// This should be called when the worker ranking changes (after heartbeats)
+    /// to ensure connections to the fastest workers are ready.
+    pub fn prewarm(&mut self, peers: &[PeerId]) {
+        let target_peers: Vec<PeerId> = peers.iter().take(self.max_pool_size).copied().collect();
+
+        // Add new peers to pool
+        for peer_id in &target_peers {
+            if !self.warm_connections.contains_key(peer_id) {
+                info!(%peer_id, "prewarming connection to top worker");
+                self.warm_connections
+                    .insert(*peer_id, ConnectionState::new(*peer_id));
+            }
+        }
+
+        // Remove peers no longer in top N
+        let to_remove: Vec<PeerId> = self
+            .warm_connections
+            .keys()
+            .filter(|peer_id| !target_peers.contains(peer_id))
+            .copied()
+            .collect();
+
+        for peer_id in to_remove {
+            debug!(%peer_id, "removing peer from warm pool (no longer in top workers)");
+            self.warm_connections.remove(&peer_id);
+        }
+    }
+
+    /// Check if a peer is in the warm connection pool.
+    pub fn has_warm_connection(&self, peer_id: &PeerId) -> bool {
+        self.warm_connections
+            .get(peer_id)
+            .map(|state| state.is_healthy)
+            .unwrap_or(false)
+    }
+
+    /// Mark a pooled connection as used.
+    pub fn mark_connection_used(&mut self, peer_id: &PeerId) {
+        if let Some(state) = self.warm_connections.get_mut(peer_id) {
+            state.mark_used();
+            debug!(%peer_id, count = state.request_count, "marked pooled connection as used");
+        }
+    }
+
+    /// Update health status for a peer (e.g., after ping response).
+    pub fn update_peer_health(&mut self, peer_id: &PeerId, success: bool) {
+        if let Some(state) = self.warm_connections.get_mut(peer_id) {
+            state.update_health(success);
+            if !success {
+                warn!(
+                        %peer_id,
+                failed_checks = state.failed_checks,
+                             "health check failed for pooled connection"
+                        );
+            }
+        }
+    }
+
+    /// Get all peers in the warm pool.
