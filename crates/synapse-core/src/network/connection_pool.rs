@@ -164,3 +164,86 @@ impl ConnectionPool {
     }
 
     /// Get all peers in the warm pool.
+    pub fn pooled_peers(&self) -> Vec<PeerId> {
+        self.warm_connections.keys().copied().collect()
+    }
+
+    /// Get healthy peers in the warm pool.
+    pub fn healthy_peers(&self) -> Vec<PeerId> {
+        self.warm_connections
+            .values()
+            .filter(|state| state.is_healthy)
+            .map(|state| state.peer_id)
+            .collect()
+    }
+
+    /// Run periodic health check maintenance.
+    ///
+    /// Returns true if health checks should be triggered (30s interval).
+    pub fn should_run_health_check(&mut self) -> bool {
+        if self.last_health_check.elapsed() >= HEALTH_CHECK_INTERVAL {
+            self.last_health_check = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove idle and unhealthy connections.
+    pub fn prune_stale_connections(&mut self) {
+        let to_remove: Vec<PeerId> = self
+            .warm_connections
+            .iter()
+            .filter(|(_, state)| !state.is_healthy || state.is_idle())
+            .map(|(peer_id, _)| *peer_id)
+            .collect();
+
+        for peer_id in to_remove {
+            let state = self.warm_connections.remove(&peer_id).unwrap();
+            if !state.is_healthy {
+                info!(%peer_id, "removed unhealthy connection from pool");
+            } else if state.is_idle() {
+                debug!(%peer_id, "removed idle connection from pool");
+            }
+        }
+    }
+
+    /// Get statistics about the connection pool.
+    pub fn stats(&self) -> PoolStats {
+        let healthy = self.healthy_peers().len();
+        let total = self.warm_connections.len();
+        let total_requests: u64 = self
+            .warm_connections
+            .values()
+            .map(|state| state.request_count)
+            .sum();
+
+        PoolStats {
+            total_connections: total,
+            healthy_connections: healthy,
+            max_pool_size: self.max_pool_size,
+            total_requests,
+        }
+    }
+}
+
+impl Default for ConnectionPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Connection pool statistics.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolStats {
+    pub total_connections: usize,
+    pub healthy_connections: usize,
+    pub max_pool_size: usize,
+    pub total_requests: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
