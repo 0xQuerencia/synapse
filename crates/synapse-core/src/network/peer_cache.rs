@@ -91,3 +91,50 @@ impl PeerCache {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
+            .as_secs();
+
+        self.providers
+            .get(model_id)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| now - entry.cached_at < CACHE_TTL.as_secs())
+                    .filter_map(|entry| {
+                        let peer_id = entry.peer_id.parse::<PeerId>().ok()?;
+                        let addrs: Vec<Multiaddr> =
+                            entry.addrs.iter().filter_map(|s| s.parse().ok()).collect();
+                        if addrs.is_empty() {
+                            None
+                        } else {
+                            Some((peer_id, addrs))
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Add or update a provider entry.
+    pub fn add_provider(&mut self, model_id: String, peer_id: PeerId, addrs: Vec<Multiaddr>) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let entry = CachedPeer {
+            peer_id: peer_id.to_string(),
+            addrs: addrs.iter().map(|a| a.to_string()).collect(),
+            model_id: model_id.clone(),
+            cached_at: now,
+        };
+
+        self.providers
+            .entry(model_id)
+            .or_default()
+            .retain(|e| e.peer_id != entry.peer_id); // Remove old entry if exists
+        self.providers.get_mut(&entry.model_id).unwrap().push(entry);
+    }
+
+    /// Prune stale entries older than TTL.
+    pub fn prune_stale(&mut self) {
+        let now = SystemTime::now()
