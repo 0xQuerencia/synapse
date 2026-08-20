@@ -792,14 +792,11 @@ impl WeightTransfer {
                 reason: "length outside accepted range",
             });
         }
-        match self.filename.as_str() {
-            "config.json" | "model.safetensors" | "tokenizer.json" => {}
-            _ => {
-                return Err(ProtocolError::InvalidField {
-                    field: "filename",
-                    reason: "only config.json, model.safetensors, and tokenizer.json are allowed",
-                });
-            }
+        if !weight_filename_allowed(&self.filename) {
+            return Err(ProtocolError::InvalidField {
+                field: "filename",
+                reason: "only config.json, tokenizer.json, *.safetensors, *.safetensors.index.json, and *.gguf are allowed",
+            });
         }
         if self.chunk.len() > MAX_WEIGHT_CHUNK_BYTES {
             return Err(ProtocolError::TensorTooLarge {
