@@ -214,9 +214,43 @@ impl NodeHello {
 
         Ok(())
     }
+
+    /// Build a `NodeHello` from a hardware probe. Legacy scalar
+    /// fields are auto-derived from the structured capability so
+    /// receivers that haven't been updated keep working.
+    pub fn from_probe(
+        role: NodeRole,
+        model: ModelIdentity,
+        platform: impl Into<String>,
+        probe: &crate::hardware::HardwareProbe,
+    ) -> Self {
+        let cap = WorkerCapability::from_probe(probe);
+        Self {
+            protocol_version: PROTOCOL_VERSION.into(),
+            role,
+            model,
+            platform: platform.into(),
+            capability: Some(cap.clone()),
+            cpu_threads: cap.hardware.cpu_threads,
+            compute_score: Some(cap.compute_score),
+            available_ram_mb: Some(cap.available_ram_mb),
+            memory_bytes: None,
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
 pub enum DType {
     F32,
     F16,
