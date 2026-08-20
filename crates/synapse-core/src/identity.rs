@@ -176,8 +176,7 @@ fn default_key_path() -> Result<PathBuf, IdentityError> {
 /// The GUI runs its HTTP handlers on a thread pool separate from
 /// `main`, so this has to be a process-global rather than a
 /// `thread_local!`.
-static IDENTITY_PATH_OVERRIDE: std::sync::Mutex<Option<PathBuf>> =
-    std::sync::Mutex::new(None);
+static IDENTITY_PATH_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 /// Install a process-wide override for the identity key path used by
 /// `load_or_create`. Pass `None` to clear the override. While set,
