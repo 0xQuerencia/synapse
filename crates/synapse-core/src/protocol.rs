@@ -438,11 +438,26 @@ impl TensorPayload {
             },
         )?;
 
-        if expected != self.bytes.len() {
-            return Err(ProtocolError::TensorByteLength {
-                expected,
-                actual: self.bytes.len(),
-            });
+        // For uncompressed payloads, the wire buffer must equal the
+        // element buffer. For compressed payloads, the *original*
+        // size must equal the element buffer (the on-wire size is
+        // allowed to be smaller, of course).
+        if self.compression.is_lossless() {
+            if self.compression == crate::protocol::CompressionCodec::None {
+                if expected != self.data.len() {
+                    return Err(ProtocolError::TensorByteLength {
+                        expected,
+                        actual: self.data.len(),
+                    });
+                }
+            } else {
+                if expected != self.original_size {
+                    return Err(ProtocolError::TensorByteLength {
+                        expected,
+                        actual: self.original_size,
+                    });
+                }
+            }
         }
 
         Ok(())
