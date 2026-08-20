@@ -1,8 +1,9 @@
-use crate::{ModelIdentity, model::validate_printable};
+use crate::{ModelIdentity, hardware::ComputeBackend, model::validate_printable};
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: &str = "synapse/0.2.0";
+pub const PROTOCOL_VERSION: &str = "synapse/0.3.0";
 
 /// Maximum nonce length (bytes, hex-encoded).
 pub const MAX_NONCE_LEN: usize = 128;
