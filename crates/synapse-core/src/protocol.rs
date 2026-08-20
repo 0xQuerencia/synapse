@@ -268,26 +268,144 @@ impl DType {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Compression codec carried in `TensorPayload`'s wire header.
+///
+/// All variants are lossless. `Lz4` is the recommended default for
+/// latency-sensitive hops (decode is ~3 GB/s single-threaded).
+/// `Zstd` trades a few ms of encode time for higher ratios on
+/// bandwidth-constrained paths.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionCodec {
+    /// Bytes are uncompressed.
+    None,
+    /// lz4 block format with a 4-byte LE size header prepended.
+    Lz4,
+    /// zstd with explicit level (1..=22). 3 is a sane default.
+    Zstd { level: i32 },
+}
+
+impl CompressionCodec {
+    /// Whether the codec preserves bit-exact bytes. Reserved for a
+    /// future lossy codec (e.g. int8 quant); the validation path
+    /// uses this to reject lossy transfers when bit-exact is required.
+    pub fn is_lossless(&self) -> bool {
+        matches!(self, Self::None | Self::Lz4 | Self::Zstd { .. })
+    }
+}
+
+#[derive(
+    Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
+)]
 pub struct TensorPayload {
     pub dtype: DType,
     pub shape: Vec<usize>,
-    pub bytes: Vec<u8>,
+    /// Size of the *uncompressed* element buffer. Used for validation
+    /// (against `shape × dtype.bytes_per_element()`) and for logging
+    /// the compression ratio.
+    pub original_size: usize,
+    /// Size of `data` (what the wire sees). When `compression` is
+    /// `None` this equals `original_size`.
+    pub compressed_size: usize,
+    pub compression: CompressionCodec,
+    /// Element bytes, already compressed if `compression != None`.
+    /// On the wire this is what rkyv/serde serializes.
+    pub data: Vec<u8>,
 }
 
 impl TensorPayload {
+    /// Construct from raw element bytes without compression. Most
+    /// tests and the local-only path use this directly.
     pub fn new(dtype: DType, shape: Vec<usize>, bytes: Vec<u8>) -> Self {
+        let len = bytes.len();
         Self {
             dtype,
             shape,
-            bytes,
+            original_size: len,
+            compressed_size: len,
+            compression: CompressionCodec::None,
+            data: bytes,
+        }
+    }
+
+    /// Construct with explicit compression. If the codec produces a
+    /// larger output than the input (incompressible data), this
+    /// gracefully falls back to `None` so the wire never sees a
+    /// payload that's bigger than the raw bytes.
+    pub fn new_compressed(
+        dtype: DType,
+        shape: Vec<usize>,
+        bytes: Vec<u8>,
+        codec: CompressionCodec,
+    ) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let original_size = bytes.len();
+        let (compressed_size, data, used_codec) = match codec {
+            CompressionCodec::None => (original_size, bytes, CompressionCodec::None),
+            other => {
+                let compressed =
+                    crate::inference::compression::compress(&bytes, other).context("compress")?;
+                if compressed.len() >= original_size {
+                    (original_size, bytes, CompressionCodec::None)
+                } else {
+                    (compressed.len(), compressed, other)
+                }
+            }
+        };
+        Ok(Self {
+            dtype,
+            shape,
+            original_size,
+            compressed_size,
+            compression: used_codec,
+            data,
+        })
+    }
+
+    /// Compression ratio in `[0, 1]`. `1.0` = no compression.
+    pub fn compression_ratio(&self) -> f32 {
+        if self.original_size == 0 {
+            return 1.0;
+        }
+        self.compressed_size as f32 / self.original_size as f32
+    }
+
+    /// Decompress `self.data` into raw element bytes. Returns the
+    /// original (uncompressed) buffer; the caller validates length
+    /// against `shape × dtype.bytes_per_element()`.
+    pub fn decompress(&self) -> anyhow::Result<Vec<u8>> {
+        use anyhow::Context;
+        match self.compression {
+            CompressionCodec::None => Ok(self.data.clone()),
+            c => crate::inference::compression::decompress(&self.data, c).context("decompress"),
         }
     }
 
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.bytes.len() > MAX_TENSOR_BYTES {
+        // We bound the *wire-visible* buffer (data, possibly compressed).
+        if self.data.len() > MAX_TENSOR_BYTES {
             return Err(ProtocolError::TensorTooLarge {
-                actual: self.bytes.len(),
+                actual: self.data.len(),
+                max: MAX_TENSOR_BYTES,
+            });
+        }
+        // The uncompressed size also has to fit — a malicious peer
+        // could claim `original_size = u32::MAX` with a tiny wire
+        // buffer and trick us into allocating that on decompress.
+        if self.original_size > MAX_TENSOR_BYTES {
+            return Err(ProtocolError::TensorTooLarge {
+                actual: self.original_size,
                 max: MAX_TENSOR_BYTES,
             });
         }
