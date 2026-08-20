@@ -566,6 +566,34 @@ impl ClearCache {
     }
 }
 
+/// Master → Worker: roll the worker's KV cache back to `target_seq_len`
+/// tokens after a speculative round rejected draft tokens.
+///
+/// Workers append every verification position to their local KV caches
+/// before knowing whether drafts are accepted; rejected positions must be
+/// truncated so subsequent decode steps see a cache that matches the true
+/// committed sequence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KvTruncate {
+    pub trace_id: String,
+    pub target_seq_len: usize,
+}
+
+impl KvTruncate {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_trace_id(&self.trace_id)?;
+
+        if self.target_seq_len == 0 || self.target_seq_len >= MAX_SEQUENCE_LEN {
+            return Err(ProtocolError::InvalidField {
+                field: "target_seq_len",
+                reason: "outside accepted range",
+            });
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Health {
     pub loaded_shard: Option<(u32, u32)>,
