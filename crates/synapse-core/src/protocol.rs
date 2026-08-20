@@ -804,19 +804,19 @@ impl WeightTransfer {
                 max: MAX_WEIGHT_CHUNK_BYTES,
             });
         }
-        if let Some(sha256) = &self.sha256 {
-            if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(ProtocolError::InvalidField {
-                    field: "sha256",
-                    reason: "must be a 64-character SHA-256 hex digest",
-                });
-            }
+        if let Some(sha256) = &self.sha256
+            && (sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "sha256",
+                reason: "must be a 64-character SHA-256 hex digest",
+            });
         }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WireMessage {
     NodeHello(NodeHello),
     ShardPlan(ShardPlan),
