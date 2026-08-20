@@ -62,12 +62,100 @@ pub enum NodeRole {
     Worker,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Wire-friendly snapshot of [`crate::hardware::HardwareProbe`]. We
+/// don't send the full probe because the TFLOPS lookup table and
+/// free-VRAM are volatile; the master just needs "has GPU? which
+/// kind? how much RAM/VRAM?".
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HardwareSummary {
+    pub has_gpu: bool,
+    pub backend: ComputeBackend,
+    pub vram_free_bytes: Option<u64>,
+    pub vram_total_bytes: Option<u64>,
+    pub estimated_fp16_tflops: Option<f32>,
+    pub cpu_threads: u16,
+}
+
+/// Stable, planner-friendly representation of what this worker can
+/// do. Sent in `NodeHello` and refreshed via a periodic
+/// `CapabilityPing`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkerCapability {
+    /// Stable score: `estimated_fp16_tflops * 1000` for GPU, or
+    /// `cpu_threads * 100` for CPU. Capped at `MAX_COMPUTE_SCORE`.
+    pub compute_score: u64,
+    pub available_ram_mb: u64,
+    pub hardware: HardwareSummary,
+}
+
+impl WorkerCapability {
+    /// Build from a `HardwareProbe`. Used at startup and on heartbeat.
+    pub fn from_probe(probe: &crate::hardware::HardwareProbe) -> Self {
+        let compute_score = if probe.has_accelerator {
+            (probe.estimated_fp16_tflops.unwrap_or(0.0) * 1000.0) as u64
+        } else {
+            (probe.cpu_threads as u64) * 100
+        }
+        .min(MAX_COMPUTE_SCORE);
+
+        let available_ram_mb = if probe.has_accelerator {
+            probe
+                .vram_total_bytes
+                .map(|b| b / (1024 * 1024))
+                .unwrap_or(0)
+        } else {
+            system_free_ram_mb().unwrap_or(0)
+        }
+        .min(MAX_AVAILABLE_RAM_MB);
+
+        Self {
+            compute_score,
+            available_ram_mb,
+            hardware: HardwareSummary {
+                has_gpu: probe.has_accelerator,
+                backend: probe.backend,
+                vram_free_bytes: probe.vram_free_bytes,
+                vram_total_bytes: probe.vram_total_bytes,
+                estimated_fp16_tflops: probe.estimated_fp16_tflops,
+                cpu_threads: probe.cpu_threads,
+            },
+        }
+    }
+}
+
+/// Linux-specific `/proc/meminfo` reader. Other platforms get `0`.
+#[cfg(target_os = "linux")]
+fn system_free_ram_mb() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:")
+            && let Some(kib) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+        {
+            return Some(kib / 1024);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn system_free_ram_mb() -> Option<u64> {
+    None
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeHello {
     pub protocol_version: String,
     pub role: NodeRole,
     pub model: ModelIdentity,
     pub platform: String,
+    /// Structured capability (Phase 2). New workers populate this;
+    /// legacy workers may leave it `None` and the receiver should
+    /// fall back to the legacy scalar fields.
+    pub capability: Option<WorkerCapability>,
+    // Legacy — derived from `capability` when it's `None`.
     pub cpu_threads: u16,
     pub memory_bytes: Option<u64>,
     pub compute_score: Option<u64>,
