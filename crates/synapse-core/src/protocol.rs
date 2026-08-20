@@ -733,6 +733,24 @@ pub struct WeightRequest {
     pub offset: u64,
 }
 
+/// Whether a requested weight filename is allowed on the wire.
+///
+/// Multi-file checkpoints shard weights (`model-00001-of-00002.safetensors`),
+/// publish a `model.safetensors.index.json` weight map, and quantized models
+/// ship as `.gguf`. Any path separator or `..` traversal is always rejected —
+/// the filename must be a plain last-path-component.
+pub fn weight_filename_allowed(filename: &str) -> bool {
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return false;
+    }
+    matches!(
+        filename,
+        "config.json" | "tokenizer.json" | "model.safetensors"
+    ) || filename.ends_with(".safetensors.index.json")
+        || filename.ends_with(".safetensors")
+        || filename.ends_with(".gguf")
+}
+
 impl WeightRequest {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.model_id.is_empty() || self.model_id.len() > MAX_MODEL_ID_LEN {
