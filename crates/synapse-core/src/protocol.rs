@@ -908,6 +908,7 @@ mod tests {
             role: NodeRole::Master,
             model: ModelIdentity::new("hf-internal-testing/tiny-random-LlamaForCausalLM"),
             platform: "linux".to_owned(),
+            capability: None,
             cpu_threads: 8,
             memory_bytes: None,
             compute_score: None,
