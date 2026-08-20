@@ -604,12 +604,12 @@ pub struct Health {
 
 impl Health {
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if let Some((start, end)) = self.loaded_shard {
-            if start >= end {
-                return Err(ProtocolError::InvalidShardPlan {
-                    reason: "health shard range must be non-empty",
-                });
-            }
+        if let Some((start, end)) = self.loaded_shard
+            && start >= end
+        {
+            return Err(ProtocolError::InvalidShardPlan {
+                reason: "health shard range must be non-empty",
+            });
         }
 
         if let Some(last_error) = &self.last_error {
