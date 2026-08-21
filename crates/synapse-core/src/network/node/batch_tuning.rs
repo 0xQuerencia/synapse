@@ -107,3 +107,40 @@ mod tests {
         assert_eq!(cal.current_batch_size(), 8);
 
         // Continue through remaining sizes
+        for _ in 0..5 {
+            cal.record_sample(25.0);
+        }
+        for _ in 0..5 {
+            cal.record_sample(30.0);
+        }
+        // Last batch size
+        for i in 0..4 {
+            assert!(!cal.record_sample(35.0 + i as f32));
+        }
+        assert!(cal.record_sample(39.0)); // Calibration complete
+    }
+
+    #[test]
+    fn batch_calibration_finds_optimal_batch_size() {
+        let mut cal = BatchCalibration::new(PeerId::random());
+
+        // Simulate measurements: batch 16 has best throughput
+        let measurements = vec![
+            10.0, // batch 1
+            20.0, // batch 4
+            30.0, // batch 8
+            50.0, // batch 16 (best)
+            35.0, // batch 32 (worse due to memory pressure)
+        ];
+
+        for &throughput in &measurements {
+            for _ in 0..5 {
+                cal.record_sample(throughput);
+            }
+        }
+
+        let (optimal_size, optimal_throughput) = cal.optimal_result().unwrap();
+        assert_eq!(optimal_size, 16);
+        assert_eq!(optimal_throughput, 50.0);
+    }
+}
