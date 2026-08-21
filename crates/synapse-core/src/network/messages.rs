@@ -47,6 +47,14 @@ pub enum ResponseMessage {
     ChallengeIssued(Challenge),
     /// Deliver a chunk of model weight data.
     WeightTransfer(WeightTransfer),
+    /// Master → Worker: capability ping accepted.
+    CapabilityAck {
+        accepted: bool,
+    },
+    /// Worker → Master: health check response.
+    HealthPong(Health),
+    /// Worker → Master: KV cache truncated to the requested length.
+    KvTruncateAck(KvTruncate),
 }
 
 impl ResponseMessage {
