@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActivationRequest, ActivationResponse, Challenge, ChallengeResponse, ClearCache, NodeHello,
-    WeightRequest, WeightTransfer,
+    ActivationRequest, ActivationResponse, Challenge, ChallengeResponse, ClearCache, Health,
+    KvTruncate, NodeHello, WeightRequest, WeightTransfer, WorkerCapability,
 };
 
 /// Maximum length for the `Rejected.reason` string to prevent memory abuse.
