@@ -24,6 +24,15 @@ pub enum RequestMessage {
     ChallengeResponse(ChallengeResponse),
     /// Request a chunk of model weights from a peer.
     WeightRequest(WeightRequest),
+    /// Worker → Master: "my capabilities are now X" (heartbeat).
+    /// Master updates the worker registry and may re-plan if VRAM
+    /// is tight.
+    CapabilityPing(WorkerCapability),
+    /// Master → Worker: pre-warm connection with health check.
+    HealthPing,
+    /// Master → Worker: roll the KV cache back after rejected speculative
+    /// draft tokens.
+    KvTruncate(KvTruncate),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
