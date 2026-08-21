@@ -71,3 +71,39 @@ impl BatchCalibration {
         }
 
         let mut best_idx = 0;
+        let mut best_throughput = 0.0;
+
+        for (idx, &throughput) in self.measured_throughput.iter().enumerate() {
+            if throughput > best_throughput {
+                best_throughput = throughput;
+                best_idx = idx;
+            }
+        }
+
+        Some((self.test_sizes[best_idx], best_throughput))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_calibration_collects_samples_across_sizes() {
+        let mut cal = BatchCalibration::new(PeerId::random());
+        assert_eq!(cal.current_batch_size(), 1);
+
+        // Collect 5 samples for batch size 1
+        for i in 0..4 {
+            assert!(!cal.record_sample(10.0 + i as f32));
+        }
+        assert!(!cal.record_sample(14.0));
+        assert_eq!(cal.current_batch_size(), 4);
+
+        // Collect 5 samples for batch size 4
+        for i in 0..5 {
+            assert!(!cal.record_sample(20.0 + i as f32));
+        }
+        assert_eq!(cal.current_batch_size(), 8);
+
+        // Continue through remaining sizes
