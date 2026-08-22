@@ -142,3 +142,51 @@ impl OllamaClient {
                         if frame.done {
                             let reason = frame
                                 .done_reason
+                                .unwrap_or_else(|| "stop".to_owned());
+                            info!(tokens = total_tokens, %reason, "ollama done");
+                            // Map ollama's done_reason to our StopReason.
+                            // ollama emits "stop" on a natural end (EOS/stop
+                            // token) and "length" when num_predict is hit.
+                            let stop = match reason.as_str() {
+                                "length" => StopReason::MaxTokens,
+                                _ => StopReason::Eos,
+                            };
+                            let _ = bcast.send(ChatEvent::GenerationDone {
+                                tokens_generated: total_tokens,
+                                reason: stop,
+                            });
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Stream ended without a `done` frame.
+        let _ = bcast.send(ChatEvent::GenerationDone {
+            tokens_generated: total_tokens,
+            reason: StopReason::MaxTokens,
+        });
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct TagsResponse {
+    models: Vec<TagModel>,
+}
+
+#[derive(Deserialize)]
+struct TagModel {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct GenerateChunk {
+    #[serde(default)]
+    response: Option<String>,
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    done_reason: Option<String>,
+}
