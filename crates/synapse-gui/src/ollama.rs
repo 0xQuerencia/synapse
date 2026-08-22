@@ -94,3 +94,51 @@ impl OllamaClient {
             .json(&body)
             .send()
             .await
+            .with_context(|| format!("POST {url}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("ollama /api/generate returned {status}: {text}"));
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut total_tokens: usize = 0;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.recv() => {
+                    info!("ollama stream cancelled by caller");
+                    return Ok(());
+                }
+                chunk = stream.next() => {
+                    let Some(chunk) = chunk else { break };
+                    let chunk = chunk.context("read ollama chunk")?;
+                    buf.extend_from_slice(&chunk);
+
+                    // ollama's stream emits one JSON object per line
+                    // (NDJSON). Parse whatever complete lines are in
+                    // the buffer.
+                    while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                        let mut line: Vec<u8> = buf.drain(..=pos).collect();
+                        // drop the trailing \n
+                        let _ = line.pop();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let frame: GenerateChunk = match serde_json::from_slice(&line) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                warn!(error = %e, "skip malformed ollama frame");
+                                continue;
+                            }
+                        };
+                        if let Some(t) = frame.response
+                            && !t.is_empty() {
+                                total_tokens += 1;
+                                let _ = bcast.send(ChatEvent::Token(t));
+                            }
+                        if frame.done {
+                            let reason = frame
+                                .done_reason
