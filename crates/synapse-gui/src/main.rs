@@ -109,7 +109,13 @@ async fn main() -> Result<()> {
     eprintln!("│ Synapse GUI                                   │");
     eprintln!("├───────────────────────────────────────────────┤");
     eprintln!("│ Listening on:  http://{:<27} │", local_addr);
-    eprintln!("│ Open in browser to use the GUI.               │");
+    if let Some(tok) = &cli.token {
+        eprintln!("│ Auth:          ENABLED (token required)       │");
+        eprintln!("│ Share URL:     http://{local_addr}/?token={tok}");
+    } else {
+        eprintln!("│ Auth:          OFF (localhost only — do NOT   │");
+        eprintln!("│                expose without --token)        │");
+    }
     eprintln!("│ Press Ctrl+C to stop.                         │");
     eprintln!("╰───────────────────────────────────────────────╯");
 
