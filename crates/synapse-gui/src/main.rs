@@ -18,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 mod api;
 mod assets;
 mod config_io;
+mod ollama;
 mod session;
 mod ws;
 
