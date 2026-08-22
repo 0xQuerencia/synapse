@@ -26,6 +26,102 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     pub sessions: SessionStore,
+    /// Optional shared access token. When `Some`, the `auth_guard`
+    /// middleware requires it on every request. `None` = no auth
+    /// (localhost-only mode).
+    pub token: Option<Arc<String>>,
+}
+
+/// Request gate: when a token is configured, every request must present it
+/// via `?token=`, `x-synapse-token`, `Authorization: Bearer`, or the
+/// `synapse_token` cookie. A valid `?token=` also sets the cookie so the
+/// browser (and the WebSocket upgrade, which can't send custom headers)
+/// stays authenticated for the rest of the session.
+pub async fn auth_guard(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::header;
+
+    let Some(expected) = state.token.as_deref() else {
+        // No token configured — open (only safe on 127.0.0.1).
+        return next.run(req).await;
+    };
+
+    let from_query = req.uri().query().and_then(|q| query_param(q, "token"));
+    let headers = req.headers();
+    let from_header = headers
+        .get("x-synapse-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| {
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .map(str::to_owned)
+        });
+    let from_cookie = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| cookie_value(c, "synapse_token"));
+
+    let presented = from_query.clone().or(from_header).or(from_cookie);
+
+    match presented {
+        Some(tok) if ct_eq(tok.as_bytes(), expected.as_bytes()) => {
+            let set_cookie = from_query.is_some();
+            let mut resp = next.run(req).await;
+            if set_cookie
+                && let Ok(val) = header::HeaderValue::from_str(&format!(
+                    "synapse_token={expected}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400"
+                ))
+            {
+                resp.headers_mut().append(header::SET_COOKIE, val);
+            }
+            resp
+        }
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            "unauthorized — open this server with ?token=YOUR_TOKEN appended to the URL",
+        )
+            .into_response(),
+    }
+}
+
+/// Constant-time byte comparison to avoid leaking the token via timing.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Pull a single value out of a `key=value&key2=value2` query string.
+fn query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        let mut it = pair.splitn(2, '=');
+        if it.next() == Some(key) {
+            return it.next().map(str::to_owned);
+        }
+    }
+    None
+}
+
+/// Pull a single cookie value out of a `Cookie:` header string.
+fn cookie_value(cookies: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    for c in cookies.split(';') {
+        if let Some(v) = c.trim().strip_prefix(&prefix) {
+            return Some(v.to_owned());
+        }
+    }
+    None
 }
 
 /// Build the REST sub-router. Returns a `Router<AppState>` that
