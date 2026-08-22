@@ -39,6 +39,15 @@ struct Cli {
     #[arg(long, default_value_t = true)]
     open: bool,
 
+    /// Shared access token. When set, every `/api/*`, `/ws`, and page
+    /// request must present it (via `?token=`, an `x-synapse-token`
+    /// header, `Authorization: Bearer`, or the `synapse_token` cookie).
+    /// REQUIRED before exposing the server publicly (e.g. via a tunnel) —
+    /// the API includes a `PUT /api/config/:file` that writes to disk.
+    /// When unset, no auth is enforced (safe only for `127.0.0.1`).
+    #[arg(long, env = "SYNAPSE_TOKEN")]
+    token: Option<String>,
+
     /// Verbosity (repeat for more detail).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
