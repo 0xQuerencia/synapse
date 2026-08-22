@@ -45,9 +45,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     let _ = tx
         .send(Message::Text(
-            json!({ "type": "hello", "role": "synapse-gui" })
-                .to_string()
-                .into(),
+            json!({ "type": "hello", "role": "synapse-gui" }).to_string(),
         ))
         .await;
 
