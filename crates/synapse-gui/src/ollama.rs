@@ -46,3 +46,51 @@ impl OllamaClient {
     /// after the last `:` in `name`, since ollama returns names like
     /// `gemma4:e2b` already).
     pub async fn list_models(&self) -> Result<Vec<String>> {
+        let url = format!("{}/api/tags", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("ollama /api/tags returned {}", resp.status()));
+        }
+        let body: TagsResponse = resp.json().await.context("decode /api/tags")?;
+        Ok(body.models.into_iter().map(|m| m.name).collect())
+    }
+
+    /// Pump a single prompt through ollama and stream `ChatEvent`s
+    /// into the broadcast. The function returns when the stream
+    /// ends (terminal `done: true` frame or transport error).
+    pub async fn stream_generate(
+        &self,
+        model: &str,
+        prompt: &str,
+        max_tokens: u32,
+        bcast: &broadcast::Sender<ChatEvent>,
+        mut cancel: mpsc::Receiver<()>,
+    ) -> Result<()> {
+        let url = format!("{}/api/generate", self.base_url);
+        let body = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "stream": true,
+            // Disable "thinking" mode. Models like gemma4:e2b-it-qat emit
+            // hidden chain-of-thought into a separate `thinking` field that we
+            // don't surface; left on, the model spends its entire num_predict
+            // budget reasoning and the visible `response` comes back empty
+            // (done_reason="length", tokens=0). For a chat GUI we want answers,
+            // not the scratchpad. Ollama ignores this flag for non-thinking
+            // models, so it's safe to always send.
+            "think": false,
+            "options": { "num_predict": max_tokens },
+            "keep_alive": "5m",
+        });
+        debug!(%url, %model, len = prompt.len(), "ollama generate request");
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
