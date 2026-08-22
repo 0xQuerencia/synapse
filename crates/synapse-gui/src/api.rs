@@ -453,6 +453,11 @@ struct JoinRequest {
     model: String,
     code: String,
     master_addr: Option<String>,
+    /// Optional measured benchmark score from `/api/benchmark`. When
+    /// present, the worker advertises it so the master divides layers by
+    /// this machine's real throughput instead of a thread-count guess.
+    #[serde(default)]
+    compute_score: Option<u64>,
 }
 
 async fn post_join(
