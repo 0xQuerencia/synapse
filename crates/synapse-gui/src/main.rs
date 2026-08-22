@@ -81,12 +81,20 @@ async fn main() -> Result<()> {
 
     let state = api::AppState {
         sessions: session::SessionStore::new(),
+        token: cli.token.clone().map(std::sync::Arc::new),
     };
 
     let app = api::router()
         .route("/ws", axum::routing::get(ws::ws_handler))
         .route("/", axum::routing::get(assets::serve_root))
+        .route("/contribute", axum::routing::get(assets::serve_contribute))
         .fallback(assets::spa_fallback)
+        // Auth gate runs first (outermost). With a token set, every route —
+        // pages, assets, /api, /ws — requires it. No token = open (localhost).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api::auth_guard,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
