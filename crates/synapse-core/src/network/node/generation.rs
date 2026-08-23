@@ -1478,6 +1478,70 @@ impl SynapseNode {
                     self.send_next_activation();
                 }
             }
+            super::super::ResponseMessage::KvTruncateAck(ack) => {
+                if let Err(error) = ack.validate() {
+                    warn!(%peer, %error, "invalid KvTruncateAck from peer");
+                    return;
+                }
+
+                if !self.generation_active {
+                    warn!(%peer, trace_id = %ack.trace_id, "ignoring KvTruncateAck without active generation");
+                    return;
+                }
+
+                if !self.awaiting_truncate_ack {
+                    warn!(%peer, trace_id = %ack.trace_id, "unexpected KvTruncateAck received");
+                    return;
+                }
+
+                let expected_trace = match &self.pending_truncate_trace_id {
+                    Some(trace_id) => trace_id,
+                    None => {
+                        warn!(%peer, trace_id = %ack.trace_id, "missing expected truncate trace id");
+                        return;
+                    }
+                };
+
+                if ack.trace_id != *expected_trace {
+                    warn!(
+                        %peer,
+                        expected_trace_id = %expected_trace,
+                        actual_trace_id = %ack.trace_id,
+                        "ignoring stale KvTruncateAck"
+                    );
+                    return;
+                }
+
+                if !self.pending_truncate_peers.remove(&peer) {
+                    warn!(
+                        %peer,
+                        trace_id = %ack.trace_id,
+                        "received KvTruncateAck from peer outside pending truncate set"
+                    );
+                    return;
+                }
+
+                if !self.pending_truncate_peers.is_empty() {
+                    info!(
+                        pending_peers = self.pending_truncate_peers.len(),
+                        trace_id = %ack.trace_id,
+                        "waiting for remaining KV truncation acknowledgements"
+                    );
+                    return;
+                }
+
+                self.awaiting_truncate_ack = false;
+                self.pending_truncate_trace_id = None;
+                info!(
+                    trace_id = %ack.trace_id,
+                    target_seq_len = ack.target_seq_len,
+                    "KV truncation acknowledged — resuming generation"
+                );
+                self.send_next_activation();
+            }
+            super::super::ResponseMessage::HealthPong(health) => {
+                info!(%peer, latency_ms = ?health.latency_ms, "connection pre-warmed with HealthPong");
+            }
             super::super::ResponseMessage::Rejected { reason } => {
                 self.fail_generation(format!("request rejected by peer {peer}: {reason}"));
             }
