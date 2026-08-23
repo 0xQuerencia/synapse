@@ -356,6 +356,7 @@ impl SessionStore {
         model_id: String,
         code: String,
         master_addr: Option<String>,
+        compute_score: Option<u64>,
     ) -> Result<String> {
         let mut guard = self.inner.lock().await;
         if guard
