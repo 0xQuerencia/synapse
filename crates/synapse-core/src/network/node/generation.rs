@@ -341,14 +341,42 @@ impl SynapseNode {
             }
         };
 
-        let (activation_pass, activation_tokens) =
-            match activation_tokens_for_position(&self.token_ids, self.tokens_generated) {
+        // Phase 4: start timing this step's activation chain so we can
+        // compute each worker's share of total step latency once it
+        // completes (see `publish_step_telemetry`).
+        self.step_started_at = Some(Instant::now());
+        self.step_hop_durations_ms.clear();
+
+        // Decide what this step feeds through the route:
+        // - step 0 → full prefill
+        // - later steps → either a multi-token speculative verification
+        //   block (when the draft cache has a prediction) or a plain
+        //   single-token decode.
+        let (activation_pass, activation_tokens) = if self.tokens_generated == 0 {
+            match activation_tokens_for_position(&self.token_ids, 0) {
                 Ok(activation) => activation,
                 Err(error) => {
                     self.fail_generation(error);
                     return;
                 }
-            };
+            }
+        } else {
+            match self.build_speculative_activation() {
+                Some((tokens, round)) => {
+                    self.spec_round = Some(round);
+                    (ActivationPass::Speculative, tokens)
+                }
+                None => {
+                    match activation_tokens_for_position(&self.token_ids, self.tokens_generated) {
+                        Ok(activation) => activation,
+                        Err(error) => {
+                            self.fail_generation(error);
+                            return;
+                        }
+                    }
+                }
+            }
+        };
 
         info!(
             seq_len = activation_tokens.len(),
