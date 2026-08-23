@@ -1395,7 +1395,22 @@ impl SynapseNode {
                         response.logits,
                     );
                 } else {
-                    self.process_final_activation_output(Some(peer), response.logits);
+                    // Final hop returned over the wire — deserialize once here
+                    // before lm_head (the local-only path skips this entirely).
+                    // Phase 5: the wire carries bf16; upcast to f32 before
+                    // lm_head, which is tied to the f32 embedding weights.
+                    let worker_output = match payload_to_tensor(&response.logits)
+                        .and_then(|t| t.to_dtype(candle_core::DType::F32).map_err(Into::into))
+                    {
+                        Ok(tensor) => tensor,
+                        Err(error) => {
+                            self.fail_generation(format!(
+                                "failed to deserialize worker output from {peer}: {error}"
+                            ));
+                            return;
+                        }
+                    };
+                    self.process_final_activation_output(Some(peer), worker_output);
                 }
             }
             super::super::ResponseMessage::ClearCacheAck(ack) => {
