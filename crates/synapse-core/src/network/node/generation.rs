@@ -527,6 +527,9 @@ impl SynapseNode {
             return;
         }
 
+        // Phase 6: record that this hop consumes a pooled connection.
+        self.connection_pool.mark_connection_used(&hop.peer_id);
+
         let trace_id = activation_trace_id(sequence_position, hop_index);
         match activation_pass {
             ActivationPass::Prefill => {
