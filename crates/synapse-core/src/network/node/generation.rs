@@ -1092,6 +1092,14 @@ impl SynapseNode {
                     "worker decode inference complete — sending response (expected [1,1,hidden])"
                 );
             }
+            ActivationPass::Speculative => {
+                info!(
+                    %peer,
+                    trace_id = %request.trace_id,
+                    output_shape = ?payload.shape,
+                    "worker speculative verification complete — sending multi-token response"
+                );
+            }
         }
 
         let response = crate::ActivationResponse {
