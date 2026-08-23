@@ -413,6 +413,8 @@ impl SessionStore {
             peer_id: peer_id.clone(),
             model_id,
             max_tokens: 0,
+            is_ollama: false,
+            status_rx: Some(status_rx),
         });
 
         Ok(peer_id)
