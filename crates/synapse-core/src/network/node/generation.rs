@@ -551,8 +551,24 @@ impl SynapseNode {
                     hop = hop_index,
                     layer_range = ?hop.layer_range,
                     shape = ?payload.shape,
-                    bytes = payload.bytes.len(),
+                    original_bytes = payload.original_size,
+                    compressed_bytes = payload.compressed_size,
+                    ratio = payload.compression_ratio(),
+                    codec = ?payload.compression,
                     "master routing decode hidden state to worker"
+                );
+            }
+            ActivationPass::Speculative => {
+                info!(
+                    peer = %hop.peer_id,
+                    hop = hop_index,
+                    layer_range = ?hop.layer_range,
+                    shape = ?payload.shape,
+                    original_bytes = payload.original_size,
+                    compressed_bytes = payload.compressed_size,
+                    ratio = payload.compression_ratio(),
+                    codec = ?payload.compression,
+                    "master routing speculative verification block to worker"
                 );
             }
         }
