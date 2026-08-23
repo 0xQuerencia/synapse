@@ -20,27 +20,13 @@ enum RouteParticipant {
     Worker(PeerId),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct RouteWorkerCandidate {
     peer_id: PeerId,
     capability: Option<crate::NodeCapability>,
-}
-
-impl ActivationPass {
-    fn for_sequence_position(sequence_position: usize) -> Self {
-        if sequence_position == 0 {
-            Self::Prefill
-        } else {
-            Self::Decode
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Prefill => "prefill",
-            Self::Decode => "decode",
-        }
-    }
+    /// Phase 2: structured `WorkerCapability` from a heartbeat.
+    /// When `Some`, the master uses the capability-aware planner.
+    wire_capability: Option<crate::WorkerCapability>,
 }
 
 fn activation_tokens_for_position(
