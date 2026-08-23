@@ -70,28 +70,70 @@ fn build_generation_route(
             .map(|worker| RouteParticipant::Worker(worker.peer_id)),
     );
 
-    let weighted_inputs = master_capability.and_then(|master_capability| {
-        let mut weighted = Vec::with_capacity(workers_in_order.len() + 1);
-        weighted.push(WeightedShardParticipant {
-            participant: RouteParticipant::Master,
-            capability: master_capability,
-        });
-        for worker in workers_in_order {
-            let capability = worker.capability?;
-            weighted.push(WeightedShardParticipant {
-                participant: RouteParticipant::Worker(worker.peer_id),
-                capability,
+    // ─── Phase 3: capability-aware planner ─────────────────────────
+    // If every worker has a structured `WorkerCapability` (i.e. the
+    // worker has sent at least one `CapabilityPing` heartbeat),
+    // use the new planner. Otherwise fall back to the legacy
+    // capability-scalar path so a pre-Phase-2 worker still works.
+    let all_workers_have_wire = workers_in_order.iter().all(|w| w.wire_capability.is_some());
+    let _all_workers_have_legacy = workers_in_order.iter().all(|w| w.capability.is_some());
+
+    let assignments = if all_workers_have_wire && !workers_in_order.is_empty() {
+        // Master owns a fixed lower prefix; workers split the rest
+        // proportionally based on `per_layer_throughput`.
+        let workers_only: Vec<(RouteParticipant, crate::WorkerCapability)> = workers_in_order
+            .iter()
+            .map(|w| {
+                (
+                    RouteParticipant::Worker(w.peer_id),
+                    w.wire_capability.clone().expect("checked above"),
+                )
+            })
+            .collect();
+        let worker_assignments = crate::plan_weighted_shards_capable(total_layers, &workers_only)
+            .map_err(|e| format!("capability-aware planner failed: {e}"))?;
+        // Shift worker ranges up by the master's prefix so the
+        // master and workers don't overlap.
+        let master_split = total_layers / (workers_in_order.len() + 1);
+        let mut all: Vec<StaticShardAssignment<RouteParticipant>> = Vec::new();
+        if master_split > 0 {
+            all.push(StaticShardAssignment {
+                participant: RouteParticipant::Master,
+                layer_range: 0..master_split,
             });
         }
-        Some(weighted)
-    });
-
-    let assignments = if let Some(weighted_inputs) = weighted_inputs {
-        plan_weighted_shards(total_layers, &weighted_inputs)
-            .map_err(|error| format!("failed to build weighted generation route: {error}"))?
+        let mut cumulative = master_split;
+        for mut a in worker_assignments {
+            let len = a.layer_range.len();
+            a.layer_range = cumulative..cumulative + len;
+            cumulative += len;
+            all.push(a);
+        }
+        all
     } else {
-        plan_static_shards(total_layers, &participants)
-            .map_err(|error| format!("failed to build static generation route: {error}"))?
+        let weighted_inputs = master_capability.and_then(|master_capability| {
+            let mut weighted = Vec::with_capacity(workers_in_order.len() + 1);
+            weighted.push(WeightedShardParticipant {
+                participant: RouteParticipant::Master,
+                capability: master_capability,
+            });
+            for worker in workers_in_order {
+                let capability = worker.capability?;
+                weighted.push(WeightedShardParticipant {
+                    participant: RouteParticipant::Worker(worker.peer_id),
+                    capability,
+                });
+            }
+            Some(weighted)
+        });
+
+        if let Some(weighted_inputs) = weighted_inputs {
+            plan_weighted_shards(total_layers, &weighted_inputs)
+                .map_err(|error| format!("failed to build weighted generation route: {error}"))?
+        } else {
+            plan_static_shards(total_layers, &participants)
+                .map_err(|error| format!("failed to build static generation route: {error}"))?
+        }
     };
 
     let mut master_layer_range = None;
