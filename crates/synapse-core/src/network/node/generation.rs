@@ -245,6 +245,7 @@ impl SynapseNode {
                     .capability_for(&peer_id)
                     .as_ref()
                     .and_then(WorkerCapabilitySnapshot::planner_capability),
+                wire_capability: self.worker_registry.wire_capability(&peer_id),
             })
             .collect();
         let route_plan = match build_generation_route(
