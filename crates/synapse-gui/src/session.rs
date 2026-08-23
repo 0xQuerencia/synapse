@@ -485,9 +485,17 @@ impl SessionStore {
         // chat_channels prompt stream doesn't accept a
         // per-message override. We accept the API anyway
         // for forward compatibility.
-        let formatted = format_instruct_prompt(&text);
+
+        // Ollama applies the model's own chat template server-side (via the
+        // Modelfile TEMPLATE), so we send the raw user text. The candle path
+        // expects SmolLM2's instruct framing, so it gets the wrapped form.
+        let payload = if state.is_ollama {
+            text
+        } else {
+            format_instruct_prompt(&text)
+        };
         prompt_tx
-            .send(formatted)
+            .send(payload)
             .await
             .map_err(|e| anyhow!("failed to send prompt: {e}"))?;
         Ok(())
