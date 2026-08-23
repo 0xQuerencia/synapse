@@ -305,6 +305,10 @@ impl SessionStore {
         let (prompt_tx, mut event_rx) = node.chat_channels();
         let (bcast_tx, _) = broadcast::channel::<UiChatEvent>(1024);
 
+        // Grab the live status receiver BEFORE the node is moved into its
+        // run task — that's the only place we still hold a `&node`.
+        let status_rx = node.status_receiver();
+
         // Bridge: forward node's chat events into the broadcast.
         let bcast_for_bridge = bcast_tx.clone();
         tokio::spawn(async move {
