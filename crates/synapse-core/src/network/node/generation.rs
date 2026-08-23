@@ -995,6 +995,18 @@ impl SynapseNode {
             }
         };
 
+        // Phase 5: the wire carries bf16; upcast to f32 before running
+        // layers — weights are f32 and candle matmul requires matching
+        // dtypes on both operands.
+        let hidden = match hidden.to_dtype(candle_core::DType::F32) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                warn!(%peer, %error, "failed to upcast hidden state to f32");
+                self.reject(channel, "tensor dtype conversion failed");
+                return;
+            }
+        };
+
         // Run worker layers.
         let pipeline = match &self.pipeline {
             Some(pipeline) => Arc::clone(pipeline),
