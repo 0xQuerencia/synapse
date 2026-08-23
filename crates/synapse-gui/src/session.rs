@@ -70,6 +70,14 @@ pub struct SessionState {
     /// The model id used for this session.
     pub model_id: String,
     pub max_tokens: usize,
+    /// True when this master streams from a local ollama backend
+    /// (`ollama:` model prefix) instead of the candle/libp2p pipeline.
+    /// Controls prompt templating in `send_prompt`.
+    pub is_ollama: bool,
+    /// Live networking snapshot receiver, present whenever a real
+    /// `SynapseNode` is running (candle master/worker). `None` for the
+    /// ollama backend (no swarm) and relay sessions.
+    pub status_rx: Option<watch::Receiver<NodeStatusSnapshot>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
