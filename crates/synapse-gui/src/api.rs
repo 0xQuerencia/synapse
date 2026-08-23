@@ -466,7 +466,7 @@ async fn post_join(
 ) -> Result<Json<JoinResponse>, ApiError> {
     let peer_id = state
         .sessions
-        .start_worker(req.model, req.code, req.master_addr)
+        .start_worker(req.model, req.code, req.master_addr, req.compute_score)
         .await
         .map_err(|e| ApiError::bad_request(&e.to_string()))?;
     let session = state.sessions.snapshot().await;
