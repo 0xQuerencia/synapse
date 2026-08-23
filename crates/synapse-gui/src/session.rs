@@ -16,10 +16,11 @@ use anyhow::{Context, Result, anyhow};
 use synapse_core::{
     ModelIdentity, format_instruct_prompt, generate_pairing_code,
     network::{
-        ChatEvent, NetworkError, SynapseNode, SynapseRole, default_listen_addr, parse_listen_addr,
+        ChatEvent, NetworkError, NodeStatusSnapshot, SynapseNode, SynapseRole, default_listen_addr,
+        parse_listen_addr,
     },
 };
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
 /// The set of `ChatEvent`s a UI cares about, serialised as JSON.
 #[derive(Debug, Clone, serde::Serialize)]
