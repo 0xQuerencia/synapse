@@ -1771,14 +1771,14 @@ impl SynapseNode {
             .collect();
 
         // Clear master cache too for replay.
-        if let Some(pipeline) = &self.pipeline {
-            if let Err(error) = pipeline.clear_kv_cache() {
-                warn!(%error, "failed to clear master cache during healing");
-                self.healing_in_progress = false;
-                self.healing_saved_tokens = None;
-                self.fail_generation(format!("healing cache clear failed: {error}"));
-                return;
-            }
+        if let Some(pipeline) = &self.pipeline
+            && let Err(error) = pipeline.clear_kv_cache()
+        {
+            warn!(%error, "failed to clear master cache during healing");
+            self.healing_in_progress = false;
+            self.healing_saved_tokens = None;
+            self.fail_generation(format!("healing cache clear failed: {error}"));
+            return;
         }
 
         if cache_reset_peers.is_empty() {
