@@ -467,12 +467,6 @@ impl SynapseNode {
             }
         };
 
-        if route_plan.worker_hops.is_empty() {
-            self.in_flight_activation_hop = None;
-            self.process_final_activation_output(None, payload);
-            return;
-        }
-
         self.dispatch_worker_hop(
             &route_plan,
             activation_pass,
