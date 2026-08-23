@@ -585,6 +585,7 @@ impl SynapseNode {
             hop_index,
             trace_id,
             dispatch_time: Some(Instant::now()),
+            pass: activation_pass,
         });
 
         self.swarm.behaviour_mut().request_response.send_request(
