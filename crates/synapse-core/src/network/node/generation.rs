@@ -1889,6 +1889,24 @@ mod tests {
     }
 
     #[test]
+    fn activation_pass_classification_from_request_shape() {
+        use super::super::ActivationPass;
+
+        // Position 0 is always a cache-replacing prefill.
+        assert_eq!(ActivationPass::for_request(0, 7), ActivationPass::Prefill);
+        assert_eq!(ActivationPass::for_request(0, 1), ActivationPass::Prefill);
+
+        // Later positions with a single token are plain decode.
+        assert_eq!(ActivationPass::for_request(4, 1), ActivationPass::Decode);
+
+        // Later positions with multi-token blocks are speculative.
+        assert_eq!(
+            ActivationPass::for_request(4, 4),
+            ActivationPass::Speculative
+        );
+    }
+
+    #[test]
     fn multi_hop_route_is_ordered_and_contiguous_end_to_end() {
         let worker_a = PeerId::random();
         let worker_b = PeerId::random();
