@@ -2007,6 +2007,7 @@ mod tests {
                     compute_score: 2,
                     available_ram_mb: 200,
                 }),
+                wire_capability: None,
             },
             RouteWorkerCandidate {
                 peer_id: worker_c,
