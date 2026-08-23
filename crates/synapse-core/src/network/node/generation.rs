@@ -4,18 +4,15 @@ use libp2p::{PeerId, request_response};
 use tracing::{info, warn};
 
 use super::{
-    BatchPromptRequest, ChatEvent, GenerationRoutePlan, InFlightActivationHop, InFlightRequest,
-    MAX_BATCH_SIZE, StopReason, SynapseNode, SynapseRole, WORKER_HOP_TIMEOUT,
+    ActivationPass, BatchPromptRequest, ChatEvent, GenerationRoutePlan, InFlightActivationHop,
+    InFlightRequest, MAX_BATCH_SIZE, SpeculativeRound, StopReason, SynapseNode, SynapseRole,
     WorkerCapabilitySnapshot, WorkerRouteHop,
 };
 use crate::inference::{ToyLlama, payload_to_tensor, tensor_to_payload};
-use crate::{WeightedShardParticipant, plan_static_shards, plan_weighted_shards};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ActivationPass {
-    Prefill,
-    Decode,
-}
+use crate::network::node::speculation::MAX_DRAFT_LEN;
+use crate::{
+    StaticShardAssignment, WeightedShardParticipant, plan_static_shards, plan_weighted_shards,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RouteParticipant {
