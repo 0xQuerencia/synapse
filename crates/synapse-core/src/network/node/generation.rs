@@ -1655,8 +1655,8 @@ impl SynapseNode {
     /// Periodic check for timed-out worker hops (called from the run loop).
     ///
     /// If the in-flight activation hop has been waiting longer than
-    /// `WORKER_HOP_TIMEOUT`, we assume the worker is dead and initiate
-    /// self-healing to reroute through remaining workers.
+    /// adaptive timeout (or `WORKER_HOP_TIMEOUT` fallback), we assume the
+    /// worker is dead and initiate self-healing to reroute through remaining workers.
     pub(super) fn check_worker_timeouts(&mut self) {
         if !self.generation_active || self.healing_in_progress {
             return;
