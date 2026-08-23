@@ -708,14 +708,8 @@ impl SynapseNode {
         self.tokens_generated += 1;
         self.in_flight_activation_hop = None;
 
-        let max_tokens = self
-            .batch_active_max_tokens
-            .unwrap_or_else(|| match &self.role {
-                SynapseRole::Master { max_tokens, .. } => *max_tokens,
-                _ => 50,
-            });
-
         let eos = tokenizer.eos_token_id();
+        let max_tokens = self.current_max_tokens();
         let should_stop = self.tokens_generated >= max_tokens || eos == Some(next_token);
 
         if should_stop {
