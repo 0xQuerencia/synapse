@@ -1968,10 +1968,12 @@ mod tests {
                 RouteWorkerCandidate {
                     peer_id: worker_a,
                     capability: None,
+                    wire_capability: None,
                 },
                 RouteWorkerCandidate {
                     peer_id: worker_b,
                     capability: None,
+                    wire_capability: None,
                 },
             ],
         )
