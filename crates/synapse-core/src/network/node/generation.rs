@@ -317,6 +317,14 @@ impl SynapseNode {
             return;
         }
 
+        if self.awaiting_truncate_ack {
+            info!(
+                pending_peers = self.pending_truncate_peers.len(),
+                "waiting for all KvTruncateAck messages before next activation"
+            );
+            return;
+        }
+
         let pipeline = match &self.pipeline {
             Some(pipeline) => Arc::clone(pipeline),
             None => {
