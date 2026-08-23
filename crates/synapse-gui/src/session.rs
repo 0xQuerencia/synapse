@@ -448,6 +448,8 @@ impl SessionStore {
             peer_id: peer_id.clone(),
             model_id: "synapse-relay".to_owned(),
             max_tokens: 0,
+            is_ollama: false,
+            status_rx: None,
         });
 
         Ok(peer_id)
