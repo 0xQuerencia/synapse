@@ -389,11 +389,18 @@ impl SessionStore {
         .await
         .map_err(|e| anyhow!("failed to construct worker node: {e}"))?;
 
+        // Advertise the GUI's measured benchmark score, if one was run, so
+        // the master's planner divides layers by real throughput.
+        if let Some(score) = compute_score {
+            node.set_measured_compute_score(score);
+        }
+
         node.load_model()
             .await
             .map_err(|e| anyhow!("failed to load model: {e}"))?;
 
         let peer_id = node.local_peer_id().to_string();
+        let status_rx = node.status_receiver();
         let node_handle = tokio::spawn(async move { node.run().await });
 
         *guard = Some(SessionState {
