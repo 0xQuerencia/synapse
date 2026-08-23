@@ -2089,6 +2089,7 @@ mod tests {
                         compute_score: 1,
                         available_ram_mb: 4_096,
                     }),
+                    wire_capability: None,
                 },
             ],
         )
