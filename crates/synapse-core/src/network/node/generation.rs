@@ -45,6 +45,9 @@ fn activation_tokens_for_position(
                 .last()
                 .ok_or_else(|| "decode requires at least one token".to_owned())?,
         ],
+        ActivationPass::Speculative => {
+            return Err("speculative passes build their own token block".to_owned());
+        }
     };
 
     Ok((pass, tokens))
