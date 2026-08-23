@@ -476,6 +476,37 @@ impl SynapseNode {
         );
     }
 
+    /// Build the multi-token verification block for a speculative step.
+    ///
+    /// Returns `[last_committed_token, d1, ..., dk]` plus the round
+    /// bookkeeping when the draft cache predicts at least one token for the
+    /// current context; `None` falls back to a plain single-token decode.
+    fn build_speculative_activation(&mut self) -> Option<(Vec<u32>, SpeculativeRound)> {
+        if !self.speculative_enabled || self.token_ids.len() < 2 {
+            return None;
+        }
+
+        let draft_tokens = self.draft_cache.draft(&self.token_ids, MAX_DRAFT_LEN);
+        if draft_tokens.is_empty() {
+            return None;
+        }
+
+        let last_token = *self.token_ids.last()?;
+        let cache_base_len = self.kv_cache_len;
+
+        let mut tokens = Vec::with_capacity(draft_tokens.len() + 1);
+        tokens.push(last_token);
+        tokens.extend_from_slice(&draft_tokens);
+
+        Some((
+            tokens,
+            SpeculativeRound {
+                draft_tokens,
+                cache_base_len,
+            },
+        ))
+    }
+
     fn dispatch_worker_hop(
         &mut self,
         route_plan: &GenerationRoutePlan,
