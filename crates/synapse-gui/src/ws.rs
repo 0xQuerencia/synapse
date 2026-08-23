@@ -54,11 +54,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             match bcast_rx.recv().await {
                 Ok(ev) => {
                     let msg = json!({ "type": "event", "id": null, "event": ev });
-                    if tx
-                        .send(Message::Text(msg.to_string().into()))
-                        .await
-                        .is_err()
-                    {
+                    if tx.send(Message::Text(msg.to_string())).await.is_err() {
                         break;
                     }
                 }
