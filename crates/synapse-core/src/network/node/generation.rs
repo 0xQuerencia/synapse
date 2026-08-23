@@ -1709,7 +1709,11 @@ impl SynapseNode {
         self.worker_peers.retain(|p| *p != dead_peer);
         self.worker_registry.mark_disconnected(dead_peer);
         self.pending_cache_reset_peers.remove(&dead_peer);
+        self.pending_truncate_peers.remove(&dead_peer);
         self.in_flight_activation_hop = None;
+        self.spec_round = None;
+        self.awaiting_truncate_ack = false;
+        self.pending_truncate_trace_id = None;
 
         // Save current generation state for replay.
         self.healing_in_progress = true;
