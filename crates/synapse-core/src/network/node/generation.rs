@@ -968,7 +968,13 @@ impl SynapseNode {
             return;
         }
 
-        let activation_pass = ActivationPass::for_sequence_position(request.sequence_position);
+        // Classify the compute pass from the sequence position and the
+        // activation's token count. Multi-token blocks at non-zero
+        // positions are speculative verification passes that append to the
+        // existing KV caches instead of replacing them.
+        let activation_seq_len = request.hidden_state.shape.get(1).copied().unwrap_or(0);
+        let activation_pass =
+            ActivationPass::for_request(request.sequence_position, activation_seq_len);
 
         info!(
             %peer,
