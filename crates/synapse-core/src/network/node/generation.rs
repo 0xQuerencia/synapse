@@ -1054,8 +1054,19 @@ impl SynapseNode {
             }
         };
 
+        // Phase 5: downcast back to bf16 before sending onward — to the
+        // next worker hop, or back to the master for lm_head.
+        let wire_output = match output.to_dtype(candle_core::DType::BF16) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                warn!(%peer, %error, "failed to downcast output to bf16");
+                self.reject(channel, "tensor dtype conversion failed");
+                return;
+            }
+        };
+
         // Serialize the output tensor.
-        let payload = match tensor_to_payload(&output) {
+        let payload = match tensor_to_payload(&wire_output) {
             Ok(payload) => payload,
             Err(error) => {
                 warn!(%peer, %error, "failed to serialize output tensor");
