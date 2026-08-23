@@ -1158,12 +1158,80 @@ impl SynapseNode {
         );
     }
 
+    /// Handle KvTruncate request from the master: roll this worker's owned
+    /// KV caches back to `target_seq_len` positions after a speculative
+    /// round rejected draft tokens.
+    pub(super) fn handle_kv_truncate_request(
+        &mut self,
+        peer: PeerId,
+        request: crate::KvTruncate,
+        channel: request_response::ResponseChannel<super::super::ResponseMessage>,
+    ) {
+        if !matches!(self.role, SynapseRole::Worker { .. }) {
+            warn!(%peer, "master received KvTruncate request; rejecting");
+            self.reject(channel, "KvTruncate is handled by workers");
+            return;
+        }
+
+        if let Err(error) = request.validate() {
+            warn!(%peer, %error, "KvTruncate validation failed");
+            self.reject(channel, "invalid KvTruncate request");
+            return;
+        }
+
+        let pipeline = match &self.pipeline {
+            Some(pipeline) => Arc::clone(pipeline),
+            None => {
+                warn!(%peer, "model not loaded yet");
+                self.reject(channel, "model not loaded");
+                return;
+            }
+        };
+
+        if let Err(error) = pipeline.truncate_kv_cache(request.target_seq_len) {
+            warn!(%peer, %error, "worker failed to truncate KV cache");
+            self.reject(channel, "failed to truncate KV cache");
+            return;
+        }
+
+        info!(
+            %peer,
+            trace_id = %request.trace_id,
+            target_seq_len = request.target_seq_len,
+            "worker truncated KV cache and acknowledged request"
+        );
+        self.send_response(
+            channel,
+            super::super::ResponseMessage::KvTruncateAck(request),
+        );
+    }
+
+    /// Handle HealthPing request from master to pre-warm connection.
+    /// Workers respond with HealthPong containing current timestamp.
+    pub(super) fn handle_health_ping(
+        &mut self,
+        peer: PeerId,
+        channel: request_response::ResponseChannel<super::super::ResponseMessage>,
+    ) {
+        info!(%peer, "received HealthPing, responding with HealthPong");
+        let health = crate::Health {
+            loaded_shard: None,
+            latency_ms: Some(0),
+            memory_bytes: None,
+            last_error: None,
+        };
+        self.send_response(channel, super::super::ResponseMessage::HealthPong(health));
+    }
+
     pub(super) fn handle_inbound_response(
         &mut self,
         peer: PeerId,
         response: super::super::ResponseMessage,
     ) {
         match response {
+            super::super::ResponseMessage::CapabilityAck { accepted } => {
+                info!(%peer, accepted, "master acked capability ping");
+            }
             super::super::ResponseMessage::ChallengeIssued(challenge) => {
                 info!(%peer, "received challenge from master, signing and sending response");
 
