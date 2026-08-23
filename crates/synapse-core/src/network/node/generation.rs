@@ -2015,6 +2015,7 @@ mod tests {
                     compute_score: 1,
                     available_ram_mb: 300,
                 }),
+                wire_capability: None,
             },
         ];
 
