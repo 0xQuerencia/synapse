@@ -181,6 +181,106 @@ impl SessionStore {
             return Err(anyhow!("a session is already running; stop it first"));
         }
 
+        // ─── Ollama backend ──────────────────────────────────────────────
+        // A `ollama:` prefix routes to a local ollama server instead of the
+        // candle/libp2p sharded pipeline. There is no swarm, no workers, and
+        // no peer authentication — just a streaming HTTP call per prompt. We
+        // reuse the exact same `UiChatEvent` broadcast the WebSocket already
+        // consumes, so the browser side is unchanged.
+        if let Some(ollama_model) = model_id.strip_prefix("ollama:") {
+            let ollama_model = ollama_model.to_owned();
+            let base_url = std::env::var("SYNAPSE_OLLAMA_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:11434".to_owned());
+
+            let client = crate::ollama::OllamaClient::new(&base_url)
+                .context("failed to build ollama client")?;
+
+            // Fail fast with a clear message if ollama isn't reachable.
+            let available = client
+                .list_models()
+                .await
+                .map_err(|e| anyhow!("ollama not reachable at {base_url}: {e}"))?;
+            if !available.iter().any(|m| m == &ollama_model) {
+                tracing::warn!(
+                    model = %ollama_model,
+                    "requested ollama model not in `ollama list`; attempting anyway"
+                );
+            }
+
+            let pairing_code = generate_pairing_code();
+            let peer_id = format!("ollama:{ollama_model}");
+
+            // ChatEvent stream from the ollama client → bridged into the
+            // UiChatEvent broadcast the WS fan-out subscribes to.
+            let (chat_tx, mut chat_rx) = broadcast::channel::<ChatEvent>(1024);
+            let (bcast_tx, _) = broadcast::channel::<UiChatEvent>(1024);
+            let bcast_for_bridge = bcast_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match chat_rx.recv().await {
+                        Ok(ev) => {
+                            let _ = bcast_for_bridge.send(ev.into());
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+
+            // Prompt pump: one streaming generate per incoming prompt.
+            let (prompt_tx, mut prompt_rx) = mpsc::channel::<String>(32);
+            let pump_model = ollama_model.clone();
+            let pump_tokens = max_tokens as u32;
+            let run_handle = tokio::spawn(async move {
+                while let Some(prompt) = prompt_rx.recv().await {
+                    // A live cancel sender kept in scope; dropping it would
+                    // make the client's `cancel.recv()` fire immediately.
+                    let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+                    let _keep_cancel = cancel_tx;
+                    if let Err(e) = client
+                        .stream_generate(&pump_model, &prompt, pump_tokens, &chat_tx, cancel_rx)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "ollama generation failed");
+                        let _ = chat_tx.send(ChatEvent::Token(format!("[ollama-error] {e}")));
+                        let _ = chat_tx.send(ChatEvent::GenerationDone {
+                            tokens_generated: 0,
+                            reason: synapse_core::network::StopReason::Error,
+                        });
+                    }
+                }
+                Ok::<(), NetworkError>(())
+            });
+
+            let session = SessionSnapshot {
+                role: SessionRole::Master,
+                peer_id: Some(peer_id.clone()),
+                model_id: Some(model_id.clone()),
+                pairing_code: Some(pairing_code.clone()),
+                max_tokens: Some(max_tokens),
+                listen_addr: Some(listen.clone()),
+            };
+
+            *guard = Some(SessionState {
+                role: SessionRole::Master,
+                prompt_tx: Some(prompt_tx),
+                event_bcast: Some(bcast_tx),
+                run_handle: Some(run_handle),
+                pairing_code: Some(pairing_code.clone()),
+                listen_addr: Some(listen),
+                peer_id,
+                model_id,
+                max_tokens,
+                is_ollama: true,
+                status_rx: None,
+            });
+
+            return Ok(MasterStartResult {
+                pairing_code,
+                session,
+            });
+        }
+
         let identity = ModelIdentity::new(&model_id);
         identity.validate().context("invalid model id")?;
         let listen_addr = parse_listen_addr(&listen).map_err(|e| anyhow!(e))?;
