@@ -433,8 +433,33 @@ impl SynapseNode {
             }
         };
 
-        // Serialize for network transfer.
-        let payload = match tensor_to_payload(&after_master) {
+        // Every KV cache along the route now holds these positions too —
+        // track the count so speculative rollbacks know the base length.
+        self.kv_cache_len += activation_tokens.len();
+
+        // Local-only fast path: when no workers are in the route, the
+        // master's hidden state goes straight into lm_head. Serializing it to
+        // a `TensorPayload` and immediately deserializing it back (as the old
+        // path did) cost two full-tensor f32 copies per token for nothing.
+        if route_plan.worker_hops.is_empty() {
+            self.in_flight_activation_hop = None;
+            self.process_final_activation_output(None, after_master);
+            return;
+        }
+
+        // Phase 5: activations cross the wire in bf16 — halves the bytes
+        // per hop. Compute itself stays f32 on both ends (weights are
+        // f32); only the inter-node hidden-state transfer is downcast.
+        let wire_hidden = match after_master.to_dtype(candle_core::DType::BF16) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                self.fail_generation(format!("failed to cast hidden state to bf16: {error}"));
+                return;
+            }
+        };
+
+        // Serialize for network transfer (only needed when a worker hop exists).
+        let payload = match tensor_to_payload(&wire_hidden) {
             Ok(payload) => payload,
             Err(error) => {
                 self.fail_generation(format!("failed to serialize hidden state: {error}"));
