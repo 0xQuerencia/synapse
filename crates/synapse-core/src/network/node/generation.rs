@@ -1826,24 +1826,25 @@ impl SynapseNode {
     }
 }
 
-// ─── Phase 10: Speculative Decoding (wiring into generation) ─────────────────
-
-// The core speculation logic (NgramDraftCache, verify_draft) lives in
-// speculation.rs and is already fully implemented. These methods wire the
-// draft/verify cycle into the generation loop.
+// ─── Phase 10: Speculative Decoding ──────────────────────────────────────────
 //
-// Current PoC integration:
-// - After each token, observe it in the draft cache (done above in
-//   process_final_activation_output).
-// - Draft tokens are available via self.draft_cache.draft() for future
-//   speculative passes.
-// - Speculative multi-token verification would require sending a
-//   [1, draft_len, hidden] tensor to workers and using
-//   forward_layers_speculative(). The pipeline already supports this.
-// - On mismatch, truncate_kv_cache() rolls back rejected tokens.
+// The full draft → verify → accept/reject → rollback cycle now runs inside
+// the master generation loop:
 //
-// The full speculative loop (draft → verify → accept/reject → rollback)
-// is scaffolded here for integration once the single-token path is stable.
+// - `build_speculative_activation` drafts up to MAX_DRAFT_LEN tokens from the
+//   N-gram cache and builds the verification block
+//   `[last_committed_token, d1..dk]`.
+// - The block flows through the normal route as an
+//   ActivationPass::Speculative activation; workers append it with
+//   forward_layers_speculative (KV-append, never replace).
+// - `process_speculative_output` runs lm_head over all block positions and
+//   verifies drafts against greedy argmax (speculation::verify_draft).
+// - Rejected positions roll back via truncate_kv_cache on the master and
+//   KvTruncate requests (ack-gated) on every worker hop.
+//
+// Cache accounting invariant: after a round the caches hold exactly
+// `cache_base_len + accepted + 1` positions; the correction token is fed by
+// the following decode step.
 
 #[cfg(test)]
 mod tests {
