@@ -1326,10 +1326,67 @@ impl SynapseNode {
                     return;
                 }
 
+                // Phase 4: record how long this hop took (dispatch → response)
+                // so `publish_step_telemetry` can compute its live tokens/s
+                // and share of the step's total latency once the step ends.
+                let hop_duration_ms = in_flight
+                    .dispatch_time
+                    .map(|dispatched| dispatched.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                self.step_hop_durations_ms.insert(peer, hop_duration_ms);
+
+                // Phase 1 Task 1.5: Record latency for adaptive timeout calculation
+                if let Some(dispatch_time) = in_flight.dispatch_time {
+                    let latency = dispatch_time.elapsed();
+                    // Update per-worker latency window (last 20 samples)
+                    self.worker_latencies
+                        .entry(peer)
+                        .or_insert_with(|| std::collections::VecDeque::with_capacity(20))
+                        .push_back(latency);
+                    if self.worker_latencies.get(&peer).unwrap().len() > 20 {
+                        self.worker_latencies.get_mut(&peer).unwrap().pop_front();
+                    }
+                    // Update per-hop latency window (last 20 samples)
+                    self.hop_latencies
+                        .entry(in_flight.hop_index)
+                        .or_insert_with(|| std::collections::VecDeque::with_capacity(20))
+                        .push_back(latency);
+                    if self.hop_latencies.get(&in_flight.hop_index).unwrap().len() > 20 {
+                        self.hop_latencies
+                            .get_mut(&in_flight.hop_index)
+                            .unwrap()
+                            .pop_front();
+                    }
+                }
+
+                // Phase 5: feed per-token throughput into this worker's
+                // batch calibration (tokens / second at current batch size).
+                let latency_secs = in_flight
+                    .dispatch_time
+                    .map(|d| d.elapsed().as_secs_f32())
+                    .unwrap_or(0.0);
+                if latency_secs > 0.0 && in_flight.sequence_position > 0 {
+                    let throughput = in_flight.sequence_position as f32 / latency_secs;
+                    let recalibrated = self
+                        .batch_profiles
+                        .entry(peer)
+                        .or_insert_with(|| super::batch_tuning::BatchCalibration::new(peer))
+                        .record_sample(throughput);
+                    if recalibrated {
+                        info!(%peer, throughput, "batch calibration updated");
+                    }
+                }
+
+                // Phase 6: mark this pooled connection as used + healthy.
+                self.connection_pool.mark_connection_used(&peer);
+                self.connection_pool.update_peer_health(&peer, true);
+
                 let next_hop_index = in_flight.hop_index + 1;
                 if route_plan.worker_hops.get(next_hop_index).is_some() {
-                    let activation_pass =
-                        ActivationPass::for_sequence_position(in_flight.sequence_position);
+                    // The pass travels with the hop so multi-token
+                    // speculative blocks stay on the append path across
+                    // every worker hop.
+                    let activation_pass = in_flight.pass;
                     self.dispatch_worker_hop(
                         &route_plan,
                         activation_pass,
