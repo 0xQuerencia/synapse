@@ -152,6 +152,20 @@ impl SessionStore {
             .and_then(|s| s.event_bcast.as_ref().map(|tx| tx.subscribe()))
     }
 
+    /// Latest live networking snapshot for the running node, if any.
+    ///
+    /// Returns `None` when no session is running, or when the session has no
+    /// swarm (the ollama backend and idle/relay states). The `watch`
+    /// receiver always carries the most recent value the run loop published,
+    /// so this is a cheap, non-blocking read.
+    pub async fn node_status(&self) -> Option<NodeStatusSnapshot> {
+        let guard = self.inner.lock().await;
+        guard
+            .as_ref()
+            .and_then(|s| s.status_rx.as_ref())
+            .map(|rx| rx.borrow().clone())
+    }
+
     pub async fn start_master(
         &self,
         model_id: String,
