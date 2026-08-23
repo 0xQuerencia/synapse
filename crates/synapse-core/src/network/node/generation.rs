@@ -665,7 +665,7 @@ impl SynapseNode {
             }
         };
 
-        let logits = match pipeline.head(&worker_output) {
+        let logits = match pipeline.head_last_token(&worker_output) {
             Ok(logits) => logits,
             Err(error) => {
                 self.fail_generation(format!("lm_head inference failed: {error}"));
