@@ -718,20 +718,227 @@ impl SynapseNode {
             } else {
                 StopReason::MaxTokens
             };
-            self.emit(ChatEvent::GenerationDone {
-                tokens_generated: self.tokens_generated,
-                reason,
-            });
-            self.generation_active = false;
-            self.awaiting_clear_cache_ack = false;
-            self.pending_cache_reset_trace_id = None;
-            self.pending_cache_reset_peers.clear();
-            self.generation_route_plan = None;
-            self.batch_active_max_tokens = None;
-            // Process next batch request if any are queued.
-            self.drain_batch_queue();
+            self.finish_generation(reason);
         } else {
             self.send_next_activation();
+        }
+    }
+
+    /// Phase 10: verify a speculative draft block against the model's own
+    /// logits and commit only the verified prefix plus one correction token.
+    ///
+    /// Cache bookkeeping: the verification block appended
+    /// `1 + draft_len` positions to every KV cache along the route. The
+    /// true committed sequence is `accepted` drafts + the last committed
+    /// token already present as the block head, so caches are truncated to
+    /// `cache_base_len + accepted + 1` positions; rejected tail positions
+    /// disappear from both the master's local layers and (via KvTruncate)
+    /// every worker hop.
+    fn process_speculative_output(
+        &mut self,
+        peer: Option<PeerId>,
+        worker_output: candle_core::Tensor,
+        round: SpeculativeRound,
+    ) {
+        info!(
+            peer = ?peer,
+            shape = ?worker_output.dims(),
+            "master received speculative activation — verifying drafts"
+        );
+        self.in_flight_activation_hop = None;
+
+        let pipeline = match &self.pipeline {
+            Some(pipeline) => Arc::clone(pipeline),
+            None => {
+                self.fail_generation("model not loaded");
+                return;
+            }
+        };
+        let tokenizer = match &self.tokenizer {
+            Some(tokenizer) => Arc::clone(tokenizer),
+            None => {
+                self.fail_generation("tokenizer not loaded");
+                return;
+            }
+        };
+
+        // Full-sequence logits over the verification block:
+        // [1, 1 + draft_len, vocab].
+        let logits = match pipeline.head(&worker_output) {
+            Ok(logits) => logits,
+            Err(error) => {
+                self.fail_generation(format!("lm_head inference failed: {error}"));
+                return;
+            }
+        };
+
+        let verification =
+            match crate::network::node::speculation::verify_draft(&round.draft_tokens, &logits) {
+                Ok(verification) => verification,
+                Err(error) => {
+                    self.fail_generation(format!("draft verification failed: {error}"));
+                    return;
+                }
+            };
+
+        let accepted = verification.accepted_count;
+        let Some(correction) = verification.correction_token else {
+            self.fail_generation("draft verification produced no continuation token");
+            return;
+        };
+
+        let target_cache_len = round.cache_base_len + accepted + 1;
+        let rejected_positions = self.kv_cache_len.saturating_sub(target_cache_len);
+
+        info!(
+            draft_len = round.draft_tokens.len(),
+            accepted,
+            rejected_positions,
+            correction_token = correction,
+            "speculative verification complete"
+        );
+
+        // Roll back the master-local caches when drafts were rejected.
+        if rejected_positions > 0
+            && let Err(error) = pipeline.truncate_kv_cache(target_cache_len)
+        {
+            self.fail_generation(format!("KV cache rollback failed: {error}"));
+            return;
+        }
+        self.kv_cache_len = target_cache_len;
+
+        // Commit accepted drafts + the correction token, stopping at EOS or
+        // the turn's token budget.
+        let committed: Vec<u32> = round.draft_tokens[..accepted]
+            .iter()
+            .copied()
+            .chain(std::iter::once(correction))
+            .collect();
+
+        let eos = tokenizer.eos_token_id();
+        let max_tokens = self.current_max_tokens();
+        let mut stop_reason: Option<StopReason> = None;
+
+        for &token in &committed {
+            if stop_reason.is_some() {
+                break;
+            }
+
+            // Feed the N-gram draft cache with each newly committed token
+            // (context excludes the token itself, matching decode steps).
+            if self.speculative_enabled && self.token_ids.len() >= 2 {
+                self.draft_cache.observe(&self.token_ids, token);
+            }
+
+            let decoded = match tokenizer.decode(&[token], true) {
+                Ok(text) => text,
+                Err(error) => {
+                    warn!(peer = ?peer, %error, token_id = token, "token decode failed");
+                    format!("<tok:{token}>")
+                }
+            };
+            self.emit(ChatEvent::Token(decoded));
+
+            self.token_ids.push(token);
+            self.tokens_generated += 1;
+
+            if eos == Some(token) {
+                stop_reason = Some(StopReason::Eos);
+            } else if self.tokens_generated >= max_tokens {
+                stop_reason = Some(StopReason::MaxTokens);
+            }
+        }
+
+        if let Some(reason) = stop_reason {
+            self.finish_generation(reason);
+            return;
+        }
+
+        // Workers still hold rejected positions in their KV caches. Roll
+        // them back and wait for acks before feeding the next activation;
+        // a local-only route truncates above and continues immediately.
+        let has_worker_hops = self
+            .generation_route_plan
+            .as_ref()
+            .is_some_and(|plan| !plan.worker_hops.is_empty());
+        if rejected_positions > 0 && has_worker_hops {
+            self.send_kv_truncate_requests(target_cache_len);
+            return;
+        }
+
+        self.send_next_activation();
+    }
+
+    /// Shared end-of-turn bookkeeping for all generation paths.
+    fn finish_generation(&mut self, reason: StopReason) {
+        self.emit(ChatEvent::GenerationDone {
+            tokens_generated: self.tokens_generated,
+            reason,
+        });
+        self.generation_active = false;
+        self.awaiting_clear_cache_ack = false;
+        self.pending_cache_reset_trace_id = None;
+        self.pending_cache_reset_peers.clear();
+        self.generation_route_plan = None;
+        self.batch_active_max_tokens = None;
+        self.spec_round = None;
+        self.awaiting_truncate_ack = false;
+        self.pending_truncate_trace_id = None;
+        self.pending_truncate_peers.clear();
+        // Process next batch request if any are queued.
+        self.drain_batch_queue();
+    }
+
+    /// Max tokens for the active turn: batch override when set, otherwise
+    /// the role default.
+    fn current_max_tokens(&self) -> usize {
+        self.batch_active_max_tokens.unwrap_or(match &self.role {
+            SynapseRole::Master { max_tokens, .. } => *max_tokens,
+            _ => 50,
+        })
+    }
+
+    /// Ask every worker hop to roll its KV caches back to `target_seq_len`
+    /// positions after rejected speculative drafts. The next activation is
+    /// dispatched once all acks arrive (mirrors the ClearCache handshake).
+    fn send_kv_truncate_requests(&mut self, target_seq_len: usize) {
+        let peers: Vec<PeerId> = match &self.generation_route_plan {
+            Some(plan) => plan.worker_hops.iter().map(|hop| hop.peer_id).collect(),
+            None => {
+                self.fail_generation("missing generation route during KV rollback");
+                return;
+            }
+        };
+
+        if peers.is_empty() {
+            self.awaiting_truncate_ack = false;
+            self.pending_truncate_trace_id = None;
+            self.pending_truncate_peers.clear();
+            self.send_next_activation();
+            return;
+        }
+
+        self.truncate_nonce = self.truncate_nonce.wrapping_add(1);
+        let trace_id = format!("kv-truncate-{}-{}", self.truncate_nonce, target_seq_len);
+
+        self.awaiting_truncate_ack = true;
+        self.pending_truncate_trace_id = Some(trace_id.clone());
+        self.pending_truncate_peers = peers.iter().copied().collect();
+
+        for peer in peers {
+            info!(
+                %peer,
+                trace_id,
+                target_seq_len,
+                "master requesting worker KV truncation"
+            );
+            self.swarm.behaviour_mut().request_response.send_request(
+                &peer,
+                super::super::RequestMessage::KvTruncate(crate::KvTruncate {
+                    trace_id: trace_id.clone(),
+                    target_seq_len,
+                }),
+            );
         }
     }
 
