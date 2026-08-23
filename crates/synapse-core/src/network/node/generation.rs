@@ -418,6 +418,9 @@ impl SynapseNode {
             ActivationPass::Decode => {
                 pipeline.forward_layers_decode(&hidden, route_plan.master_layer_range.clone())
             }
+            ActivationPass::Speculative => {
+                pipeline.forward_layers_speculative(&hidden, route_plan.master_layer_range.clone())
+            }
         };
         let after_master = match after_master {
             Ok(hidden) => hidden,
