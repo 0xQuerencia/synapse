@@ -341,6 +341,8 @@ impl SessionStore {
             peer_id,
             model_id,
             max_tokens,
+            is_ollama: false,
+            status_rx: Some(status_rx),
         });
 
         Ok(MasterStartResult {
