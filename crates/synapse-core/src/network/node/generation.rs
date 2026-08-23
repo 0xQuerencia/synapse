@@ -1036,6 +1036,9 @@ impl SynapseNode {
             ActivationPass::Decode => {
                 pipeline.forward_layers_decode(&hidden, layer_start..layer_end)
             }
+            ActivationPass::Speculative => {
+                pipeline.forward_layers_speculative(&hidden, layer_start..layer_end)
+            }
         };
         let output = match result {
             Ok(tensor) => tensor,
