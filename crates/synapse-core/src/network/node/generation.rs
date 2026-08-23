@@ -1664,14 +1664,20 @@ impl SynapseNode {
 
         let timed_out_peer = match &self.in_flight_activation_hop {
             Some(hop) => match hop.dispatch_time {
-                Some(dispatch_time) if dispatch_time.elapsed() > WORKER_HOP_TIMEOUT => {
-                    let route_plan = match &self.generation_route_plan {
-                        Some(plan) => plan,
-                        None => return,
-                    };
-                    route_plan.worker_hops.get(hop.hop_index).map(|h| h.peer_id)
+                Some(dispatch_time) => {
+                    // Phase 1 Task 1.5: Use adaptive timeout based on observed latency
+                    let timeout = self.compute_adaptive_timeout(hop.hop_index);
+                    if dispatch_time.elapsed() > timeout {
+                        let route_plan = match &self.generation_route_plan {
+                            Some(plan) => plan,
+                            None => return,
+                        };
+                        route_plan.worker_hops.get(hop.hop_index).map(|h| h.peer_id)
+                    } else {
+                        None
+                    }
                 }
-                _ => None,
+                None => None,
             },
             None => None,
         };
