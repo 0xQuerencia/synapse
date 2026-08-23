@@ -220,7 +220,11 @@ impl SynapseNode {
 
         // Reset draft cache for new conversation turn
         self.draft_cache.clear();
-        self.pending_draft = None;
+        self.spec_round = None;
+        self.kv_cache_len = 0;
+        self.awaiting_truncate_ack = false;
+        self.pending_truncate_trace_id = None;
+        self.pending_truncate_peers.clear();
 
         self.token_ids = ids;
         self.tokens_generated = 0;
