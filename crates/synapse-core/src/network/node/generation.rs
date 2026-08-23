@@ -594,24 +594,68 @@ impl SynapseNode {
         );
     }
 
+    /// Phase 4: publish live per-peer telemetry (layers handled, measured
+    /// pace, share of total step latency) for the generation step that
+    /// just finished. No-op when no worker hops were involved (local-only
+    /// execution, or a step where no hop response was recorded).
+    fn publish_step_telemetry(&mut self) {
+        let hop_durations = std::mem::take(&mut self.step_hop_durations_ms);
+        if hop_durations.is_empty() {
+            self.step_started_at = None;
+            return;
+        }
+
+        let total_step_ms = self
+            .step_started_at
+            .take()
+            .map(|started| started.elapsed().as_millis() as u64)
+            .unwrap_or(0)
+            .max(1);
+
+        let Some(route_plan) = self.generation_route_plan.clone() else {
+            return;
+        };
+
+        for hop in &route_plan.worker_hops {
+            let Some(&hop_ms) = hop_durations.get(&hop.peer_id) else {
+                continue;
+            };
+            let layers_assigned = hop.layer_range.len() as u32;
+            let tokens_per_sec = if hop_ms > 0 {
+                1000.0 / hop_ms as f32
+            } else {
+                0.0
+            };
+            let util_pct =
+                ((hop_ms as f64 / total_step_ms as f64) * 100.0).clamp(0.0, 100.0) as f32;
+            self.worker_registry.update_telemetry(
+                hop.peer_id,
+                layers_assigned,
+                tokens_per_sec,
+                util_pct,
+            );
+        }
+    }
+
     fn process_final_activation_output(
         &mut self,
         peer: Option<PeerId>,
-        payload: crate::TensorPayload,
+        worker_output: candle_core::Tensor,
     ) {
+        self.publish_step_telemetry();
+
+        // Phase 10: speculative rounds verify a whole draft block instead
+        // of sampling one token.
+        if let Some(round) = self.spec_round.take() {
+            self.process_speculative_output(peer, worker_output, round);
+            return;
+        }
+
         info!(
             peer = ?peer,
-            shape = ?payload.shape,
-            "master received final activation payload — running lm_head"
+            shape = ?worker_output.dims(),
+            "master received final activation hidden state — running lm_head"
         );
-
-        let worker_output = match payload_to_tensor(&payload) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                self.fail_generation(format!("failed to deserialize worker output: {error}"));
-                return;
-            }
-        };
 
         let pipeline = match &self.pipeline {
             Some(pipeline) => Arc::clone(pipeline),
