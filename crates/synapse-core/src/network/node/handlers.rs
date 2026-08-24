@@ -498,15 +498,15 @@ impl SynapseNode {
         };
 
         // Check if we're still in backoff period.
-        if let Some(next_at) = self.next_redial_at {
-            if Instant::now() < next_at {
-                debug!(
-                    address = %addr,
-                    remaining_ms = (next_at - Instant::now()).as_millis(),
-                    "redial suppressed by backoff"
-                );
-                return;
-            }
+        if let Some(next_at) = self.next_redial_at
+            && Instant::now() < next_at
+        {
+            debug!(
+                address = %addr,
+                remaining_ms = (next_at - Instant::now()).as_millis(),
+                "redial suppressed by backoff"
+            );
+            return;
         }
 
         self.redial_attempts += 1;
