@@ -36,7 +36,11 @@ impl SynapseNode {
         self.healing_saved_tokens = None;
         // Reset batch state
         self.batch_active_max_tokens = None;
-        self.pending_draft = None;
+        // Reset speculative state
+        self.spec_round = None;
+        self.awaiting_truncate_ack = false;
+        self.pending_truncate_trace_id = None;
+        self.pending_truncate_peers.clear();
     }
 
     pub(super) fn send_worker_hello(&mut self, peer: PeerId) {
