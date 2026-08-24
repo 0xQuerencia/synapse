@@ -135,3 +135,49 @@ async fn local_layer_index_validates_slice_window() {
 fn shard_files_reads_index_and_validates() {
     // Write a synthetic index next to a fake weights path.
     let dir = std::env::temp_dir().join(format!("synapse-shards-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let index_path = dir.join("model.safetensors.index.json");
+    std::fs::write(
+        &index_path,
+        r#"{"weight_map": {
+            "model.layers.0.self_attn.q_proj.weight": "model-00001-of-00002.safetensors",
+            "model.layers.1.self_attn.q_proj.weight": "model-00002-of-00002.safetensors",
+            "model.layers.2.self_attn.q_proj.weight": "model-00002-of-00002.safetensors"
+        }}"#,
+    )
+    .expect("write index");
+    for shard in [
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+    ] {
+        std::fs::write(dir.join(shard), b"fake").expect("write shard stub");
+    }
+
+    let shards = shard_files(Path::new(&index_path)).expect("shards should resolve");
+    assert_eq!(shards.len(), 2, "duplicate shard names should dedupe");
+    assert!(
+        shards[0].ends_with("model-00001-of-00002.safetensors"),
+        "shards should be sorted"
+    );
+
+    // Unsafe filenames must be rejected.
+    std::fs::write(
+        &index_path,
+        r#"{"weight_map": {"a.weight": "../../etc/passwd"}}"#,
+    )
+    .expect("write index");
+    assert!(
+        shard_files(Path::new(&index_path)).is_err(),
+        "path traversal must be rejected"
+    );
+
+    // A plain single-file weights path returns itself — but only when no
+    // sibling index exists, so isolate this case in its own directory.
+    let single_dir =
+        std::env::temp_dir().join(format!("synapse-shards-single-{}", std::process::id()));
+    std::fs::create_dir_all(&single_dir).expect("create temp dir");
+    let single = single_dir.join("model.safetensors");
+    std::fs::write(&single, b"fake").expect("write stub");
+    let shards = shard_files(Path::new(&single)).expect("single file should pass through");
+    assert_eq!(shards, vec![single], "no index → single file");
+}
