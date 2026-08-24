@@ -193,7 +193,7 @@ pub(crate) fn detect_available_ram_mb() -> Option<u64> {
 
 /// Detect available system RAM in MiB via PowerShell.
 #[cfg(target_os = "windows")]
-fn detect_available_ram_mb() -> Option<u64> {
+pub(crate) fn detect_available_ram_mb() -> Option<u64> {
     use std::process::Command;
     let output = Command::new("powershell")
         .args([
