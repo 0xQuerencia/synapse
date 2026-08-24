@@ -143,13 +143,22 @@ impl WorkerCapabilitySnapshot {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct WorkerRegistryEntry {
     peer_id: PeerId,
     state: WorkerConnectionState,
     capability: Option<WorkerCapabilitySnapshot>,
+    /// Phase 2: structured `WorkerCapability` from a heartbeat
+    /// `CapabilityPing`. The planner reads this when present.
+    wire_capability: Option<crate::WorkerCapability>,
     pending_challenge: Option<crate::Challenge>,
     last_seen_at: Instant,
+    /// Phase 4: live telemetry from the most recently completed
+    /// generation step. `None` until this peer has handled at least
+    /// one activation hop.
+    layers_assigned: Option<u32>,
+    tokens_per_sec: Option<f32>,
+    util_pct: Option<f32>,
 }
 
 #[derive(Default)]
