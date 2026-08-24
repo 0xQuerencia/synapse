@@ -93,7 +93,7 @@ impl SynapseNode {
                     [(super::super::SynapseProtocol, ProtocolSupport::Full)],
                     request_response::Config::default()
                         .with_request_timeout(DEFAULT_REQUEST_TIMEOUT)
-                        .with_max_concurrent_streams(16),
+                        .with_max_concurrent_streams(128), // Increased for pipelining support
                 );
 
                 Ok(SynapseBehaviour {
