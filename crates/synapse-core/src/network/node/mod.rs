@@ -595,6 +595,9 @@ impl SynapseNode {
                     compute_score: entry.capability.as_ref().and_then(|c| c.compute_score),
                     available_ram_mb: entry.capability.as_ref().and_then(|c| c.available_ram_mb),
                     last_seen_unix_ms,
+                    layers_assigned: entry.layers_assigned,
+                    tokens_per_sec: entry.tokens_per_sec,
+                    util_pct: entry.util_pct,
                 }
             })
             .collect()
