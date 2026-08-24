@@ -3,15 +3,15 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use super::{ChatEvent, StopReason, SynapseNode, SynapseRole, WorkerCapabilitySnapshot};
-use crate::{ModelIdentity, NodeHello, NodeRole, PROTOCOL_VERSION};
+use crate::{ModelIdentity, NodeHello, NodeRole};
 
 impl SynapseNode {
     /// Send a ChatEvent to the CLI (no-op if channels aren't configured).
     pub(super) fn emit(&self, event: ChatEvent) {
-        if let Some(tx) = &self.event_tx {
-            if let Err(error) = tx.try_send(event) {
-                warn!(%error, "dropping chat event because channel is full or closed");
-            }
+        if let Some(tx) = &self.event_tx
+            && let Err(error) = tx.try_send(event)
+        {
+            warn!(%error, "dropping chat event because channel is full or closed");
         }
     }
 
