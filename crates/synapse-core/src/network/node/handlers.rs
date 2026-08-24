@@ -240,6 +240,8 @@ impl SynapseNode {
                     providers,
                 })) => {
                     info!(key = ?String::from_utf8_lossy(key.as_ref()), peers = providers.len(), "DHT: found providers for model");
+
+                    // Dial discovered peers that run the same model.
                     // Dial discovered peers that run the same model.
                     for peer in providers {
                         if peer != self.local_peer_id() && !self.dialed_peers.contains(&peer) {
