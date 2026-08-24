@@ -115,7 +115,6 @@ pub(super) async fn recv_prompt(rx: &mut Option<mpsc::Receiver<String>>) -> Opti
     }
 }
 
-/// Helper for tokio::select! — returns pending if no batch queue is configured.
 pub(super) async fn recv_batch_prompt(
     rx: &mut Option<mpsc::UnboundedReceiver<super::BatchPromptRequest>>,
 ) -> Option<super::BatchPromptRequest> {
