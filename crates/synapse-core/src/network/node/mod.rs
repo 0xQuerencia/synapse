@@ -198,6 +198,40 @@ impl WorkerRegistry {
             .and_then(|entry| entry.capability.clone())
     }
 
+    /// Structured (Phase 2) capability snapshot for the peer, if
+    /// the worker has sent a `CapabilityPing` heartbeat.
+    pub fn wire_capability(&self, peer_id: &PeerId) -> Option<crate::WorkerCapability> {
+        self.entries
+            .get(peer_id)
+            .and_then(|entry| entry.wire_capability.clone())
+    }
+
+    /// Update the structured capability for a peer. Used by the
+    /// `CapabilityPing` heartbeat path.
+    pub fn update_capability(&mut self, peer_id: PeerId, cap: crate::WorkerCapability) {
+        if let Some(entry) = self.entries.get_mut(&peer_id) {
+            entry.wire_capability = Some(cap);
+            entry.last_seen_at = Instant::now();
+        }
+    }
+
+    /// Phase 4: record live per-device telemetry for a worker from the
+    /// generation step that just completed. No-op if the peer isn't
+    /// registered (e.g. it disconnected mid-step).
+    fn update_telemetry(
+        &mut self,
+        peer_id: PeerId,
+        layers_assigned: u32,
+        tokens_per_sec: f32,
+        util_pct: f32,
+    ) {
+        if let Some(entry) = self.entries.get_mut(&peer_id) {
+            entry.layers_assigned = Some(layers_assigned);
+            entry.tokens_per_sec = Some(tokens_per_sec);
+            entry.util_pct = Some(util_pct);
+        }
+    }
+
     fn upsert(
         &mut self,
         peer_id: PeerId,
