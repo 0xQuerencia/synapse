@@ -89,3 +89,49 @@ async fn sharded_head_last_token_matches_full() {
     let hidden = master.embed(&tokens).expect("master embed");
     let hidden = master
         .forward_layers_prefill(&hidden, 0..1)
+        .expect("master layers");
+    let hidden = worker
+        .forward_layers_prefill(&hidden, 1..2)
+        .expect("worker layers");
+    let sharded_last = master
+        .head_last_token(&hidden)
+        .expect("sharded last-token logits");
+
+    assert_logits_equal(&full_last, &sharded_last, "head_last_token");
+
+    // Argmax sampling must pick the same token on both paths.
+    assert_eq!(
+        ToyLlama::sample_argmax(&full_last).expect("sample full"),
+        ToyLlama::sample_argmax(&sharded_last).expect("sample sharded"),
+        "argmax should agree between full and sliced forward"
+    );
+}
+
+#[tokio::test]
+async fn local_layer_index_validates_slice_window() {
+    let files = download_model(TINY_MODEL)
+        .await
+        .expect("download should succeed");
+    let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
+
+    let master = ToyLlama::load_range(&config, &files.weights, 0..1).expect("slice should load");
+    let worker = ToyLlama::load_range(&config, &files.weights, 1..2).expect("slice should load");
+
+    // Full window mapping: global == local.
+    assert_eq!(master.layer_offset(), 0);
+    assert_eq!(master.local_layer_index(0).expect("global 0 in window"), 0);
+    assert!(master.local_layer_index(1).is_err(), "1 ∉ 0..1");
+
+    // Worker window: global 1 → local 0; 0 and 2 rejected.
+    assert_eq!(worker.layer_offset(), 1);
+    assert_eq!(worker.local_layer_index(1).expect("global 1 in window"), 0);
+    assert!(worker.local_layer_index(0).is_err(), "0 ∉ 1..2");
+    assert!(worker.local_layer_index(2).is_err(), "2 ∉ 1..2");
+}
+
+/// Multi-shard safetensors checkpoints must resolve to one path per shard,
+/// in sorted order, with unsafe names rejected.
+#[test]
+fn shard_files_reads_index_and_validates() {
+    // Write a synthetic index next to a fake weights path.
+    let dir = std::env::temp_dir().join(format!("synapse-shards-{}", std::process::id()));
