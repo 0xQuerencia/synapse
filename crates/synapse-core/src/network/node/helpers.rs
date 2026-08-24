@@ -143,30 +143,16 @@ pub(super) fn local_worker_capability_snapshot() -> Option<WorkerCapabilitySnaps
 }
 
 fn node_hello(role: NodeRole, model: ModelIdentity) -> NodeHello {
-    let cpu_threads = std::thread::available_parallelism()
-        .map(|threads| threads.get())
-        .unwrap_or(1)
-        .min(u16::MAX as usize) as u16;
-    let capability = local_worker_capability_snapshot();
-    let compute_score = capability.as_ref().and_then(|entry| entry.compute_score);
-    let available_ram_mb = capability.as_ref().and_then(|entry| entry.available_ram_mb);
-    let memory_bytes = available_ram_mb.and_then(|mb| mb.checked_mul(1024 * 1024));
-
-    NodeHello {
-        protocol_version: PROTOCOL_VERSION.to_owned(),
-        role,
-        model,
-        platform: std::env::consts::OS.to_owned(),
-        cpu_threads,
-        memory_bytes,
-        compute_score,
-        available_ram_mb,
-    }
+    let probe = crate::hardware::HardwareProbe::detect();
+    NodeHello::from_probe(role, model, std::env::consts::OS, &probe)
 }
 
 /// Detect available system RAM in MiB. Platform-specific implementation.
 #[cfg(target_os = "linux")]
-fn detect_available_ram_mb() -> Option<u64> {
+/// Detect available system RAM in MiB. Platform-specific implementation.
+/// Public so the compute-score benchmark path can read it.
+#[cfg(target_os = "linux")]
+pub(crate) fn detect_available_ram_mb() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     let mut total_kib = None;
     let mut available_kib = None;
