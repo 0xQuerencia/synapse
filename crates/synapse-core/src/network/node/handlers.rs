@@ -298,13 +298,16 @@ impl SynapseNode {
         channel: request_response::ResponseChannel<super::super::ResponseMessage>,
     ) {
         match request {
+            super::super::RequestMessage::Challenge(_) => {
+                self.reject(channel, "worker does not accept challenges");
+            }
+            super::super::RequestMessage::CapabilityPing(_) => {
+                self.reject(channel, "worker does not accept capability pings");
+            }
             super::super::RequestMessage::NodeHello {
                 hello,
                 pairing_code,
             } => self.handle_node_hello(peer, hello, pairing_code, channel),
-            super::super::RequestMessage::Challenge(..) => {
-                self.reject(channel, "worker does not accept challenges");
-            }
             super::super::RequestMessage::ChallengeResponse(response) => {
                 self.handle_challenge_response(peer, response, channel);
             }
