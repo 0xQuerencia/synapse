@@ -119,6 +119,12 @@ impl SynapseNode {
             .map_err(|error| NetworkError::Listen(error.to_string()))?;
 
         let local_capability = local_worker_capability_snapshot();
+        let peer_cache = super::super::PeerCache::load();
+
+        // Live status channel: the run loop publishes peer/route snapshots
+        // here so a GUI can render real peer data without owning the node.
+        let (status_tx, _status_rx) =
+            tokio::sync::watch::channel(super::NodeStatusSnapshot::default());
 
         Ok(Self {
             role,
