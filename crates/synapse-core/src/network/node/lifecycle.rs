@@ -396,8 +396,31 @@ impl SynapseNode {
                 manual_master: None,
                 ..
             } => {
-                info!("searching DHT for masters serving model {}", self.model.id);
-                self.swarm.behaviour_mut().kad.get_providers(model_key);
+                // Check peer cache first before DHT query.
+                let cached_providers = self.peer_cache.get_providers(&self.model.id);
+                if !cached_providers.is_empty() {
+                    info!(
+                        count = cached_providers.len(),
+                        "found cached providers, dialing directly"
+                    );
+                    let cached_ids: Vec<_> = cached_providers.iter().map(|(p, _)| *p).collect();
+                    // Phase 6: pre-warm connection pool with cached masters.
+                    self.connection_pool.prewarm(&cached_ids);
+                    for (peer_id, addrs) in cached_providers {
+                        for addr in addrs {
+                            info!(%peer_id, %addr, "dialing cached master");
+                            if let Err(error) = self.swarm.dial(addr.clone()) {
+                                warn!(%peer_id, %addr, %error, "failed to dial cached master");
+                            }
+                        }
+                    }
+                } else {
+                    info!(
+                        "no cached providers, searching DHT for masters serving model {}",
+                        self.model.id
+                    );
+                    self.swarm.behaviour_mut().kad.get_providers(model_key);
+                }
             }
             _ => {}
         }
