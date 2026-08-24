@@ -425,9 +425,11 @@ pub struct SynapseNode {
     worker_peers: Vec<PeerId>,
     worker_registry: WorkerRegistry,
     local_capability: Option<WorkerCapabilitySnapshot>,
+    peer_cache: super::PeerCache,
     exchange_complete: bool,
     /// Shared model reference — loaded after download, before network exchange.
-    pipeline: Option<Arc<ToyLlama>>,
+    /// Erased behind `ShardedModel` so both safetensors and GGUF weights work.
+    pipeline: Option<Arc<dyn ShardedModel>>,
     /// Tokenizer for encoding/decoding text.
     tokenizer: Option<Arc<SimpleTokenizer>>,
     /// Cached master range end for the active route plan.
