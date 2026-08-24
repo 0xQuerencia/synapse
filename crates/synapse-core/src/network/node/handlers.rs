@@ -207,6 +207,18 @@ impl SynapseNode {
                         .kad
                         .add_address(&peer_id, addr.clone());
                 }
+
+                // Cache authenticated workers for faster reconnection
+                if matches!(self.role, SynapseRole::Master { .. })
+                    && self.authenticated_workers.contains(&peer_id)
+                {
+                    self.peer_cache.add_provider(
+                        self.model.id.clone(),
+                        peer_id,
+                        info.listen_addrs.clone(),
+                    );
+                    self.peer_cache.save();
+                }
             }
             identify::Event::Sent { peer_id, .. } => {
                 debug!(%peer_id, "identify: sent our info");
