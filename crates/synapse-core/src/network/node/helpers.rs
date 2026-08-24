@@ -225,3 +225,45 @@ pub(super) fn extract_peer_id(addr: &libp2p::Multiaddr) -> Option<PeerId> {
     }
     None
 }
+
+/// Measure relay latencies and return RelayInfo vec with measurements.
+pub(super) fn measure_relay_latencies(
+    swarm: &mut libp2p::Swarm<super::SynapseBehaviour>,
+    relays: &[libp2p::Multiaddr],
+) -> Vec<crate::RelayInfo> {
+    let mut relay_infos: Vec<crate::RelayInfo> = relays
+        .iter()
+        .map(|addr| crate::RelayInfo::new(addr.clone()))
+        .collect();
+
+    for relay_info in &mut relay_infos {
+        let start = std::time::Instant::now();
+        info!(addr = %relay_info.addr, region = ?relay_info.region, "measuring relay latency");
+
+        match swarm.dial(relay_info.addr.clone()) {
+            Ok(_) => {
+                let latency_ms = start.elapsed().as_millis() as u64;
+                relay_info.measured_latency_ms = Some(latency_ms);
+                info!(
+                        addr = %relay_info.addr,
+                      region = ?relay_info.region,
+                latency_ms,
+                     "relay connection established"
+                      );
+            }
+            Err(error) => {
+                warn!(addr = %relay_info.addr, %error, "failed to dial relay");
+            }
+        }
+    }
+
+    relay_infos
+}
+
+/// Select best relay (lowest latency) from measured relays.
+pub(super) fn select_best_relay(relay_infos: &[crate::RelayInfo]) -> Option<&crate::RelayInfo> {
+    relay_infos
+        .iter()
+        .filter(|r| r.measured_latency_ms.is_some())
+        .min_by_key(|r| r.measured_latency_ms.unwrap_or(u64::MAX))
+}
