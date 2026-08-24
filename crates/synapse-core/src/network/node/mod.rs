@@ -547,6 +547,16 @@ pub struct PeerSummary {
     pub compute_score: Option<u64>,
     pub available_ram_mb: Option<u64>,
     pub last_seen_unix_ms: u64,
+    /// Phase 4: live contribution telemetry from the most recently
+    /// completed generation step. `None` until this peer has handled
+    /// at least one activation hop.
+    pub layers_assigned: Option<u32>,
+    /// This peer's measured pace during its last hop: `1000 / hop_ms`.
+    pub tokens_per_sec: Option<f32>,
+    /// This peer's share of that step's total wall-clock latency, in
+    /// `[0, 100]` — a real, measured "how much of the work was here"
+    /// number, not a synthetic CPU/GPU utilization reading.
+    pub util_pct: Option<f32>,
 }
 
 /// Reconnection state for a worker waiting for its master.
