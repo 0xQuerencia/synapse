@@ -786,4 +786,31 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn update_telemetry_sets_live_fields_for_registered_peer() {
+        let mut registry = WorkerRegistry::default();
+        let peer_id = PeerId::random();
+        registry.mark_connected(peer_id);
+
+        registry.update_telemetry(peer_id, 4, 25.0, 62.5);
+
+        let entry = registry
+            .get(&peer_id)
+            .expect("connected worker should exist");
+        assert_eq!(entry.layers_assigned, Some(4));
+        assert_eq!(entry.tokens_per_sec, Some(25.0));
+        assert_eq!(entry.util_pct, Some(62.5));
+    }
+
+    #[test]
+    fn update_telemetry_is_noop_for_unknown_peer() {
+        let mut registry = WorkerRegistry::default();
+        let peer_id = PeerId::random();
+
+        // No prior `mark_connected` — peer isn't registered.
+        registry.update_telemetry(peer_id, 4, 25.0, 62.5);
+
+        assert!(registry.get(&peer_id).is_none());
+    }
 }
