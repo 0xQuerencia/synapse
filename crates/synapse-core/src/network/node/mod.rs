@@ -505,6 +505,38 @@ pub struct SynapseNode {
     redial_attempts: u32,
     /// When the next redial attempt is allowed (backoff).
     next_redial_at: Option<Instant>,
+    // ─── Live status publishing ──────────────────────────────────────────
+    /// Publishes the latest networking snapshot (peers, route, redial) so
+    /// the GUI can render real peer data. `run()` owns this sender; the
+    /// GUI holds a `watch::Receiver` obtained via `status_receiver()`
+    /// before the node is moved into its run task.
+    status_tx: tokio::sync::watch::Sender<NodeStatusSnapshot>,
+    /// Worker-only: a real measured compute score from the GUI's benchmark.
+    /// When set, it overrides the coarse probe heuristic in the `NodeHello`
+    /// the worker sends, so the master's planner divides layers by the
+    /// machine's *actual* throughput rather than a thread-count guess.
+    measured_compute_score: Option<u64>,
+    // ─── Live per-device telemetry (Phase 4) ──────────────────────────────
+    /// Wall-clock start of the in-flight generation step's activation
+    /// chain (embed → master layers → worker hops → lm_head). `None`
+    /// when idle. Paired with `step_hop_durations_ms` to compute each
+    /// worker's live `util_pct` once the step completes.
+    step_started_at: Option<Instant>,
+    /// Per-peer hop duration (ms) measured during the in-flight step.
+    /// Cleared once the step completes and results are published to
+    /// the worker registry for the GUI's live dashboard.
+    step_hop_durations_ms: HashMap<PeerId, u64>,
+    // ─── Adaptive Timeouts (Phase 1 Task 1.5) ────────────────────────────
+    /// Rolling window of recent hop latencies per worker (last 20 samples).
+    worker_latencies: HashMap<PeerId, VecDeque<Duration>>,
+    /// Rolling window of recent hop latencies per layer hop index (last 20).
+    hop_latencies: HashMap<usize, VecDeque<Duration>>,
+    // ─── Phase 5: Per-worker batch calibration ────────────────────────────
+    /// Throughput-based batch calibration per worker, fed by live samples.
+    batch_profiles: HashMap<PeerId, batch_tuning::BatchCalibration>,
+    // ─── Phase 6: Connection pooling ──────────────────────────────────────
+    /// Pre-warmed connection pool tracking worker connection health.
+    connection_pool: super::ConnectionPool,
 }
 
 /// Public summary of a worker peer for UIs / dashboards.
