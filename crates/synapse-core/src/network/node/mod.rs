@@ -13,21 +13,23 @@ use libp2p::{
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+mod adaptive_timeout;
+mod batch_tuning;
 mod speculation;
 
 use crate::{
     ModelIdentity, NodeCapability, PairingRateLimiter,
-    inference::{SimpleTokenizer, ToyLlama},
+    inference::{ShardedModel, SimpleTokenizer},
 };
 
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const PROMPT_CHANNEL_CAPACITY: usize = 32;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Maximum number of prompts batched into a single forward pass.
 pub(super) const MAX_BATCH_SIZE: usize = 4;
 /// Timeout for individual worker hop responses (self-healing trigger).
-const WORKER_HOP_TIMEOUT: Duration = Duration::from_secs(2);
+const WORKER_HOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the run loop checks for worker timeouts.
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
