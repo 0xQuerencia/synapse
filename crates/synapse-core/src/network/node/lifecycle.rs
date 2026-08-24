@@ -483,6 +483,10 @@ impl SynapseNode {
                         }
                         return Ok(());
                     }
+
+                    // Peer/auth state changes happen inside swarm events;
+                    // publish a fresh snapshot so the GUI updates promptly.
+                    self.publish_status();
                 }
                 // Listen for prompts from the CLI REPL (master only)
                 Some(prompt) = recv_prompt(&mut self.prompt_rx) => {
