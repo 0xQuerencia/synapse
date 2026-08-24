@@ -151,6 +151,7 @@ impl SynapseNode {
             generation_route_plan: None,
             in_flight_activation_hop: None,
             cache_reset_nonce: 0,
+            truncate_nonce: 0,
             prompt_rx: None,
             event_tx: None,
             // Phase 8: Continuous Batching
