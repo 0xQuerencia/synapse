@@ -136,6 +136,7 @@ impl SynapseNode {
             worker_peers: Vec::new(),
             worker_registry: WorkerRegistry::default(),
             local_capability,
+            peer_cache,
             exchange_complete: false,
             pipeline: None,
             tokenizer: None,
