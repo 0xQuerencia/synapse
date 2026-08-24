@@ -480,10 +480,23 @@ pub struct SynapseNode {
     // ─── Speculative Decoding (Phase 10) ─────────────────────────────────
     /// N-gram draft cache for predicting next tokens.
     draft_cache: speculation::NgramDraftCache,
-    /// In-flight speculative draft tokens awaiting verification.
-    pending_draft: Option<Vec<u32>>,
+    /// In-flight speculative verification round, if any.
+    spec_round: Option<SpeculativeRound>,
     /// Whether speculative decoding is enabled for this session.
     speculative_enabled: bool,
+    /// Number of token positions currently held in every KV cache along the
+    /// active route (master local layers + each worker hop). Grows by the
+    /// activation length on every forward and shrinks on truncation; lets
+    /// the master compute rollback targets without querying peers.
+    kv_cache_len: usize,
+    // ─── Speculative rollback (KvTruncate) ───────────────────────────────
+    /// Whether master is waiting for worker KvTruncateAck before the next
+    /// activation after rejected speculative drafts.
+    awaiting_truncate_ack: bool,
+    /// Trace id for the in-flight truncate request (if any).
+    pending_truncate_trace_id: Option<String>,
+    /// Workers still expected to acknowledge the in-flight truncate request.
+    pending_truncate_peers: HashSet<PeerId>,
     // ─── Security ────────────────────────────────────────────────────────
     /// Rate limiter for pairing code brute-force protection.
     pairing_rate_limiter: PairingRateLimiter,
