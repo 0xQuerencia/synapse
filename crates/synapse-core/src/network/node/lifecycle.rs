@@ -222,30 +222,66 @@ impl SynapseNode {
             })?;
         }
 
-        let config = ToyLlamaConfig::from_file(&files.config)
+        let is_gguf = files.weights.extension().is_some_and(|ext| ext == "gguf");
+
+        // GGUF files carry all model metadata in their header; safetensors
+        // models use the HF `config.json`. Only the layer count is needed
+        // here to compute the static shard plan.
+        let config = if is_gguf {
+            None
+        } else {
+            Some(
+                ToyLlamaConfig::from_file(&files.config)
+                    .map_err(|error| NetworkError::Inference(error.to_string()))?,
+            )
+        };
+        let total = match &config {
+            Some(config) => config.num_hidden_layers,
+            None => gguf_layer_count(&files.weights)
+                .map_err(|error| NetworkError::Inference(error.to_string()))?,
+        };
+        // The master loads the full layer span. Generation replans shards
+        // dynamically (capability-weighted) as workers join and leave, so a
+        // fixed placeholder split here would leave the master holding fewer
+        // layers than a later route plan assigns it. A full-span load is
+        // valid for any plan; workers slice their own range on join.
+        let split = match &self.role {
+            SynapseRole::Master { .. } => total,
+            SynapseRole::Worker { .. } | SynapseRole::RelayServer => total,
+        };
+
+        let device = crate::inference::get_best_device()
             .map_err(|error| NetworkError::Inference(error.to_string()))?;
 
-        let total = config.num_hidden_layers;
-        let assignments = plan_static_shards(total, &["master", "worker"]).map_err(|error| {
-            NetworkError::Inference(format!("failed to compute static shard plan: {error}"))
-        })?;
-        let split = assignments
-            .iter()
-            .find(|assignment| assignment.participant == "master")
-            .map(|assignment| assignment.layer_range.end)
-            .ok_or_else(|| {
-                NetworkError::Inference(
-                    "invalid static shard plan: master received no layers".to_owned(),
+        // Slice the model by role: the master holds embed + all layers +
+        // the LM head (full span, see note above); workers hold the upper
+        // layers. RelayServer never loads a model (empty range).
+        let layer_range = match &self.role {
+            SynapseRole::Master { .. } => 0..split,
+            SynapseRole::Worker { .. } => split..total,
+            SynapseRole::RelayServer => 0..0,
+        };
+
+        let model: std::sync::Arc<dyn ShardedModel> = if is_gguf {
+            std::sync::Arc::new(
+                ToyLlamaGGUF::load_range(&files.weights, layer_range, &device)
+                    .map_err(|error| NetworkError::Inference(error.to_string()))?,
+            )
+        } else {
+            std::sync::Arc::new(
+                ToyLlama::load_range(
+                    config.as_ref().expect("safetensors config loaded above"),
+                    &files.weights,
+                    layer_range,
                 )
-            })?;
-
-        let model = ToyLlama::load(&config, &files.weights)
-            .map_err(|error| NetworkError::Inference(error.to_string()))?;
+                .map_err(|error| NetworkError::Inference(error.to_string()))?,
+            )
+        };
 
         let tokenizer = SimpleTokenizer::from_file(&files.tokenizer)
             .map_err(|error| NetworkError::Inference(error.to_string()))?;
 
-        self.pipeline = Some(std::sync::Arc::new(model));
+        self.pipeline = Some(model);
         self.tokenizer = Some(std::sync::Arc::new(tokenizer));
         self.split_point = split;
         self.total_layers = total;
