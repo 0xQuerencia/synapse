@@ -475,6 +475,8 @@ impl SynapseNode {
             self.worker_peers.push(peer);
         }
         self.worker_registry.mark_authenticated(peer, None); // Retains existing capability from upsert
+        // Pre-warm connection to eliminate cold-start latency on first inference
+        self.send_health_ping(peer);
 
         info!(%peer, "worker authenticated via challenge-response and ready");
         self.send_response(channel, super::super::ResponseMessage::Authenticated);
