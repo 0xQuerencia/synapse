@@ -11,12 +11,18 @@ use super::{
     BatchPromptRequest, ChatEvent, DEFAULT_REQUEST_TIMEOUT, EVENT_CHANNEL_CAPACITY, NetworkError,
     PROMPT_CHANNEL_CAPACITY, SynapseBehaviour, SynapseNode, SynapseRole, TIMEOUT_CHECK_INTERVAL,
     WorkerRegistry,
-    helpers::{extract_peer_id, local_worker_capability_snapshot, recv_batch_prompt, recv_prompt},
+    helpers::{
+        extract_peer_id, local_worker_capability_snapshot, measure_relay_latencies,
+        recv_batch_prompt, recv_prompt, select_best_relay,
+    },
 };
 use crate::{ModelIdentity, NetConfig, NodeIdentity, PairingRateLimiter};
 use crate::{
-    inference::{SimpleTokenizer, ToyLlama, ToyLlamaConfig, download_model, verify_file_sha256},
-    plan_static_shards,
+    compute_score::blend_compute_score,
+    inference::{
+        ShardedModel, SimpleTokenizer, ToyLlama, ToyLlamaConfig, ToyLlamaGGUF, download_model,
+        gguf_layer_count, verify_file_sha256,
+    },
 };
 use std::collections::VecDeque;
 
