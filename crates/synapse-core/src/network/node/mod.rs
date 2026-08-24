@@ -644,6 +644,60 @@ impl SynapseNode {
             SynapseRole::RelayServer => "relay",
         }
     }
+
+    /// Subscribe to live networking status updates. Call this BEFORE moving
+    /// the node into its `run()` task; the GUI keeps the receiver to render
+    /// real peer data. The channel always holds the latest snapshot.
+    pub fn status_receiver(&self) -> tokio::sync::watch::Receiver<NodeStatusSnapshot> {
+        self.status_tx.subscribe()
+    }
+
+    /// Worker-only: set the real benchmark score this node advertises to the
+    /// master. Call before `run()` (and before the worker dials its master,
+    /// which is when the first `NodeHello` is sent). Overrides the coarse
+    /// probe heuristic so the planner divides layers by measured throughput.
+    pub fn set_measured_compute_score(&mut self, score: u64) {
+        self.measured_compute_score = Some(score);
+        // Keep the in-memory capability snapshot consistent so the GUI's
+        // own peer view reflects the measured score too.
+        if let Some(snapshot) = self.local_capability.as_mut() {
+            snapshot.compute_score = Some(score);
+        }
+    }
+
+    /// Build a snapshot of the current networking state.
+    fn build_status_snapshot(&self) -> NodeStatusSnapshot {
+        NodeStatusSnapshot {
+            peers: self.peers(),
+            authenticated_count: self.authenticated_workers.len(),
+            route_plan: self.route_plan(),
+            redial: match self.role {
+                SynapseRole::Worker { .. } => Some(self.redial_status()),
+                _ => None,
+            },
+            role: self.role_label().to_owned(),
+        }
+    }
+
+    /// Publish the current networking state to any `watch` subscribers.
+    /// Cheap and lossless to call often — `watch` coalesces to the latest
+    /// value, so a fast burst of calls just leaves subscribers the newest.
+    pub(super) fn publish_status(&self) {
+        // `send` only errors if there are no receivers, which is fine.
+        let _ = self.status_tx.send(self.build_status_snapshot());
+    }
+
+    /// Phase 2: Calculate the average latency for a worker from recent samples.
+    /// Returns `None` if no latency data is available for this peer.
+    pub fn get_worker_avg_latency(&self, peer: &PeerId) -> Option<Duration> {
+        self.worker_latencies.get(peer).and_then(|latencies| {
+            if latencies.is_empty() {
+                return None;
+            }
+            let sum: Duration = latencies.iter().sum();
+            Some(sum / latencies.len() as u32)
+        })
+    }
 }
 
 #[cfg(test)]
