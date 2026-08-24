@@ -292,6 +292,30 @@ impl SynapseNode {
             "model and tokenizer loaded, shard plan computed"
         );
 
+        // ─── Compute real compute score (Phase 1) ─────────────────
+        // Run the micro-benchmark once and cache the result so the
+        // worker advertises its real throughput, not cpu_threads*100.
+        let measured = crate::inference::run_micro_benchmark(&device);
+        let probe = crate::hardware::HardwareProbe::detect();
+        let ram_free_mb = super::helpers::detect_available_ram_mb().unwrap_or(0);
+        let score = blend_compute_score(measured, ram_free_mb, &probe);
+        self.measured_compute_score = Some(score);
+        info!(
+            measured,
+            ram_free_mb,
+            blended_score = score,
+            backend = %probe.backend.as_str(),
+            gpu = probe.has_accelerator,
+            "compute score set from real benchmark"
+        );
+
+        // Also update the local capability snapshot so the master's
+        // own peer view shows the measured score, not cpu_threads*100.
+        if let Some(snapshot) = self.local_capability.as_mut() {
+            snapshot.compute_score = Some(score);
+            snapshot.available_ram_mb = Some(ram_free_mb);
+        }
+
         Ok(())
     }
 
