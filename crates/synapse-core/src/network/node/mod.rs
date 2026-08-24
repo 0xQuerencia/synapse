@@ -303,12 +303,94 @@ pub struct RouteHopView {
     pub layer_range: std::ops::Range<usize>,
 }
 
+/// Live snapshot of the node's networking state, published by the run
+/// loop through a `watch` channel so the GUI can render real peers
+/// instead of placeholder data. Cheap to clone (small Vec + a couple of
+/// Options); the `watch` channel only ever retains the latest value.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct NodeStatusSnapshot {
+    /// Every worker the registry knows about, with connection state.
+    pub peers: Vec<PeerSummary>,
+    /// Number of workers that have fully authenticated (challenge-response).
+    pub authenticated_count: usize,
+    /// The active generation route, if a turn is in progress.
+    pub route_plan: Option<RoutePlanView>,
+    /// Reconnection status (worker role only).
+    pub redial: Option<RedialStatus>,
+    /// Stable role label: "master" | "worker" | "relay".
+    pub role: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct InFlightActivationHop {
-    sequence_position: usize,
-    hop_index: usize,
-    trace_id: String,
-    dispatch_time: Option<Instant>,
+pub(super) struct InFlightActivationHop {
+    pub(super) sequence_position: usize,
+    pub(super) hop_index: usize,
+    pub(super) trace_id: String,
+    pub(super) dispatch_time: Option<Instant>,
+    /// Which compute pass this hop belongs to; workers need it to pick
+    /// the right KV-cache strategy (replace / single append / block append).
+    pub(super) pass: ActivationPass,
+}
+
+/// How a hidden-state activation should be executed against the KV cache.
+///
+/// Derived from the request's `sequence_position` and the activation's
+/// sequence length:
+/// - position 0 → [`ActivationPass::Prefill`] (cache replace, full prompt)
+/// - later positions with a single token → [`ActivationPass::Decode`]
+/// - later positions with multiple tokens → [`ActivationPass::Speculative`]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ActivationPass {
+    Prefill,
+    Decode,
+    Speculative,
+}
+
+impl ActivationPass {
+    fn for_sequence_position(sequence_position: usize) -> Self {
+        if sequence_position == 0 {
+            Self::Prefill
+        } else {
+            Self::Decode
+        }
+    }
+
+    /// Classify an inbound `ActivationRequest`. Multi-token activations at
+    /// non-zero sequence positions are speculative verification passes that
+    /// must append to (not replace) the worker's KV caches.
+    pub(crate) fn for_request(sequence_position: usize, seq_len: usize) -> Self {
+        if sequence_position == 0 {
+            Self::Prefill
+        } else if seq_len <= 1 {
+            Self::Decode
+        } else {
+            Self::Speculative
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+            Self::Speculative => "speculative",
+        }
+    }
+}
+
+/// A speculative verification round in flight.
+///
+/// The master dispatched `[last_committed_token, draft_1, ..., draft_k]`
+/// through the route and is awaiting the multi-position activation output
+/// to verify the drafts. On verification the cache must hold exactly
+/// `cache_base_len + accepted + 1` positions — anything beyond that came
+/// from rejected drafts and is truncated away.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SpeculativeRound {
+    /// Drafted tokens `[d1..dk]` being verified.
+    pub(crate) draft_tokens: Vec<u32>,
+    /// Master/worker KV cache length *before* this round appended its
+    /// verification block.
+    pub(crate) cache_base_len: usize,
 }
 
 // ─── Batching types ──────────────────────────────────────────────────────────
