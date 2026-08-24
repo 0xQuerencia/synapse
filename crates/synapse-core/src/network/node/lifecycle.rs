@@ -165,11 +165,25 @@ impl SynapseNode {
             healing_saved_step: 0,
             // Phase 10: Speculative Decoding
             draft_cache: super::NgramDraftCache::default(),
-            pending_draft: None,
+            spec_round: None,
             speculative_enabled: true,
+            kv_cache_len: 0,
+            awaiting_truncate_ack: false,
+            pending_truncate_trace_id: None,
+            pending_truncate_peers: std::collections::HashSet::new(),
             pairing_rate_limiter: PairingRateLimiter::default(),
             redial_attempts: 0,
             next_redial_at: None,
+            status_tx,
+            measured_compute_score: None,
+            step_started_at: None,
+            step_hop_durations_ms: std::collections::HashMap::new(),
+            worker_latencies: std::collections::HashMap::new(),
+            hop_latencies: std::collections::HashMap::new(),
+            // Phase 5: per-worker batch calibration starts empty.
+            batch_profiles: std::collections::HashMap::new(),
+            // Phase 6: pre-warmed connection pool.
+            connection_pool: super::super::ConnectionPool::with_capacity(64),
         })
     }
 
