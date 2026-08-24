@@ -177,7 +177,7 @@ fn parse_meminfo_kib(line: &str) -> Option<u64> {
 
 /// Detect available system RAM in MiB via `sysctl hw.memsize`.
 #[cfg(target_os = "macos")]
-fn detect_available_ram_mb() -> Option<u64> {
+pub(crate) fn detect_available_ram_mb() -> Option<u64> {
     use std::process::Command;
     let output = Command::new("sysctl")
         .args(["-n", "hw.memsize"])
