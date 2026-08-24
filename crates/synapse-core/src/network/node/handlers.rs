@@ -320,6 +320,12 @@ impl SynapseNode {
             super::super::RequestMessage::ClearCache(request) => {
                 self.handle_clear_cache_request(peer, request, channel);
             }
+            super::super::RequestMessage::KvTruncate(request) => {
+                self.handle_kv_truncate_request(peer, request, channel);
+            }
+            super::super::RequestMessage::HealthPing => {
+                self.handle_health_ping(peer, channel);
+            }
         }
     }
 
