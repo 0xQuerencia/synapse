@@ -246,8 +246,12 @@ impl WorkerRegistry {
                 peer_id,
                 state,
                 capability: None,
+                wire_capability: None,
                 pending_challenge: None,
                 last_seen_at: now,
+                layers_assigned: None,
+                tokens_per_sec: None,
+                util_pct: None,
             });
         entry.peer_id = peer_id;
         entry.state = state;
