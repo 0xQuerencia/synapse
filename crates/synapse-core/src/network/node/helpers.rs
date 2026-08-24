@@ -53,7 +53,15 @@ impl SynapseNode {
             return;
         }
 
-        let hello = node_hello(NodeRole::Worker, self.model.clone());
+        let mut hello = node_hello(NodeRole::Worker, self.model.clone());
+        // If the GUI ran a real compute benchmark, advertise that measured
+        // score instead of the coarse probe heuristic (cpu_threads × 100).
+        // The master reads `hello.compute_score` and the weighted planner
+        // divides layers proportionally by it, so this is what actually
+        // makes "divide power accordingly" use real measurements.
+        if let Some(score) = self.measured_compute_score {
+            hello.compute_score = Some(score);
+        }
         let hashed_code = crate::hash_pairing_code(pairing_code);
         info!(%peer, "worker sending NodeHello");
         self.swarm.behaviour_mut().request_response.send_request(
