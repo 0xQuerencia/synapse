@@ -454,6 +454,8 @@ pub struct SynapseNode {
     in_flight_activation_hop: Option<InFlightActivationHop>,
     /// Monotonic nonce for clear-cache trace ids.
     cache_reset_nonce: u64,
+    /// Monotonic nonce for KV-truncate trace ids.
+    truncate_nonce: u64,
     // ─── Chat channels ───────────────────────────────────────────────────
     /// Receives prompts from the CLI (master only).
     prompt_rx: Option<mpsc::Receiver<String>>,
