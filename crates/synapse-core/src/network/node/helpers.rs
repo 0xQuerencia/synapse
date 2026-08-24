@@ -95,9 +95,19 @@ impl SynapseNode {
             error!(?response, "failed to send response");
         }
     }
+
+    /// Send a HealthPing to pre-warm the connection with a worker.
+    /// Called immediately after authentication to eliminate cold-start latency.
+    pub(super) fn send_health_ping(&mut self, peer: PeerId) {
+        info!(%peer, "sending HealthPing to pre-warm connection");
+        self.swarm
+            .behaviour_mut()
+            .request_response
+            .send_request(&peer, super::super::RequestMessage::HealthPing);
+    }
 }
 
-/// Helper for tokio::select! — returns pending if no channel is configured.
+/// Helper for tokio::select! — returns pending if no batch queue is configured.
 pub(super) async fn recv_prompt(rx: &mut Option<mpsc::Receiver<String>>) -> Option<String> {
     match rx {
         Some(rx) => rx.recv().await,
