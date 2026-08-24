@@ -43,3 +43,49 @@ async fn sharded_slices_match_full_forward() {
         .expect("download should succeed");
     let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
 
+    let full = ToyLlama::load(&config, &files.weights).expect("full model should load");
+    // master = 0..1, worker = 1..2 (tiny model has exactly 2 layers)
+    let master =
+        ToyLlama::load_range(&config, &files.weights, 0..1).expect("master slice should load");
+    let worker =
+        ToyLlama::load_range(&config, &files.weights, 1..2).expect("worker slice should load");
+
+    let tokens = token_ids();
+    let full_logits = full.forward_prefill(&tokens).expect("full prefill");
+
+    let hidden = master.embed(&tokens).expect("master embed");
+    let hidden = master
+        .forward_layers_prefill(&hidden, 0..1)
+        .expect("master layers");
+    let hidden = worker
+        .forward_layers_prefill(&hidden, 1..2)
+        .expect("worker layers");
+    let sharded_logits = master.head(&hidden).expect("master LM head");
+
+    assert_logits_equal(&full_logits, &sharded_logits, "prefill");
+}
+
+#[tokio::test]
+async fn sharded_head_last_token_matches_full() {
+    let files = download_model(TINY_MODEL)
+        .await
+        .expect("download should succeed");
+    let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
+
+    let full = ToyLlama::load(&config, &files.weights).expect("full model should load");
+    let master =
+        ToyLlama::load_range(&config, &files.weights, 0..1).expect("master slice should load");
+    let worker =
+        ToyLlama::load_range(&config, &files.weights, 1..2).expect("worker slice should load");
+
+    let tokens = token_ids();
+    // forward_prefill returns full-sequence logits; take the last position.
+    let full_prefill = full.forward_prefill(&tokens).expect("full prefill");
+    let seq_len = full_prefill.dim(1).expect("seq dim");
+    let full_last = full_prefill
+        .narrow(1, seq_len - 1, 1)
+        .expect("last position");
+
+    let hidden = master.embed(&tokens).expect("master embed");
+    let hidden = master
+        .forward_layers_prefill(&hidden, 0..1)
