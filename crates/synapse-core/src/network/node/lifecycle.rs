@@ -348,21 +348,31 @@ impl SynapseNode {
         // Dial relays and (for NAT'd masters) reserve a circuit so remote peers
         // can reach us through the relay. The relay server itself skips this.
         if !matches!(self.role, SynapseRole::RelayServer) {
-            for addr in &net_config.relays {
-                info!(%addr, "dialing relay server");
-                if let Err(error) = self.swarm.dial(addr.clone()) {
-                    warn!(%addr, %error, "failed to dial relay");
-                    continue;
-                }
-                // Masters listen on a circuit address so workers can dial them
-                // through the relay even when both sides are behind NAT.
-                if matches!(self.role, SynapseRole::Master { .. }) {
-                    let circuit: Multiaddr =
-                        addr.clone().with(libp2p::multiaddr::Protocol::P2pCircuit);
+            // Geographic relay selection: measure latency and prefer fastest.
+            let relay_infos = measure_relay_latencies(&mut self.swarm, &net_config.relays);
+
+            // Masters listen on circuit address via the best relay.
+            if matches!(self.role, SynapseRole::Master { .. }) {
+                if let Some(best_relay) = select_best_relay(&relay_infos) {
+                    let circuit: Multiaddr = best_relay
+                        .addr
+                        .clone()
+                        .with(libp2p::multiaddr::Protocol::P2pCircuit);
                     match self.swarm.listen_on(circuit.clone()) {
-                        Ok(_) => info!(%circuit, "listening on relay circuit address"),
-                        Err(error) => warn!(%circuit, %error, "failed to listen on circuit"),
+                        Ok(_) => {
+                            info!(
+                               circuit = %circuit,
+                                 region = ?best_relay.region,
+                                latency_ms = ?best_relay.measured_latency_ms,
+                            "listening on best relay circuit"
+                               );
+                        }
+                        Err(error) => {
+                            warn!(%circuit, %error, "failed to listen on circuit");
+                        }
                     }
+                } else {
+                    warn!("no relay available for circuit listening");
                 }
             }
         }
