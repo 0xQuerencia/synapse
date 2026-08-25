@@ -27,3 +27,6 @@ Rust is the only requirement. Candle does the math, libp2p does the networking, 
 ```
 synapse host
 synapse join
+synapse demo
+```
+
