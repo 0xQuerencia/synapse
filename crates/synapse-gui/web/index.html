@@ -544,9 +544,9 @@
           this.wsStatus = 'open';
           appendLog('NET', `WebSocket ${proto}://${window.location.host}/ws — open.`);
         };
-        this.ws.onerror = (e) => {
+        this.ws.onerror = () => {
           this.wsStatus = 'error';
-          appendLog('ERROR', 'WebSocket error. See /api/session/status for details.');
+          appendLog('ERROR', 'WebSocket error. See /api/status for details.');
         };
         this.ws.onclose = () => {
           this.wsStatus = 'closed';
