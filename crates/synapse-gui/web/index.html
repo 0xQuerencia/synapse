@@ -935,84 +935,136 @@
     });
 
     function escapeHTML(str) {
-      return str.replace(/[&<>'"]/g, tag => ({
+      return String(str).replace(/[&<>'"]/g, tag => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
       }[tag] || tag));
     }
 
-    function addUserMessage(text) {
-      const wrapper = document.createElement('div');
-      wrapper.className = "flex gap-4 max-w-3xl justify-end ml-auto";
-      wrapper.innerHTML = `
-        <div class="space-y-1.5 pt-1 order-1 flex flex-col items-end">
-          <div class="flex items-center gap-2 mb-2">
-            <span class="text-[10px] font-mono text-app-dim">00:00:05</span>
-            <span class="text-[10px] font-mono font-semibold text-white uppercase tracking-wider bg-white/10 px-2 py-0.5 rounded border border-white/20">OPERATOR</span>
+    // ─── Peers / hardware rendering ─────────────────────────────────
+    const STATE_TONES = {
+      authenticated: { dot: 'bg-ink-live',  badge: 'text-ink-live border-ink-live/30',  bar: 'bg-ink-live' },
+      connected:     { dot: 'bg-ink-info',  badge: 'text-ink-info border-ink-info/30',  bar: 'bg-ink-info' },
+      discovered:    { dot: 'bg-ink-warn',  badge: 'text-ink-warn border-ink-warn/30',  bar: 'bg-ink-warn' },
+    };
+
+    function peerCard(p, assignment) {
+      const short = p.peer_id.length > 12
+        ? `${p.peer_id.slice(0, 6)}…${p.peer_id.slice(-4)}`
+        : p.peer_id;
+      const tone = STATE_TONES[p.state] || STATE_TONES.discovered;
+      const ramGb = p.available_ram_mb != null ? (p.available_ram_mb / 1024).toFixed(1) + ' GB' : '—';
+      const compute = p.compute_score != null ? String(p.compute_score) : '—';
+
+      return `
+        <div class="border border-ink-line rounded-xl p-5 hover:border-ink-lineHi transition-colors bg-ink-surface">
+          <div class="flex items-start justify-between mb-4">
+            <div>
+              <div class="flex items-center gap-2 font-mono text-[12px] text-ink-fg">
+                <span class="w-1.5 h-1.5 rounded-full ${tone.dot}"></span>${short}
+              </div>
+              <span class="inline-block mt-2 px-1.5 py-0.5 rounded border text-[9px] font-mono uppercase tracking-wider ${tone.badge}">${p.state}</span>
+            </div>
+            <i data-lucide="server" class="w-4 h-4 text-ink-faint"></i>
           </div>
-          <div class="text-app-fg text-[15px] leading-relaxed font-sans glass-panel px-5 py-4 rounded-2xl rounded-tr-sm border-app-border/40 shadow-md">
-            ${escapeHTML(text).replace(/\n/g, '<br>')}
+          <div class="space-y-2 text-xs">
+            <div class="flex justify-between pb-2 border-b border-ink-line/70">
+              <span class="text-ink-dim">compute</span>
+              <span class="font-mono text-ink-mute tabular-nums">${compute}</span>
+            </div>
+            <div class="flex justify-between pb-2 border-b border-ink-line/70">
+              <span class="text-ink-dim">available ram</span>
+              <span class="font-mono text-ink-mute tabular-nums">${ramGb}</span>
+            </div>
+            ${p.tokens_per_sec != null ? `
+            <div class="pt-1">
+              <div class="flex justify-between mb-1.5">
+                <span class="text-ink-dim">live pace</span>
+                <span class="font-mono text-ink-mute tabular-nums">${p.tokens_per_sec.toFixed(1)} tok/s · ${Math.round(p.util_pct || 0)}%</span>
+              </div>
+              <div class="h-1 rounded-full bg-ink-line overflow-hidden">
+                <div class="h-full rounded-full ${tone.bar}" style="width:${Math.min(100, Math.max(0, p.util_pct || 0))}%"></div>
+              </div>
+            </div>` : ''}
+            <div class="flex justify-between pt-1">
+              <span class="text-ink-dim">assignment</span>
+              <span class="font-mono text-ink-mute text-[11px]">${assignment}</span>
+            </div>
           </div>
-        </div>
-        <div class="w-10 h-10 rounded-xl bg-app-panel border border-app-border flex items-center justify-center flex-shrink-0 order-2 shadow-inner">
-          <i data-lucide="user" class="w-5 h-5 text-app-muted"></i>
-        </div>
-      `;
-      DOM.chatHistory.appendChild(wrapper);
-      lucide.createIcons({root: wrapper});
-      DOM.chatHistory.scrollTop = DOM.chatHistory.scrollHeight;
+        </div>`;
     }
 
-    function startInferenceSimulation() {
-      state.isStreaming = true;
-      DOM.btnRun.disabled = true;
-      DOM.promptInput.disabled = true;
-      
-      DOM.metricTs.innerText = '0.0';
-      DOM.metricTtft.innerText = '---';
-      
-      DOM.edgesAnim.forEach(e => e.classList.remove('hidden'));
-      
-      // Pulse dots
-      let dotIdx = 0;
-      const dotColors = ['#8b5cf6', '#06b6d4', '#10b981', '#8b5cf6'];
-      const dotShadows = ['shadow-neon-violet', 'shadow-neon-cyan', 'shadow-neon-emerald', 'shadow-neon-violet'];
-      
-      const dotInterval = setInterval(() => {
-        DOM.dots.forEach((d, i) => {
-          d.style.backgroundColor = 'transparent';
-          d.className = `absolute -left-[19px] top-0.5 w-3 h-3 rounded-full bg-app-bg border-2 border-[${dotColors[i]}] z-10 transition-all`;
-        });
-        DOM.dots[dotIdx].style.backgroundColor = dotColors[dotIdx];
-        DOM.dots[dotIdx].classList.add(dotShadows[dotIdx], 'scale-125');
-        dotIdx = (dotIdx + 1) % 4;
-      }, 250);
-
-      const ttft = Math.floor(Math.random() * 120 + 120); 
-      setTimeout(() => {
-        DOM.metricTtft.innerText = ttft.toString();
-        appendLog('INFO', `First Token latency calculated: ${ttft}ms`);
-        streamAssistantResponse(dotInterval);
-      }, ttft);
-
-      state.simInterval = setInterval(updateTelemetryLive, 2000);
+    function emptyState(title, body) {
+      return `
+        <div class="md:col-span-2 xl:col-span-3 border border-dashed border-ink-line rounded-xl px-8 py-12 text-center">
+          <div class="text-[13px] text-ink-mute mb-1.5">${title}</div>
+          <div class="text-[11px] text-ink-dim leading-relaxed max-w-md mx-auto">${body}</div>
+        </div>`;
     }
 
-    function formatCodeBlocks(container) {
-       const html = container.innerHTML;
-       if(html.includes('```rust')) {
-         container.innerHTML = html.replace(/```rust(.*?)```/gs, '<div class="bg-[#050508] border border-app-border rounded-lg p-4 font-mono text-[13px] my-3 text-app-emerald shadow-inner leading-relaxed">$1</div>');
-       }
+    function renderPeers(data) {
+      const grid = document.getElementById('hardware-grid');
+      const peerLabel = document.getElementById('peer-count-label');
+      const nodesLabel = document.getElementById('active-nodes-label');
+      const dhtLabel = document.getElementById('dht-state-label');
+
+      const peers = (data && data.peers) || [];
+      const online = (data && data.online) || 0;
+
+      if (peerLabel) peerLabel.innerText = `${online} peer${online === 1 ? '' : 's'} online`;
+      if (nodesLabel) nodesLabel.innerText = String(online);
+      if (dhtLabel) {
+        dhtLabel.innerText = !data || !data.available
+          ? 'local'
+          : (online > 0 ? 'connected' : 'waiting');
+      }
+
+      if (!grid) return;
+
+      if (!data || !data.available) {
+        grid.innerHTML = emptyState(
+          'No swarm peers',
+          'This session runs locally with no distributed workers. Host a candle model and have another node join by code to see real peers here.'
+        );
+      } else if (peers.length === 0) {
+        grid.innerHTML = emptyState(
+          'Master online — waiting for workers',
+          'Share your pairing code. Workers that join with it will appear here once authenticated.'
+        );
+      } else {
+        const hops = (data.route_plan && data.route_plan.worker_hops) || [];
+        const hopFor = (pid) => hops.find(h => h.peer_id === pid);
+        grid.innerHTML = peers.map(p => {
+          const hop = hopFor(p.peer_id);
+          const assignment = hop ? `layers ${hop.layer_range.start}–${hop.layer_range.end}` : 'unassigned';
+          return peerCard(p, assignment);
+        }).join('');
+        if (window.lucide) lucide.createIcons({ root: grid });
+      }
     }
 
     async function updateTelemetryLive() {
       try {
         const s = await api.status();
-        // Cheap live numbers from real backend state.
         const role = s.session.role;
-        DOM.metricTs.innerText = (s.cached_models.length * 1.7 + 0.4).toFixed(1);
-        DOM.metricPing.innerText = role === 'idle' ? '-- ms' : `${(8 + role.length * 2)} ms`;
-        // Surface the chosen codec + a real bytes number when
-        // a master is running.
+
+        if (DOM.roleLabel) DOM.roleLabel.innerText = role;
+
+        if (!state.isStreaming) {
+          DOM.metricTs.innerText = state.lastTps || '0.0';
+        }
+
+        if (DOM.headerModel) {
+          if (s.session && s.session.model_id) {
+            DOM.headerModel.innerText = s.session.model_id.split('/').pop();
+          } else if (s.cached_models && s.cached_models.length > 0) {
+            DOM.headerModel.innerText = s.cached_models[0].split('/').pop();
+          } else {
+            DOM.headerModel.innerText = 'no model cached';
+          }
+        }
+
+        DOM.metricPing.innerText = role === 'idle' ? '— ms' : `${(8 + role.length * 2)} ms`;
+
         if (role === 'master') {
           const ratio = state.codec === 'LZ4' ? 0.36 : 0.24;
           const orig = 6.4;
