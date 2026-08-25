@@ -755,55 +755,62 @@
 
     function appendLog(level, msg) {
       const line = document.createElement('div');
-      let colorClass = 'text-[#c9c9c9]'; // default terminal gray
-      
-      if(level === 'INFO') colorClass = 'text-app-emerald drop-shadow-[0_0_3px_rgba(16,185,129,0.5)]';
-      if(level === 'DEBUG') colorClass = 'text-app-dim';
-      if(level === 'WARN') colorClass = 'text-app-amber drop-shadow-[0_0_3px_rgba(245,158,11,0.5)]';
-      if(level === 'ERROR') colorClass = 'text-app-red drop-shadow-[0_0_3px_rgba(239,68,68,0.5)]';
-      if(level === 'NET') colorClass = 'text-app-cyan drop-shadow-[0_0_3px_rgba(6,182,212,0.5)]';
-
-      line.innerHTML = `<span class="text-app-dim opacity-70">[${getTimestamp()}]</span> <span class="${colorClass} font-bold mr-2">[${level}]</span><span class="text-[13px]">${msg}</span>`;
+      const tones = {
+        INFO:  'text-ink-live',
+        DEBUG: 'text-ink-faint',
+        WARN:  'text-ink-warn',
+        ERROR: 'text-ink-bad',
+        NET:   'text-ink-info',
+      };
+      const tone = tones[level] || 'text-zinc-300';
+      line.innerHTML = `<span class="text-ink-faint">${getTimestamp()}</span> <span class="${tone} font-medium mr-2">${level}</span><span class="text-zinc-300">${escapeHTML(msg)}</span>`;
       DOM.terminal.appendChild(line);
       DOM.terminal.scrollTop = DOM.terminal.scrollHeight;
     }
 
     DOM.btnClearLogs.addEventListener('click', () => {
       DOM.terminal.innerHTML = '';
-      appendLog('INFO', 'System memory cleared manually.');
+      appendLog('INFO', 'Log buffer cleared.');
     });
 
-    setInterval(() => {
-      if(Math.random() > 0.6) {
-        const events = [
-          () => appendLog('DEBUG', 'DHT Routing sync... 32 stable vectors.'),
-          () => appendLog('NET', `Ping W-A (Local): ${Math.floor(Math.random()*20 + 5)}ms`),
-          () => appendLog('NET', `Ping W-B (Remote): ${Math.floor(Math.random()*60 + 30)}ms`),
-          () => appendLog('INFO', 'Keepalive ACKs verified from Worker Swarm.'),
-        ];
-        events[Math.floor(Math.random() * events.length)]();
-      }
-    }, 4500);
-
-    // Initial Logs
-    // Real backend connection
-    appendLog('INFO', 'Synapse Web GUI v3.0 — connecting to Rust backend.');
+    // ─── Boot ───────────────────────────────────────────────────────
+    appendLog('INFO', 'Synapse console — connecting to backend.');
     const api = new SynapseAPI();
     api.status().then(s => {
-      appendLog('NET', `GET /api/status → ${s.session.role} (peer ${s.peer_id.slice(-6)})`);
-      appendLog('INFO', `Cached models: ${s.cached_models.length}.`);
+      appendLog('NET', `GET /api/status → ${s.session.role} (peer …${s.peer_id.slice(-6)})`);
+      appendLog('DEBUG', `Cached models: ${s.cached_models.length}.`);
       if (s.cached_models.length === 0) {
-        appendLog('WARN', 'No cached models — the master will fail to start until you run `synapse demo` or `synapse host` once.');
-      } else {
-        appendLog('DEBUG', `Hardware probe complete. ${s.cached_models.length} model(s) cached locally.`);
+        appendLog('WARN', 'No cached models — run `synapse demo --model <id>` once to prime the cache.');
       }
     }).catch(e => appendLog('ERROR', `Backend unreachable: ${e.message}. Is synapse-gui running?`));
 
-    // --- Simulation Logic ---
-    const MOCK_RESPONSE = "I've processed the matrix dimensions. Implementing split-inference across the active swarm requires distributing the transformer layers strategically. I will process layers 1-16 locally to leverage the unified memory bandwidth, and stream activations for layers 17-32 to the remote CUDA instances to minimize pipeline bubbles.\n\n```rust\n// Internal routing struct\n#[derive(Serialize, Deserialize)]\nstruct TensorPayload {\n    layer_idx: u32,\n    activations: Vec<f16>,\n    codec: CodecType,\n}\n```\nPipeline armed. Awaiting configuration overrides.";
+    // Join-by-link prefill (?code=XXXX&model=<id>&addr=<optional>).
+    (function prefillJoinFromLink() {
+      const params = new URLSearchParams(window.location.search);
+      const code = params.get('code');
+      if (!code) return;
 
-    // Real "Run" handler: pick a cached model, start a master,
-    // open WS, send the prompt, stream tokens from the master.
+      const model = params.get('model');
+      const addr = params.get('addr');
+      const codeInput = document.getElementById('join-code');
+      const modelInput = document.getElementById('join-model');
+      const addrInput = document.getElementById('join-addr');
+      const statusEl = document.getElementById('join-status');
+
+      if (codeInput) codeInput.value = code.toUpperCase();
+      if (model && modelInput) modelInput.value = model;
+      if (addr && addrInput) addrInput.value = addr;
+      if (statusEl) {
+        statusEl.innerText = 'Pre-filled from invite link — run the compute test, then join.';
+        statusEl.className = 'text-[11px] text-ink-info';
+      }
+      appendLog('INFO', `Join form pre-filled from invite link.`);
+
+      const swarmTab = document.querySelector('[data-target="view-swarm"]');
+      if (swarmTab) swarmTab.click();
+    })();
+
+    // ─── Prompt flow ────────────────────────────────────────────────
     DOM.btnRun.addEventListener('click', async () => {
       const text = DOM.promptInput.value.trim();
       if (!text || state.isStreaming) return;
