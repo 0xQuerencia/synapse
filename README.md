@@ -21,3 +21,9 @@ cargo build
 ```
 
 Rust is the only requirement. Candle does the math, libp2p does the networking, and everything is tuned for the cpu you build on, so a plain build is already quick.
+
+## running a session
+
+```
+synapse host
+synapse join
