@@ -45,3 +45,7 @@ Relay and bootstrap addresses live in toml files under config. Entries must be f
 ## security
 
 Every peer is untrusted by default. Wire payloads are validated, tensor shapes and dtypes are checked, channels are bounded, and pairing codes never show up in logs after auth. Remote model paths are never accepted for execution.
+
+## status
+
+Working today: sharded inference on LAN and internet, self healing routes when a worker drops, speculative decoding, continuous batching, live telemetry. Next: true batched forward passes and smarter multi worker scheduling.
