@@ -41,3 +41,7 @@ There is also a local web interface in the gui crate. Build it, run the binary i
 ## config
 
 Relay and bootstrap addresses live in toml files under config. Entries must be full multiaddrs ending in the peer id. Placeholders are skipped at load.
+
+## security
+
+Every peer is untrusted by default. Wire payloads are validated, tensor shapes and dtypes are checked, channels are bounded, and pairing codes never show up in logs after auth. Remote model paths are never accepted for execution.
