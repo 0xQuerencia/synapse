@@ -101,3 +101,55 @@ async fn truncate_after_rejected_drafts_restores_reference_state() {
     let model = ToyLlama::load(&config, &files.weights).expect("model should load");
 
     // True continuation after prompt [1, 2, 3]: t1, t2, t3.
+    let t1: u32 = 9;
+    let t2: u32 = 17;
+    let t3: u32 = 33;
+
+    // Reference: decode t1, t2, t3 — no speculation ever happened. The
+    // captured logits predict the token *after* t3 (both paths below end
+    // with an identical cache of [1,2,3,t1,t2,t3]).
+    model.clear_kv_cache().unwrap();
+    model.forward_prefill(&token_tensor(&[1, 2, 3])).unwrap();
+    let reference_logits = {
+        model.forward_decode(&token_tensor(&[t1])).unwrap();
+        model.forward_decode(&token_tensor(&[t2])).unwrap();
+        model.forward_decode(&token_tensor(&[t3])).unwrap()
+    };
+
+    // Speculated path: prefill (cache=3), verification block [t1, t2, junk]
+    // appends 3 positions (cache=6). Verification would accept t2 but reject
+    // `junk`, so accepted=1 → target cache len = base(3) + accepted(1) + 1.
+    const BASE: usize = 3;
+    const ACCEPTED: usize = 1;
+    let target = BASE + ACCEPTED + 1;
+
+    model.clear_kv_cache().unwrap();
+    model.forward_prefill(&token_tensor(&[1, 2, 3])).unwrap();
+    model
+        .forward_layers_speculative(
+            &model.embed(&token_tensor(&[t1, t2, 31_999])).unwrap(),
+            0..config.num_hidden_layers,
+        )
+        .unwrap();
+    assert_eq!(
+        model.layer_kv_cache(0).unwrap().sequence_len().unwrap(),
+        Some(6),
+        "verification block should have been appended"
+    );
+
+    model.truncate_kv_cache(target).unwrap();
+    assert_eq!(
+        model.layer_kv_cache(0).unwrap().sequence_len().unwrap(),
+        Some(target),
+        "rollback target length"
+    );
+
+    // Feed the correction token (the true next token) and compare against
+    // the reference logits — both paths now hold [1,2,3,t1,t2,t3].
+    let corrected_logits = model.forward_decode(&token_tensor(&[t3])).unwrap();
+    assert_all_close(
+        &corrected_logits,
+        &reference_logits,
+        "post-rollback decode vs reference",
+    );
+}
