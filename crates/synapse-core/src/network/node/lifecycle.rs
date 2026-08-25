@@ -499,6 +499,9 @@ impl SynapseNode {
                 // Periodic timeout check for self-healing (Phase 9)
                 _ = timeout_interval.tick() => {
                     self.check_worker_timeouts();
+                    // Periodic refresh: catches redial countdowns and keeps
+                    // the GUI's peer panel live even when idle.
+                    self.publish_status();
                 }
             }
         }
