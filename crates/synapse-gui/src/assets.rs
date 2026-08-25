@@ -24,16 +24,24 @@ pub async fn serve_root() -> Response {
     serve_index()
 }
 
+/// Serve the worker onboarding page at a clean `/contribute` URL.
+pub async fn serve_contribute() -> Response {
+    match Assets::get("contribute.html") {
+        Some(file) => file_response("contribute.html", file),
+        None => (StatusCode::NOT_FOUND, "contribute.html missing from embed").into_response(),
+    }
+}
+
 /// Final fallback for any request that didn't match the API or WS
 /// router. We pull the path off the original request URI, try to
 /// serve a static asset, otherwise serve `index.html` (SPA
 /// fallback so any client-side route works on refresh).
 pub async fn spa_fallback(req: Request) -> Response {
     let path = req.uri().path().trim_start_matches('/');
-    if !path.is_empty() {
-        if let Some(file) = Assets::get(path) {
-            return file_response(path, file);
-        }
+    if !path.is_empty()
+        && let Some(file) = Assets::get(path)
+    {
+        return file_response(path, file);
     }
     serve_index()
 }
