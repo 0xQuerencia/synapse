@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Synapse · Contribute Compute</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: { colors: {
+      'ink-bg': '#09090b', 'ink-surface': '#0e0e11', 'ink-line': '#1f1f23',
+      'ink-fg': '#fafafa', 'ink-mute': '#9d9da8', 'ink-dim': '#55555e',
+      'ink-faint': '#3a3a41', 'ink-live': '#34d399', 'ink-info': '#7dd3fc',
+      'ink-warn': '#fbbf24',
+    }}}};
+  </script>
+  <style>
+    body { font-family: 'Inter', ui-sans-serif, system-ui, sans-serif; background:#09090b; color:#fafafa; -webkit-font-smoothing: antialiased; }
+    code, pre, .mono { font-family: 'Fira Code', ui-monospace, monospace; }
+    ::selection { background: rgba(52,211,153,.25); }
+  </style>
+</head>
+<body class="min-h-screen">
+  <div class="max-w-2xl mx-auto px-5 py-12">
+
+    <!-- Header -->
+    <div class="flex items-center gap-3 mb-3">
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+        <rect x="1.5" y="1.5" width="15" height="15" rx="3.5" stroke="#fafafa" stroke-width="1.4"/>
+        <circle cx="9" cy="9" r="2.2" fill="#34d399"/>
+      </svg>
+      <h1 class="text-xl font-semibold tracking-tight">Contribute your compute</h1>
+    </div>
+    <p class="text-ink-dim text-[13px] mb-8 leading-relaxed">
+      Your machine runs part of the model and shares the work. This takes a real program —
+      a browser tab can't compute — but it's three steps.
+    </p>
+
+    <!-- Live host status -->
+    <div id="status-card" class="border border-ink-line rounded-xl p-5 mb-8 bg-ink-surface">
+      <div class="flex justify-between items-center mb-4">
+        <span class="text-[10px] mono uppercase tracking-widest text-ink-dim">host status</span>
+        <span id="status-pill" class="text-[10px] mono px-2 py-0.5 rounded border border-ink-faint/50 text-ink-dim">checking…</span>
+      </div>
+      <div class="grid grid-cols-2 gap-4 text-sm mono">
+        <div>
+          <div class="text-[10px] uppercase tracking-wider text-ink-faint mb-1">model</div>
+          <div id="info-model" class="text-ink-fg break-all text-[13px]">—</div>
+        </div>
+        <div>
+          <div class="text-[10px] uppercase tracking-wider text-ink-faint mb-1">pairing code</div>
+          <div class="flex items-center gap-2">
+            <code id="info-code" class="text-ink-live tracking-[0.25em]">--------</code>
+            <button id="copy-code" class="text-[11px] text-ink-dim hover:text-ink-fg border border-ink-line rounded px-2 py-0.5 transition-colors">copy</button>
+          </div>
+        </div>
+      </div>
+      <div id="info-reason" class="mt-4 text-[12px] text-ink-warn hidden"></div>
+    </div>
+
+    <!-- Steps -->
+    <div class="space-y-4">
+
+      <!-- Step 1 -->
+      <div class="border border-ink-line rounded-xl p-5 bg-ink-surface">
+        <div class="flex items-center gap-3 mb-3">
+          <span class="w-6 h-6 shrink-0 rounded-full border border-ink-lineHi text-ink-mute flex items-center justify-center font-medium text-[11px] mono">1</span>
+          <h3 class="font-semibold text-[14px]">Get Synapse on your machine</h3>
+        </div>
+        <p class="text-ink-dim text-[13px] mb-3">Clone and build it (needs Rust). One-time setup.</p>
+        <pre class="bg-black/60 border border-ink-line rounded-lg p-3 text-[12px] text-zinc-300 overflow-x-auto">git clone https://github.com/rickyparmar-bot/synapse.git
+cd synapse
+cargo build --release -p synapse-gui</pre>
+        <p class="text-ink-faint text-[11px] mt-2">No Rust? Install via <code class="text-ink-mute">https://rustup.rs</code> first.</p>
+      </div>
+
+      <!-- Step 2 -->
+      <div class="border border-ink-line rounded-xl p-5 bg-ink-surface">
+        <div class="flex items-center gap-3 mb-3">
+          <span class="w-6 h-6 shrink-0 rounded-full border border-ink-lineHi text-ink-mute flex items-center justify-center font-medium text-[11px] mono">2</span>
+          <h3 class="font-semibold text-[14px]">Open your own Synapse GUI</h3>
