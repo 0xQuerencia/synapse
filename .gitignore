@@ -39,10 +39,3 @@
 /.github/copilot-instructions.md
 /docs/AI_CONTEXT.md
 /docs/skills/
-
-# agent instruction files stay local
-/AGENTS.md
-/GEMINI.md
-/.github/copilot-instructions.md
-/docs/AI_CONTEXT.md
-/docs/skills/
