@@ -1072,41 +1072,40 @@
           DOM.metricOrig.innerText = `${orig.toFixed(2)} MB`;
           DOM.metricComp.innerText = `${comp} MB`;
           const percentSaved = Math.round((1 - ratio) * 100);
-          DOM.badgeSavings.innerText = `-${percentSaved}%`;
+          DOM.badgeSavings.innerText = `−${percentSaved}%`;
           DOM.barSavings.style.width = `${percentSaved}%`;
         } else if (role === 'worker') {
-          DOM.metricOrig.innerText = '--';
-          DOM.metricComp.innerText = '--';
-          DOM.badgeSavings.innerText = 'OFF';
+          DOM.metricOrig.innerText = '—';
+          DOM.metricComp.innerText = '—';
+          DOM.badgeSavings.innerText = 'off';
           DOM.barSavings.style.width = '0%';
         }
-        this.onStatus?.(s);
+
+        const shareBox = document.getElementById('pairing-share');
+        const codeVal = document.getElementById('pairing-code-value');
+        if (shareBox && codeVal) {
+          if (role === 'master' && s.session && s.session.pairing_code) {
+            codeVal.innerText = s.session.pairing_code;
+            shareBox.classList.remove('hidden');
+          } else {
+            shareBox.classList.add('hidden');
+          }
+        }
+
+        api.onStatus && api.onStatus(s);
       } catch (e) {
-        // Backend is down — just keep the page alive.
         DOM.metricPing.innerText = 'down';
+      }
+
+      try {
+        const peerData = await api.peers();
+        renderPeers(peerData);
+      } catch (e) {
+        renderPeers(null);
       }
     }
 
-    function finishInferenceSimulation(dotInterval) {
-      state.isStreaming = false;
-      DOM.btnRun.disabled = false;
-      DOM.promptInput.disabled = false;
-      DOM.promptInput.focus();
-      
-      clearInterval(state.simInterval);
-      clearInterval(dotInterval);
-      
-      DOM.edgesAnim.forEach(e => e.classList.add('hidden'));
-      
-      DOM.dots.forEach(d => {
-        d.className = d.className.replace('scale-125', '').replace(/shadow-neon-[a-z]+/, '');
-        d.style.backgroundColor = 'transparent';
-      });
-      
-      DOM.metricPing.innerText = '-- ms';
-      appendLog('INFO', `Pipeline execution completed. Wait for next trace.`);
-    }
-
+    setInterval(updateTelemetryLive, 2000);
   </script>
 </body>
 </html>
