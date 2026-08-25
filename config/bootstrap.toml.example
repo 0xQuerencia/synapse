@@ -1,0 +1,6 @@
+# DHT bootstrap peers for global discovery when no relay is reachable.
+# Same rule as relays: full multiaddrs ending in /p2p/<peer-id>.
+# Placeholders are skipped at load time.
+bootstrap = [
+  "/dns4/your-bootstrap.example.com/udp/4001/quic-v1/p2p/12D3KooWExample",
+]
