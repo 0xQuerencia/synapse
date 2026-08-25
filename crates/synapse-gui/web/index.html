@@ -1,780 +1,462 @@
-
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Synapse - Advanced P2P AI Network</title>
-  
-  <!-- Google Fonts for better typography -->
+  <title>Synapse</title>
+
+  <!-- Typography -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@300;400;500;600&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-  
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
-  
+
   <!-- Lucide Icons -->
   <script src="https://unpkg.com/lucide@latest"></script>
-  
+
   <script>
     tailwind.config = {
-      darkMode: 'class',
       theme: {
         extend: {
           colors: {
-            app: {
-              bg: '#030305',
-              panel: '#0a0a0e',
-              panelHover: '#121218',
-              fg: '#f4f4f5',
-              muted: '#a1a1aa',
-              dim: '#52525b',
-              border: '#1f1f2e',
-              borderHover: '#2d2d3d',
-              cyan: '#06b6d4',
-              cyanGlow: 'rgba(6, 182, 212, 0.4)',
-              emerald: '#10b981',
-              emeraldGlow: 'rgba(16, 185, 129, 0.4)',
-              violet: '#8b5cf6',
-              violetGlow: 'rgba(139, 92, 246, 0.4)',
-              amber: '#f59e0b',
-              amberGlow: 'rgba(245, 158, 11, 0.4)',
-              red: '#ef4444'
+            ink: {
+              bg: '#09090b',
+              surface: '#0e0e11',
+              raise: '#141418',
+              line: '#1f1f23',
+              lineHi: '#2e2e33',
+              fg: '#fafafa',
+              mute: '#9d9da8',
+              dim: '#55555e',
+              faint: '#3a3a41',
+              live: '#34d399',
+              info: '#7dd3fc',
+              warn: '#fbbf24',
+              bad: '#f87171',
             }
           },
           fontFamily: {
-            mono: ['"Fira Code"', 'monospace'],
-            sans: ['Inter', 'sans-serif'],
+            mono: ['"Fira Code"', 'ui-monospace', 'monospace'],
+            sans: ['Inter', 'system-ui', 'sans-serif'],
           },
-          backgroundImage: {
-            'cyber-grid': 'linear-gradient(to right, #1f1f2e 1px, transparent 1px), linear-gradient(to bottom, #1f1f2e 1px, transparent 1px)',
-            'radial-glow': 'radial-gradient(circle at top center, rgba(139, 92, 246, 0.15), transparent 40%)',
-          },
-          boxShadow: {
-            'neon-violet': '0 0 15px rgba(139, 92, 246, 0.3)',
-            'neon-emerald': '0 0 15px rgba(16, 185, 129, 0.3)',
-            'neon-cyan': '0 0 15px rgba(6, 182, 212, 0.3)',
-            'glass': '0 4px 30px rgba(0, 0, 0, 0.5)',
-          }
         }
       }
     }
   </script>
-  <style>
-    /* Custom Scrollbar */
-    ::-webkit-scrollbar { width: 6px; height: 6px; }
+  <style type="text/tailwindcss">
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: #1f1f2e; border-radius: 3px; }
-    ::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+    ::-webkit-scrollbar-thumb { background: #232328; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #333338; }
+
+    html, body { height: 100%; }
 
     body {
-      background-color: #030305;
-      color: #f4f4f5;
-      /* Background ambient glow */
-      background-image: radial-gradient(circle at 50% 0%, rgba(139, 92, 246, 0.08), transparent 40%),
-                        radial-gradient(circle at 100% 100%, rgba(6, 182, 212, 0.05), transparent 40%);
-      background-attachment: fixed;
+      background: #09090b;
+      color: #fafafa;
+      -webkit-font-smoothing: antialiased;
     }
 
-    /* Glass Panels */
-    .glass-panel {
-      background: rgba(10, 10, 14, 0.7);
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-      box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+    /* Sidebar navigation */
+    .nav-item { @apply w-full flex items-center gap-3 px-3 py-2 rounded-md text-[13px] font-medium text-ink-dim hover:text-ink-fg hover:bg-white/[0.04] transition-colors; }
+    .nav-item.active { @apply bg-white/[0.06] text-ink-fg; }
+
+    /* Flat inputs */
+    .field {
+      @apply w-full bg-transparent border border-ink-line rounded-md px-2.5 py-1.5 text-ink-fg placeholder:text-ink-faint focus:outline-none focus:border-ink-lineHi transition-colors;
     }
-    
-    .glass-panel-heavy {
-      background: rgba(5, 5, 8, 0.85);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-      border: 1px solid rgba(255, 255, 255, 0.03);
+    .btn-ghost {
+      @apply border border-ink-line rounded-md text-ink-mute hover:text-ink-fg hover:bg-white/[0.04] transition-colors;
     }
 
-    /* Grid Backgrounds */
-    .bg-grid {
-      background-size: 40px 40px;
-      background-image: linear-gradient(to right, rgba(255, 255, 255, 0.02) 1px, transparent 1px),
-                        linear-gradient(to bottom, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+    /* Streaming caret */
+    .caret {
+      display: inline-block;
+      width: 2px;
+      height: 1em;
+      background: #fafafa;
+      margin-left: 2px;
+      vertical-align: text-bottom;
+      animation: blink 1s step-end infinite;
     }
+    @keyframes blink { 50% { opacity: 0; } }
 
-    /* SVG Animations & Filters */
+    /* Active packet flow along swarm edges */
     @keyframes flow {
       from { stroke-dashoffset: 24; }
       to { stroke-dashoffset: 0; }
     }
     .animate-flow {
-      stroke-dasharray: 4 4;
-      animation: flow 0.8s linear infinite;
-    }
-    
-    @keyframes pulse-ring {
-      0% { transform: scale(0.8); opacity: 0.5; stroke-width: 1px; }
-      50% { transform: scale(1.3); opacity: 1; stroke-width: 2px; }
-      100% { transform: scale(0.8); opacity: 0.5; stroke-width: 1px; }
-    }
-    .animate-pulse-ring {
-      animation: pulse-ring 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-      transform-origin: center;
-    }
-
-    .node-glow-violet { filter: drop-shadow(0 0 12px rgba(139, 92, 246, 0.8)); }
-    .node-glow-emerald { filter: drop-shadow(0 0 10px rgba(16, 185, 129, 0.6)); }
-    .node-glow-amber { filter: drop-shadow(0 0 10px rgba(245, 158, 11, 0.6)); }
-
-    /* Typing Cursor */
-    .cursor-blink {
-      display: inline-block;
-      width: 8px;
-      height: 18px;
-      background-color: #10b981;
-      box-shadow: 0 0 8px rgba(16, 185, 129, 0.8);
-      animation: blink 1s step-end infinite;
-      vertical-align: text-bottom;
-      margin-left: 6px;
-    }
-    @keyframes blink { 50% { opacity: 0; } }
-
-    /* Fancy Borders */
-    .border-gradient-violet {
-      position: relative;
-    }
-    .border-gradient-violet::before {
-      content: "";
-      position: absolute;
-      inset: -1px;
-      border-radius: inherit;
-      padding: 1px;
-      background: linear-gradient(135deg, rgba(139, 92, 246, 0.5), transparent 60%);
-      -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-      -webkit-mask-composite: xor;
-      mask-composite: exclude;
-      pointer-events: none;
-    }
-
-    /* Terminal Scanlines */
-    .scanlines {
-      position: relative;
-    }
-    .scanlines::after {
-      content: " ";
-      display: block;
-      position: absolute;
-      top: 0;
-      left: 0;
-      bottom: 0;
-      right: 0;
-      background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
-      z-index: 10;
-      background-size: 100% 4px, 6px 100%;
-      pointer-events: none;
+      stroke-dasharray: 5 7;
+      animation: flow 1.2s linear infinite;
     }
   </style>
 </head>
-<body class="h-screen w-screen overflow-hidden flex font-sans text-sm antialiased selection:bg-app-violet selection:text-white">
+<body class="h-screen overflow-hidden flex font-sans text-sm">
 
-  <!-- LEFT SIDEBAR -->
-  <aside class="w-[260px] border-r border-app-border glass-panel-heavy flex flex-col z-20 flex-shrink-0 hidden md:flex shadow-xl relative">
-    <!-- Subtle top glow -->
-    <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-transparent via-app-violet/50 to-transparent opacity-50"></div>
-
-    <div class="h-16 flex items-center px-6 border-b border-app-border">
-      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-app-violet/30 to-app-bg border border-app-violet/50 shadow-neon-violet flex items-center justify-center mr-3 relative overflow-hidden">
-        <i data-lucide="hexagon" class="w-4 h-4 text-app-violet z-10"></i>
-      </div>
-      <div class="flex flex-col">
-        <span class="font-bold tracking-widest text-[15px] bg-clip-text text-transparent bg-gradient-to-r from-white to-app-muted">SYNAPSE</span>
-        <span class="text-[9px] font-mono text-app-cyan tracking-widest uppercase">P2P Kernel v2.1</span>
+  <!-- ─── SIDEBAR ──────────────────────────────────────────────────────── -->
+  <aside class="w-[232px] shrink-0 hidden md:flex flex-col border-r border-ink-line bg-ink-bg">
+    <div class="h-14 flex items-center gap-2.5 px-5 border-b border-ink-line">
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+        <rect x="1.5" y="1.5" width="15" height="15" rx="3.5" stroke="#fafafa" stroke-width="1.4"/>
+        <circle cx="9" cy="9" r="2.2" fill="#34d399"/>
+      </svg>
+      <div class="flex items-baseline gap-2">
+        <span class="font-semibold tracking-wide text-[13px]">Synapse</span>
+        <span class="font-mono text-[10px] text-ink-faint">v0.3</span>
       </div>
     </div>
 
-    <!-- Navigation -->
-    <nav class="flex-1 px-3 py-6 space-y-2" id="nav-menu">
-      <div class="text-[10px] font-mono text-app-dim uppercase tracking-widest px-3 mb-2">Workspaces</div>
-      
-      <button data-target="view-chat" class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg bg-gradient-to-r from-app-violet/20 to-transparent text-app-violet border-l-2 border-app-violet shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] nav-btn group transition-all">
-        <i data-lucide="cpu" class="w-4 h-4 group-hover:drop-shadow-[0_0_5px_rgba(139,92,246,0.8)] transition-all"></i>
-        <span class="font-medium">Inference Matrix</span>
+    <nav class="flex-1 px-3 py-4 space-y-1" id="nav-menu">
+      <button data-target="view-chat" class="nav-btn nav-item active">
+        <i data-lucide="message-square" class="w-4 h-4 shrink-0"></i>
+        <span>Console</span>
       </button>
-      
-      <button data-target="view-swarm" class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-app-muted hover:text-app-fg hover:bg-app-panelHover border-l-2 border-transparent nav-btn group transition-all">
-        <i data-lucide="network" class="w-4 h-4 group-hover:text-app-cyan transition-colors"></i>
-        <span class="font-medium">Swarm Topology</span>
+      <button data-target="view-swarm" class="nav-btn nav-item">
+        <i data-lucide="network" class="w-4 h-4 shrink-0"></i>
+        <span>Network</span>
       </button>
-      
-      <button data-target="view-hardware" class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-app-muted hover:text-app-fg hover:bg-app-panelHover border-l-2 border-transparent nav-btn group transition-all">
-        <i data-lucide="server" class="w-4 h-4 group-hover:text-app-emerald transition-colors"></i>
-        <span class="font-medium">Hardware Registry</span>
+      <button data-target="view-hardware" class="nav-btn nav-item">
+        <i data-lucide="server" class="w-4 h-4 shrink-0"></i>
+        <span>Nodes</span>
       </button>
-      
-      <div class="text-[10px] font-mono text-app-dim uppercase tracking-widest px-3 mt-6 mb-2">System</div>
 
-      <button data-target="view-logs" class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-app-muted hover:text-app-fg hover:bg-app-panelHover border-l-2 border-transparent nav-btn group transition-all">
-        <i data-lucide="terminal-square" class="w-4 h-4 group-hover:text-app-fg transition-colors"></i>
-        <span class="font-medium">Diagnostic Logs</span>
+      <div class="pt-5 pb-1 px-3 text-[10px] font-medium uppercase tracking-widest text-ink-faint">System</div>
+      <button data-target="view-logs" class="nav-btn nav-item">
+        <i data-lucide="terminal" class="w-4 h-4 shrink-0"></i>
+        <span>Logs</span>
       </button>
     </nav>
 
-    <!-- Global Network Status -->
-    <div class="p-5 border-t border-app-border bg-app-panel/50 space-y-4 font-mono text-[11px] relative overflow-hidden">
-      <!-- Glow effect behind stats -->
-      <div class="absolute -right-4 -bottom-4 w-24 h-24 bg-app-emerald/10 rounded-full blur-2xl pointer-events-none"></div>
-
-      <div>
-        <div class="flex justify-between text-app-muted mb-1.5 uppercase tracking-wider text-[9px]">
-          <span>DHT State</span>
-          <span class="text-app-emerald drop-shadow-[0_0_2px_rgba(16,185,129,0.8)]">SYNCED</span>
-        </div>
-        <div class="flex items-center gap-2">
-          <div class="w-1.5 h-1.5 rounded-full bg-app-emerald shadow-[0_0_8px_rgba(16,185,129,1)] animate-pulse"></div>
-          <span class="text-app-fg font-medium">32 Peers Online</span>
-        </div>
+    <div class="px-5 py-4 border-t border-ink-line space-y-3">
+      <div class="flex items-center gap-2">
+        <span id="status-dot" class="w-1.5 h-1.5 rounded-full bg-ink-live"></span>
+        <span class="text-xs text-ink-mute" id="peer-count-label">0 peers online</span>
       </div>
-      
-      <div class="pt-2 border-t border-app-border/50">
-        <div class="flex justify-between text-app-muted mb-1.5 uppercase tracking-wider text-[9px]">
-          <span>Swarm Compute</span>
-        </div>
-        <div class="text-app-cyan text-sm font-semibold drop-shadow-[0_0_3px_rgba(6,182,212,0.5)]">4,285 TFLOPS</div>
+      <div class="flex items-center justify-between text-xs">
+        <span class="text-ink-dim">swarm</span>
+        <span class="font-mono text-ink-mute" id="dht-state-label">local</span>
       </div>
     </div>
   </aside>
 
-  <!-- MAIN CONTENT AREA -->
-  <main class="flex-1 flex flex-col min-w-0 bg-transparent relative z-10">
-    
-    <!-- HEADER -->
-    <header class="h-16 border-b border-app-border/80 flex items-center justify-between px-6 glass-panel z-20 flex-shrink-0 shadow-sm">
-      <div class="flex items-center gap-4">
-        <button class="md:hidden text-app-muted hover:text-app-fg p-2 -ml-2 rounded-md hover:bg-app-border">
-          <i data-lucide="menu" class="w-5 h-5"></i>
-        </button>
-        <h1 id="header-title" class="text-lg font-semibold text-white tracking-wide drop-shadow-md">Inference Matrix</h1>
-      </div>
-      
-      <div class="flex items-center gap-5">
-        <!-- Compression Selector -->
-        <div class="flex items-center gap-2 bg-app-bg/80 border border-app-border rounded-lg p-1 shadow-inner">
-          <button id="codec-lz4" class="px-3 py-1.5 text-xs font-mono font-semibold rounded-md bg-app-panel border border-app-borderHover text-app-cyan shadow-sm transition-all">LZ4</button>
-          <button id="codec-zstd" class="px-3 py-1.5 text-xs font-mono font-medium rounded-md text-app-muted hover:text-app-fg transition-all">ZSTD</button>
+  <!-- ─── MAIN ─────────────────────────────────────────────────────────── -->
+  <main class="flex-1 flex flex-col min-w-0">
+
+    <header class="h-14 shrink-0 border-b border-ink-line flex items-center justify-between px-6 gap-4">
+      <h1 id="header-title" class="text-[14px] font-semibold tracking-tight">Console</h1>
+
+      <div class="flex items-center gap-3">
+        <!-- Codec segmented control -->
+        <div class="hidden sm:flex items-center border border-ink-line rounded-md p-0.5">
+          <button id="codec-lz4" class="px-2.5 py-1 text-[11px] font-mono rounded [background:#1c1c21] text-ink-fg transition-colors">LZ4</button>
+          <button id="codec-zstd" class="px-2.5 py-1 text-[11px] font-mono rounded text-ink-dim hover:text-ink-mute transition-colors">ZSTD</button>
         </div>
-        
-        <div class="h-5 w-px bg-app-border"></div>
-        
-        <!-- Active Model Badge -->
-        <div class="flex items-center gap-2 text-xs font-mono border border-app-border/80 bg-app-bg/50 px-3 py-1.5 rounded-lg shadow-sm">
-          <div class="w-1.5 h-1.5 rounded-full bg-app-violet shadow-[0_0_5px_rgba(139,92,246,0.8)]"></div>
-          <span class="text-app-muted">Model:</span>
-          <span class="text-white font-medium">Llama-3-8B</span>
+
+        <div class="hidden sm:block h-4 w-px bg-ink-line"></div>
+
+        <div class="flex items-center gap-2 text-xs">
+          <span class="w-1.5 h-1.5 rounded-full bg-ink-live"></span>
+          <span class="font-mono text-ink-mute truncate max-w-[180px]" id="header-model">—</span>
         </div>
       </div>
     </header>
 
-    <!-- VIEWS CONTAINER -->
-    <div class="flex-1 overflow-hidden relative">
+    <div class="flex-1 relative overflow-hidden">
 
-      <!-- VIEW 1: CHAT & TELEMETRY -->
+      <!-- ═══ VIEW: CONSOLE ═══ -->
       <div id="view-chat" class="absolute inset-0 flex flex-col lg:flex-row view-section">
-        
-        <!-- Chat Area -->
-        <div class="flex-1 flex flex-col border-r border-app-border min-w-0 bg-app-bg/40 relative">
-          <!-- Background Pattern -->
-          <div class="absolute inset-0 bg-grid opacity-30 pointer-events-none"></div>
-          
-          <div id="chat-history" class="flex-1 overflow-y-auto p-6 space-y-8 relative z-10 scroll-smooth">
-            
-            <!-- Bot Message -->
-            <div class="flex gap-4 max-w-3xl">
-              <div class="w-10 h-10 rounded-xl bg-gradient-to-b from-app-panel to-app-bg border border-app-border shadow-md flex items-center justify-center flex-shrink-0 relative">
-                <div class="absolute inset-0 rounded-xl border border-app-violet/30 mix-blend-overlay"></div>
-                <i data-lucide="cpu" class="w-5 h-5 text-app-violet"></i>
-              </div>
-              <div class="space-y-1.5 pt-1">
-                <div class="flex items-center gap-2 mb-2">
-                  <span class="text-[10px] font-mono font-semibold text-app-violet uppercase tracking-wider bg-app-violet/10 px-2 py-0.5 rounded">SYS-NODE-01</span>
-                  <span class="text-[10px] font-mono text-app-dim">00:00:01</span>
-                </div>
-                <div class="text-app-fg text-[15px] leading-relaxed font-sans glass-panel px-5 py-4 rounded-2xl rounded-tl-sm shadow-sm border-app-border/50">
-                  Synapse Network initialized. Split-inference pipeline is armed and routed across <span class="text-app-emerald font-mono text-xs border border-app-emerald/30 bg-app-emerald/10 px-1 rounded mx-0.5">4 nodes</span>.<br><br>Awaiting prompt injection.
-                </div>
+
+        <!-- Conversation -->
+        <section class="flex-1 flex flex-col min-w-0 border-b lg:border-b-0 lg:border-r border-ink-line">
+          <div id="chat-history" class="flex-1 overflow-y-auto px-6 py-8 scroll-smooth">
+            <div class="max-w-3xl mx-auto space-y-7" id="chat-thread">
+              <div class="text-center pt-10">
+                <p class="text-ink-dim text-[13px]">Send a prompt to start generating.</p>
+                <p class="text-ink-faint text-[11px] font-mono mt-1.5">tokens stream across the swarm in real time</p>
               </div>
             </div>
+          </div>
+
+          <!-- Composer -->
+          <div class="shrink-0 px-6 pb-6 pt-2">
+            <div class="max-w-3xl mx-auto">
+              <div class="flex items-end border border-ink-line rounded-xl bg-ink-surface focus-within:border-ink-lineHi transition-colors">
+                <textarea id="prompt-input" rows="1" placeholder="Message the swarm…"
+                  class="flex-1 bg-transparent resize-none px-4 py-3.5 text-[14px] leading-relaxed text-ink-fg placeholder:text-ink-faint focus:outline-none min-h-[52px] max-h-40"></textarea>
+                <button id="btn-run" aria-label="Run"
+                  class="m-2 w-9 h-9 shrink-0 flex items-center justify-center rounded-lg bg-ink-fg text-black hover:bg-zinc-300 disabled:opacity-30 disabled:pointer-events-none transition-all">
+                  <i data-lucide="arrow-up" class="w-4 h-4"></i>
+                </button>
+              </div>
+              <div class="mt-2 px-1 flex items-center gap-3 text-[10px] font-mono text-ink-faint">
+                <span><kbd class="px-1 py-px border border-ink-line rounded">↵</kbd> send</span>
+                <span><kbd class="px-1 py-px border border-ink-line rounded">⇧↵</kbd> newline</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Telemetry rail -->
+        <aside class="w-full lg:w-[320px] shrink-0 overflow-y-auto border-t lg:border-t-0 lg:border-l border-ink-line bg-ink-bg">
+          <div class="p-5 space-y-0 divide-y divide-ink-line">
+
+            <section class="pb-5">
+              <h2 class="text-[10px] font-medium uppercase tracking-widest text-ink-dim mb-4">Throughput</h2>
+              <div class="grid grid-cols-2 gap-4">
+                <div>
+                  <div class="flex items-baseline gap-1">
+                    <span id="metric-ts" class="text-[26px] font-light tabular-nums leading-none">0.0</span>
+                    <span class="text-[10px] text-ink-dim">tok/s</span>
+                  </div>
+                  <div class="mt-1.5 text-[10px] uppercase tracking-wider text-ink-dim">speed</div>
+                </div>
+                <div>
+                  <div class="flex items-baseline gap-1">
+                    <span id="metric-ttft" class="text-[26px] font-light tabular-nums leading-none">—</span>
+                    <span class="text-[10px] text-ink-dim">ms</span>
+                  </div>
+                  <div class="mt-1.5 text-[10px] uppercase tracking-wider text-ink-dim">first token</div>
+                </div>
+              </div>
+            </section>
+
+            <section class="py-5">
+              <div class="flex items-center justify-between mb-4">
+                <h2 class="text-[10px] font-medium uppercase tracking-widest text-ink-dim">Wire savings</h2>
+                <span id="badge-savings" class="text-[11px] font-mono text-ink-live">—%</span>
+              </div>
+              <div class="space-y-2 text-xs">
+                <div class="flex justify-between">
+                  <span class="text-ink-dim">raw tensor</span>
+                  <span class="font-mono text-ink-mute tabular-nums" id="metric-orig">— MB</span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-ink-dim">transmitted</span>
+                  <span class="font-mono text-ink-live tabular-nums" id="metric-comp">— MB</span>
+                </div>
+              </div>
+              <div class="mt-3 h-1 rounded-full bg-ink-line overflow-hidden">
+                <div id="bar-savings" class="h-full bg-ink-live rounded-full transition-all duration-300" style="width:0%"></div>
+              </div>
+            </section>
+
+            <section class="py-5">
+              <h2 class="text-[10px] font-medium uppercase tracking-widest text-ink-dim mb-4">Pipeline</h2>
+              <div class="relative pl-5 space-y-5">
+                <div class="absolute left-[3px] top-1.5 bottom-1.5 w-px bg-ink-line"></div>
+
+                <div class="relative">
+                  <span id="step1-dot" class="absolute -left-5 top-1 w-[7px] h-[7px] rounded-full border border-ink-lineHi bg-ink-bg"></span>
+                  <div class="text-[13px] text-ink-fg">Master draft</div>
+                  <div class="text-[11px] text-ink-dim mt-0.5">speculative tokens</div>
+                </div>
+                <div class="relative">
+                  <span id="step2-dot" class="absolute -left-5 top-1 w-[7px] h-[7px] rounded-full border border-ink-lineHi bg-ink-bg"></span>
+                  <div class="flex items-start justify-between gap-2">
+                    <div>
+                      <div class="text-[13px] text-ink-fg">Network hop</div>
+                      <div class="text-[11px] text-ink-dim mt-0.5">quic transport</div>
+                    </div>
+                    <span id="metric-ping" class="font-mono text-[10px] text-ink-dim tabular-nums mt-0.5">— ms</span>
+                  </div>
+                </div>
+                <div class="relative">
+                  <span id="step3-dot" class="absolute -left-5 top-1 w-[7px] h-[7px] rounded-full border border-ink-lineHi bg-ink-bg"></span>
+                  <div class="text-[13px] text-ink-fg">Worker compute</div>
+                  <div class="text-[11px] text-ink-dim mt-0.5">kv cache forward</div>
+                </div>
+                <div class="relative">
+                  <span id="step4-dot" class="absolute -left-5 top-1 w-[7px] h-[7px] rounded-full border border-ink-lineHi bg-ink-bg"></span>
+                  <div class="text-[13px] text-ink-fg">Sampling</div>
+                  <div class="text-[11px] text-ink-dim mt-0.5">logits → tokens</div>
+                </div>
+              </div>
+            </section>
 
           </div>
-          
-          <!-- Prompt Input -->
-          <div class="p-6 bg-gradient-to-t from-app-bg to-transparent relative z-20">
-            <div class="max-w-4xl mx-auto relative group">
-              <!-- Glow behind input -->
-              <div class="absolute -inset-0.5 bg-gradient-to-r from-app-violet/20 via-app-cyan/20 to-app-violet/20 rounded-xl blur opacity-30 group-focus-within:opacity-70 transition duration-500"></div>
-              
-              <div class="relative glass-panel rounded-xl flex items-end shadow-lg border-app-borderHover/80">
-                <textarea id="prompt-input" rows="1" placeholder="Inject prompt sequence..." class="w-full bg-transparent border-0 text-app-fg placeholder:text-app-dim focus:ring-0 p-4 min-h-[56px] resize-none font-sans text-[15px] leading-relaxed"></textarea>
-                <div class="p-2">
-                  <button id="btn-run" class="w-10 h-10 flex items-center justify-center bg-white text-black hover:bg-app-fg rounded-lg transition-transform hover:scale-105 active:scale-95 disabled:opacity-50 disabled:hover:scale-100 shadow-[0_0_15px_rgba(255,255,255,0.2)]">
-                    <i data-lucide="arrow-up" class="w-5 h-5"></i>
+        </aside>
+      </div>
+
+      <!-- ═══ VIEW: NETWORK ═══ -->
+      <div id="view-swarm" class="absolute inset-0 hidden view-section flex-col md:flex-row z-10">
+
+        <section class="flex-1 relative border-b md:border-b-0 md:border-r border-ink-line overflow-hidden min-h-[380px]">
+          <svg class="w-full h-full" viewBox="0 0 800 600" preserveAspectRatio="xMidYMid meet">
+            <!-- Edges -->
+            <path d="M400,300 L210,160" stroke="#1f1f23" stroke-width="1" />
+            <path d="M400,300 L590,170" stroke="#1f1f23" stroke-width="1" />
+            <path d="M400,300 L250,470" stroke="#1f1f23" stroke-width="1" />
+            <path d="M400,300 L550,450" stroke="#1f1f23" stroke-width="1" />
+
+            <!-- Animated packet streams (toggled by generation) -->
+            <g class="animate-flow-group hidden">
+              <path class="edge-anim animate-flow" d="M400,300 L210,160" stroke="#34d399" stroke-width="1.25" fill="none"/>
+              <path class="edge-anim animate-flow" d="M400,300 L590,170" stroke="#34d399" stroke-width="1.25" fill="none"/>
+              <path class="edge-anim animate-flow" d="M400,300 L250,470" stroke="#34d399" stroke-width="1.25" fill="none"/>
+              <path class="edge-anim animate-flow" d="M400,300 L550,450" stroke="#34d399" stroke-width="1.25" fill="none"/>
+            </g>
+
+            <!-- Workers -->
+            <g>
+              <circle cx="210" cy="160" r="20" fill="#0e0e11" stroke="#34d399" stroke-width="1.25"/>
+              <text x="210" y="164" font-family="'Fira Code',monospace" font-size="10" fill="#d4d4d8" text-anchor="middle">W-A</text>
+            </g>
+            <g>
+              <circle cx="590" cy="170" r="20" fill="#0e0e11" stroke="#34d399" stroke-width="1.25"/>
+              <text x="590" y="174" font-family="'Fira Code',monospace" font-size="10" fill="#d4d4d8" text-anchor="middle">W-B</text>
+            </g>
+            <g>
+              <circle cx="250" cy="470" r="20" fill="#0e0e11" stroke="#55555e" stroke-width="1.25"/>
+              <text x="250" y="474" font-family="'Fira Code',monospace" font-size="10" fill="#d4d4d8" text-anchor="middle">W-C</text>
+            </g>
+            <g>
+              <circle cx="550" cy="450" r="20" fill="#0e0e11" stroke="#34d399" stroke-width="1.25"/>
+              <text x="550" y="454" font-family="'Fira Code',monospace" font-size="10" fill="#d4d4d8" text-anchor="middle">W-D</text>
+            </g>
+
+            <!-- Master -->
+            <g>
+              <circle cx="400" cy="300" r="38" fill="none" stroke="#2e2e33" stroke-width="1"/>
+              <circle cx="400" cy="300" r="27" fill="#09090b" stroke="#fafafa" stroke-width="1.5"/>
+              <text x="400" y="304" font-family="'Fira Code',monospace" font-size="11" fill="#fafafa" text-anchor="middle">M</text>
+            </g>
+          </svg>
+        </section>
+
+        <!-- Right column -->
+        <aside class="w-full md:w-[340px] shrink-0 overflow-y-auto">
+          <div class="p-5 space-y-0 divide-y divide-ink-line">
+
+            <section class="pb-5">
+              <h2 class="text-[10px] font-medium uppercase tracking-widest text-ink-dim mb-4">Node inspector</h2>
+              <div class="space-y-2.5 text-xs">
+                <div class="flex justify-between">
+                  <span class="text-ink-dim">selected</span>
+                  <span class="text-ink-fg">master-01 <span class="ml-1 text-[10px] text-ink-dim">local</span></span>
+                </div>
+                <div class="flex justify-between items-center gap-3">
+                  <span class="text-ink-dim shrink-0">peer id</span>
+                  <span class="font-mono text-[10px] text-ink-mute truncate">QmYyQSo1c1Ym7orWxLYvCrM2</span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-ink-dim">nat</span>
+                  <span class="text-ink-live">open · autonat</span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-ink-dim">streams</span>
+                  <span class="font-mono text-ink-mute tabular-nums">14</span>
+                </div>
+              </div>
+            </section>
+
+            <!-- Pairing + contribution -->
+            <section class="py-5 space-y-4">
+              <div class="flex items-center gap-2">
+                <i data-lucide="link" class="w-3.5 h-3.5 text-ink-mute"></i>
+                <h2 class="text-[10px] font-medium uppercase tracking-widest text-ink-dim">Connect by code</h2>
+              </div>
+
+              <!-- Shown while hosting -->
+              <div id="pairing-share" class="hidden space-y-2">
+                <div class="text-[10px] uppercase tracking-wider text-ink-dim">your pairing code</div>
+                <div class="flex items-center gap-2">
+                  <code id="pairing-code-value" class="flex-1 text-center font-mono text-base tracking-[0.3em] text-ink-live border border-ink-line rounded-md py-2 bg-ink-surface">--------</code>
+                  <button id="btn-copy-code" class="btn-ghost px-2.5 py-2" title="Copy code">
+                    <i data-lucide="copy" class="w-3.5 h-3.5"></i>
                   </button>
                 </div>
               </div>
-              <div class="absolute -bottom-6 left-2 flex gap-4 text-[10px] font-mono text-app-dim">
-                <span><kbd class="px-1.5 py-0.5 bg-app-panel border border-app-border rounded">Shift</kbd> + <kbd class="px-1.5 py-0.5 bg-app-panel border border-app-border rounded">Enter</kbd> to newline</span>
-                <span><kbd class="px-1.5 py-0.5 bg-app-panel border border-app-border rounded">Enter</kbd> to execute</span>
-              </div>
-            </div>
-          </div>
-        </div>
 
-        <!-- Telemetry Sidebar -->
-        <div class="w-full lg:w-[380px] flex-shrink-0 glass-panel-heavy border-l border-app-border overflow-y-auto p-6 space-y-6 shadow-2xl z-20">
-          
-          <div class="flex items-center justify-between mb-4">
-            <h2 class="text-[11px] font-mono font-bold text-white uppercase tracking-widest flex items-center gap-2">
-              <span class="w-2 h-2 bg-app-cyan rounded-full shadow-neon-cyan animate-pulse"></span>
-              Live Telemetry
-            </h2>
-          </div>
-          
-          <!-- Speed Metrics -->
-          <div class="glass-panel border-gradient-violet rounded-xl p-5 space-y-5 relative overflow-hidden">
-            <div class="absolute top-0 right-0 p-4 opacity-10">
-              <i data-lucide="gauge" class="w-24 h-24"></i>
-            </div>
-            
-            <div class="grid grid-cols-2 gap-6 font-mono relative z-10">
-              <div>
-                <div class="text-[10px] text-app-muted mb-1.5 uppercase tracking-wider flex items-center gap-1.5">
-                  <i data-lucide="zap" class="w-3 h-3 text-app-amber"></i> Velocity
-                </div>
-                <div class="flex items-baseline gap-1">
-                  <div class="text-3xl font-light text-white drop-shadow-md" id="metric-ts">0.0</div>
-                  <div class="text-xs text-app-dim">T/s</div>
-                </div>
-              </div>
-              <div>
-                <div class="text-[10px] text-app-muted mb-1.5 uppercase tracking-wider flex items-center gap-1.5">
-                  <i data-lucide="timer" class="w-3 h-3 text-app-cyan"></i> Latency (TTFT)
-                </div>
-                <div class="flex items-baseline gap-1">
-                  <div class="text-3xl font-light text-white drop-shadow-md" id="metric-ttft">--</div>
-                  <div class="text-xs text-app-dim">ms</div>
-                </div>
-              </div>
-            </div>
-          </div>
+              <div class="space-y-2.5 pt-1">
+                <input id="join-model" type="text" placeholder="model id (must match host)"
+                  value="HuggingFaceTB/SmolLM2-135M-Instruct"
+                  class="field !text-[11px] font-mono" />
 
-          <!-- Compression Widget -->
-          <div class="glass-panel rounded-xl p-5 space-y-4">
-            <div class="flex items-center justify-between border-b border-app-border/50 pb-3">
-              <div class="flex items-center gap-2">
-                <i data-lucide="minimize-2" class="w-4 h-4 text-app-emerald"></i>
-                <h3 class="text-xs font-semibold text-app-fg uppercase tracking-wider">Wire Savings</h3>
-              </div>
-              <span id="badge-savings" class="text-[11px] font-mono font-bold bg-app-emerald/10 text-app-emerald border border-app-emerald/20 px-2 py-0.5 rounded shadow-neon-emerald">-0%</span>
-            </div>
-            
-            <div class="space-y-3 font-mono text-xs">
-              <div class="flex justify-between items-center">
-                <span class="text-app-muted">Base Tensor</span>
-                <span class="bg-app-panel px-2 py-1 rounded text-white" id="metric-orig">0.00 MB</span>
-              </div>
-              <div class="flex justify-between items-center">
-                <span class="text-app-muted">Transmitted</span>
-                <span class="bg-app-emerald/10 border border-app-emerald/30 px-2 py-1 rounded text-app-emerald font-semibold shadow-[0_0_10px_rgba(16,185,129,0.1)]" id="metric-comp">0.00 MB</span>
-              </div>
-              
-              <!-- Progress Bar -->
-              <div class="h-2 w-full bg-app-bg rounded-full overflow-hidden border border-app-border mt-3 p-px shadow-inner">
-                <div id="bar-savings" class="h-full bg-gradient-to-r from-app-emerald to-app-cyan rounded-full transition-all duration-300 w-0 shadow-neon-emerald"></div>
-              </div>
-            </div>
-          </div>
-          
-          <!-- Inference Waterfall -->
-          <div class="glass-panel rounded-xl p-5">
-            <div class="flex items-center gap-2 mb-5">
-              <i data-lucide="git-merge" class="w-4 h-4 text-app-violet"></i>
-              <h3 class="text-xs font-semibold text-app-fg uppercase tracking-wider">Pass Waterfall</h3>
-            </div>
-            
-            <div class="relative pl-4 space-y-6 font-mono text-xs">
-              <!-- Vertical Line -->
-              <div class="absolute top-2 bottom-2 left-1.5 w-px bg-gradient-to-b from-app-violet via-app-cyan to-app-emerald opacity-30"></div>
-              
-              <!-- Steps -->
-              <div class="relative group">
-                <div class="absolute -left-[19px] top-0.5 w-3 h-3 rounded-full bg-app-bg border-2 border-app-violet z-10 transition-shadow" id="step1-dot"></div>
-                <div class="text-app-fg font-medium">Master Draft Phase</div>
-                <div class="text-[10px] text-app-dim mt-0.5">Generating speculative tokens</div>
-              </div>
-              
-              <div class="relative group">
-                <div class="absolute -left-[19px] top-0.5 w-3 h-3 rounded-full bg-app-bg border-2 border-app-cyan z-10 transition-shadow" id="step2-dot"></div>
-                <div class="flex justify-between items-start">
-                  <div>
-                    <div class="text-app-fg font-medium">Network Hop</div>
-                    <div class="text-[10px] text-app-dim mt-0.5">QUIC stream transport</div>
+                <button id="btn-download" class="btn-ghost w-full py-2 text-[11px] font-mono uppercase tracking-wider flex items-center justify-center gap-2 disabled:opacity-40">
+                  <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                  <span id="btn-download-label">1 · download model</span>
+                </button>
+
+                <button id="btn-benchmark" class="btn-ghost w-full py-2 text-[11px] font-mono uppercase tracking-wider flex items-center justify-center gap-2 disabled:opacity-40">
+                  <i data-lucide="gauge" class="w-3.5 h-3.5"></i>
+                  <span id="btn-benchmark-label">2 · run compute test</span>
+                </button>
+
+                <div id="benchmark-result" class="hidden border border-ink-line rounded-md p-2.5 text-xs space-y-1.5 bg-ink-surface">
+                  <div class="flex justify-between">
+                    <span class="text-ink-dim">score</span>
+                    <span id="benchmark-score" class="font-mono text-ink-fg tabular-nums">—</span>
                   </div>
-                  <span class="text-[10px] bg-app-cyan/10 text-app-cyan px-1.5 py-0.5 rounded border border-app-cyan/20" id="metric-ping">-- ms</span>
+                  <div class="flex justify-between">
+                    <span class="text-ink-dim">device</span>
+                    <span id="benchmark-device" class="font-mono text-[10px] text-ink-mute">—</span>
+                  </div>
+                </div>
+
+                <div class="pt-1 space-y-2.5">
+                  <input id="join-code" type="text" placeholder="pairing code from host" maxlength="8"
+                    class="field !text-[12px] font-mono tracking-[0.25em] uppercase" />
+                  <input id="join-addr" type="text" placeholder="master addr (optional)"
+                    class="field !text-[11px] font-mono" />
+                  <button id="btn-join" class="w-full py-2 text-[11px] font-mono uppercase tracking-wider rounded-md bg-ink-fg text-black hover:bg-zinc-300 transition-colors flex items-center justify-center gap-2 disabled:opacity-40">
+                    <i data-lucide="plug" class="w-3.5 h-3.5"></i>
+                    3 · join as worker
+                  </button>
+                  <div id="join-status" class="text-[11px] text-ink-dim min-h-[16px]"></div>
                 </div>
               </div>
-              
-              <div class="relative group">
-                <div class="absolute -left-[19px] top-0.5 w-3 h-3 rounded-full bg-app-bg border-2 border-app-emerald z-10 transition-shadow" id="step3-dot"></div>
-                <div class="text-app-fg font-medium">Worker Compute</div>
-                <div class="text-[10px] text-app-dim mt-0.5">KV Cache verification</div>
-              </div>
-              
-              <div class="relative group">
-                <div class="absolute -left-[19px] top-0.5 w-3 h-3 rounded-full bg-app-bg border-2 border-app-violet z-10 transition-shadow" id="step4-dot"></div>
-                <div class="text-app-fg font-medium">Master Sampling</div>
-                <div class="text-[10px] text-app-dim mt-0.5">Logit decoding &amp; output</div>
-              </div>
-            </div>
-          </div>
+            </section>
 
-        </div>
+          </div>
+        </aside>
       </div>
 
-      <!-- VIEW 2: SWARM TOPOLOGY -->
-      <div id="view-swarm" class="absolute inset-0 hidden view-section bg-[#020203] flex flex-col md:flex-row z-10">
-        
-        <div class="flex-1 relative border-r border-app-border overflow-hidden">
-          <!-- Ambient Map Background -->
-          <div class="absolute inset-0 bg-grid opacity-10"></div>
-          <div class="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(139,92,246,0.1)_0%,transparent_70%)]"></div>
-          
-          <!-- Controls overlay -->
-          <div class="absolute top-6 left-6 flex gap-2 font-mono text-xs z-20">
-            <button class="bg-app-panel border border-app-border hover:bg-app-border px-3 py-1.5 rounded-md text-white shadow-sm flex items-center gap-2"><i data-lucide="zoom-in" class="w-3 h-3"></i> Zoom</button>
-            <button class="bg-app-panel border border-app-border hover:bg-app-border px-3 py-1.5 rounded-md text-white shadow-sm flex items-center gap-2"><i data-lucide="refresh-cw" class="w-3 h-3"></i> Recenter</button>
-          </div>
+      <!-- ═══ VIEW: NODES ═══ -->
+      <div id="view-hardware" class="absolute inset-0 hidden view-section overflow-y-auto z-10">
+        <div class="max-w-6xl mx-auto px-6 lg:px-10 py-8 space-y-7">
 
-          <!-- SVG Canvas -->
-          <svg class="w-full h-full relative z-10" viewBox="0 0 800 600" preserveAspectRatio="xMidYMid slice">
-            <defs>
-              <!-- Glow Filters -->
-              <filter id="glow-violet" x="-50%" y="-50%" width="200%" height="200%">
-                <feGaussianBlur stdDeviation="8" result="blur" />
-                <feMerge>
-                  <feMergeNode in="blur"/>
-                  <feMergeNode in="blur"/>
-                  <feMergeNode in="SourceGraphic"/>
-                </feMerge>
-              </filter>
-              <filter id="glow-emerald" x="-50%" y="-50%" width="200%" height="200%">
-                <feGaussianBlur stdDeviation="6" result="blur" />
-                <feMerge>
-                  <feMergeNode in="blur"/>
-                  <feMergeNode in="SourceGraphic"/>
-                </feMerge>
-              </filter>
-              <filter id="glow-cyan" x="-50%" y="-50%" width="200%" height="200%">
-                <feGaussianBlur stdDeviation="4" result="blur" />
-                <feMerge>
-                  <feMergeNode in="blur"/>
-                  <feMergeNode in="SourceGraphic"/>
-                </feMerge>
-              </filter>
-            </defs>
-
-            <!-- Connections (Static) -->
-            <path id="edge-1" d="M400,300 L200,150" stroke="#1f1f2e" stroke-width="2" fill="none" />
-            <path id="edge-2" d="M400,300 L600,180" stroke="#1f1f2e" stroke-width="2" fill="none" />
-            <path id="edge-3" d="M400,300 L250,480" stroke="#1f1f2e" stroke-width="2" fill="none" />
-            <path id="edge-4" d="M400,300 L550,450" stroke="#1f1f2e" stroke-width="2" fill="none" />
-            <path id="edge-5" d="M600,180 L550,450" stroke="#1f1f2e" stroke-width="1" fill="none" stroke-dasharray="4 6" />
-
-            <!-- Connections (Animated Active Streams) -->
-            <path id="edge-1-anim" d="M400,300 L200,150" stroke="#06b6d4" stroke-width="2" fill="none" filter="url(#glow-cyan)" class="animate-flow hidden" />
-            <path id="edge-2-anim" d="M400,300 L600,180" stroke="#06b6d4" stroke-width="2" fill="none" filter="url(#glow-cyan)" class="animate-flow hidden" />
-            <path id="edge-3-anim" d="M400,300 L250,480" stroke="#06b6d4" stroke-width="2" fill="none" filter="url(#glow-cyan)" class="animate-flow hidden" />
-            <path id="edge-4-anim" d="M400,300 L550,450" stroke="#06b6d4" stroke-width="2" fill="none" filter="url(#glow-cyan)" class="animate-flow hidden" />
-
-            <!-- Nodes -->
-            <!-- Worker 1 -->
-            <g class="cursor-pointer hover:opacity-80 transition-opacity">
-              <circle cx="200" cy="150" r="24" fill="#0a0a0e" stroke="#10b981" stroke-width="2" filter="url(#glow-emerald)" />
-              <text x="200" y="154" font-family="'Fira Code', monospace" font-size="11" fill="#fff" text-anchor="middle" font-weight="600">W-A</text>
-            </g>
-
-            <!-- Worker 2 -->
-            <g class="cursor-pointer hover:opacity-80 transition-opacity">
-              <circle cx="600" cy="180" r="24" fill="#0a0a0e" stroke="#10b981" stroke-width="2" filter="url(#glow-emerald)" />
-              <text x="600" y="184" font-family="'Fira Code', monospace" font-size="11" fill="#fff" text-anchor="middle" font-weight="600">W-B</text>
-            </g>
-
-            <!-- Worker 3 -->
-            <g class="cursor-pointer hover:opacity-80 transition-opacity">
-              <circle cx="250" cy="480" r="24" fill="#0a0a0e" stroke="#f59e0b" stroke-width="2" class="node-glow-amber" />
-              <text x="250" y="484" font-family="'Fira Code', monospace" font-size="11" fill="#fff" text-anchor="middle" font-weight="600">W-C</text>
-            </g>
-
-            <!-- Worker 4 -->
-            <g class="cursor-pointer hover:opacity-80 transition-opacity">
-              <circle cx="550" cy="450" r="24" fill="#0a0a0e" stroke="#10b981" stroke-width="2" filter="url(#glow-emerald)" />
-              <text x="550" y="454" font-family="'Fira Code', monospace" font-size="11" fill="#fff" text-anchor="middle" font-weight="600">W-D</text>
-            </g>
-            
-            <!-- Master Node (Center) -->
-            <g class="cursor-pointer">
-              <circle cx="400" cy="300" r="45" fill="none" stroke="#8b5cf6" stroke-width="1" class="animate-pulse-ring" />
-              <circle cx="400" cy="300" r="34" fill="#0a0a0e" stroke="#8b5cf6" stroke-width="3" filter="url(#glow-violet)" />
-              <text x="400" y="304" font-family="'Fira Code', monospace" font-size="12" fill="#fff" text-anchor="middle" font-weight="bold">M-01</text>
-            </g>
-          </svg>
-        </div>
-        
-        <!-- Sidebar Detail -->
-        <div class="w-full md:w-[320px] flex-shrink-0 glass-panel-heavy p-6 space-y-6">
-          <div class="flex items-center gap-2 mb-2">
-            <i data-lucide="radio" class="w-4 h-4 text-app-violet"></i>
-            <h2 class="text-[11px] font-mono font-bold text-white uppercase tracking-widest">Node Inspector</h2>
-          </div>
-          
-          <div class="glass-panel rounded-xl p-5 space-y-5 font-mono text-[11px]">
+          <div class="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
             <div>
-              <div class="text-app-muted mb-1.5 uppercase tracking-wider text-[9px]">Selected Node</div>
-              <div class="text-app-violet font-semibold text-sm flex items-center gap-2">
-                Master-01 <span class="bg-app-violet/10 text-app-violet border border-app-violet/20 px-1.5 py-0.5 rounded text-[9px] uppercase shadow-neon-violet">Local</span>
-              </div>
+              <h2 class="text-lg font-semibold tracking-tight">Nodes</h2>
+              <p class="text-[13px] text-ink-dim mt-1">Hardware across the swarm, updated live.</p>
             </div>
-            
-            <div class="space-y-3 pt-3 border-t border-app-border/50">
+            <div class="flex items-center gap-6 text-xs">
               <div>
-                <div class="text-app-muted mb-1 uppercase tracking-wider text-[9px]">Peer ID Hash</div>
-                <div class="text-app-fg break-all bg-app-bg border border-app-border p-2 rounded text-[10px]">QmYyQSo1c1Ym7orWxLYvCrM2</div>
+                <div class="text-[10px] uppercase tracking-wider text-ink-faint mb-0.5">online</div>
+                <div class="font-mono text-ink-live tabular-nums" id="active-nodes-label">0</div>
               </div>
+              <div class="h-6 w-px bg-ink-line"></div>
               <div>
-                <div class="text-app-muted mb-1 uppercase tracking-wider text-[9px]">Multiaddress</div>
-                <div class="text-app-fg text-[9px] break-all bg-app-bg border border-app-border p-2 rounded">/ip4/192.168.1.42/tcp/4001/p2p/...</div>
+                <div class="text-[10px] uppercase tracking-wider text-ink-faint mb-0.5">role</div>
+                <div class="font-mono text-ink-mute" id="hardware-role-label">idle</div>
               </div>
             </div>
-            
-            <div class="pt-3 border-t border-app-border/50 space-y-3">
-              <div class="flex justify-between items-center">
-                <span class="text-app-muted uppercase tracking-wider text-[9px]">NAT Type</span>
-                <span class="text-app-emerald bg-app-emerald/10 px-1.5 py-0.5 rounded border border-app-emerald/20">Open (AutoNAT)</span>
-              </div>
-              <div class="flex justify-between items-center">
-                <span class="text-app-muted uppercase tracking-wider text-[9px]">Active Streams</span>
-                <span class="text-white font-bold text-sm">14</span>
-              </div>
-            </div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4" id="hardware-grid">
+            <!-- populated from /api/peers -->
           </div>
         </div>
       </div>
 
-      <!-- VIEW 3: HARDWARE MATRIX -->
-      <div id="view-hardware" class="absolute inset-0 hidden view-section overflow-y-auto p-6 lg:p-10 bg-app-bg relative">
-        <div class="absolute inset-0 bg-[radial-gradient(ellipse_at_top,rgba(16,185,129,0.05)_0%,transparent_50%)] pointer-events-none"></div>
-
-        <div class="max-w-7xl mx-auto space-y-8 relative z-10">
-          
-          <div class="flex flex-col md:flex-row justify-between items-start md:items-end gap-4">
-            <div>
-              <h2 class="text-2xl font-semibold text-white tracking-wide">Hardware Registry</h2>
-              <p class="text-sm text-app-muted mt-2 font-mono">Real-time telemetry from Phase 2 hardware probes.</p>
-            </div>
-            <div class="font-mono text-xs glass-panel px-4 py-2 rounded-lg flex gap-6 shadow-md border-app-borderHover border-t-app-border/80">
-              <div class="flex flex-col">
-                <span class="text-app-dim text-[9px] uppercase tracking-wider">Total VRAM</span> 
-                <span class="text-white font-medium text-sm">144 GB</span>
-              </div>
-              <div class="w-px bg-app-border"></div>
-              <div class="flex flex-col">
-                <span class="text-app-dim text-[9px] uppercase tracking-wider">Active Nodes</span> 
-                <span class="text-app-emerald font-medium text-sm drop-shadow-[0_0_5px_rgba(16,185,129,0.8)]">4</span>
-              </div>
-            </div>
-          </div>
-
-          <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6" id="hardware-grid">
-            
-            <!-- Card 1 -->
-            <div class="glass-panel rounded-2xl p-6 relative overflow-hidden group hover:border-app-emerald/50 transition-colors duration-300">
-              <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-app-emerald/0 via-app-emerald to-app-emerald/0 opacity-0 group-hover:opacity-100 transition-opacity"></div>
-              
-              <div class="flex justify-between items-start mb-6">
-                <div>
-                  <div class="font-mono text-[13px] text-white flex items-center gap-2 font-semibold">
-                    <div class="w-2 h-2 rounded-full bg-app-emerald shadow-neon-emerald animate-pulse"></div>
-                    QmWorkerA...7b
-                  </div>
-                  <div class="mt-3 inline-flex items-center px-2 py-1 rounded text-[9px] font-mono font-bold bg-app-emerald/10 text-app-emerald border border-app-emerald/30 shadow-neon-emerald uppercase tracking-wider">
-                    Accelerated - CUDA
-                  </div>
-                </div>
-                <div class="w-10 h-10 rounded-full bg-app-bg border border-app-border flex items-center justify-center shadow-inner">
-                  <i data-lucide="gpu" class="w-5 h-5 text-app-muted"></i>
-                </div>
-              </div>
-              
-              <div class="space-y-4 font-mono text-[11px]">
-                <div class="flex justify-between border-b border-app-border/50 pb-2">
-                  <span class="text-app-dim uppercase tracking-wider text-[9px]">Hardware</span>
-                  <span class="text-app-fg font-medium">NVIDIA RTX 4090</span>
-                </div>
-                <div class="flex justify-between border-b border-app-border/50 pb-2">
-                  <span class="text-app-dim uppercase tracking-wider text-[9px]">Compute</span>
-                  <span class="text-white">165 FP16 TFLOPS</span>
-                </div>
-                
-                <div class="pt-2">
-                  <div class="flex justify-between mb-2">
-                    <span class="text-app-dim uppercase tracking-wider text-[9px]">VRAM Usage</span>
-                    <span class="text-app-fg font-medium">14.2 / 24.0 GB</span>
-                  </div>
-                  <div class="h-1.5 w-full bg-app-bg rounded-full overflow-hidden border border-app-border p-px">
-                    <div class="h-full bg-gradient-to-r from-app-emerald/50 to-app-emerald rounded-full shadow-neon-emerald" style="width: 59%"></div>
-                  </div>
-                </div>
-                
-                <div class="bg-app-bg/50 p-3 rounded-lg border border-app-border/50 mt-4 shadow-inner">
-                  <div class="flex justify-between text-app-dim mb-1 text-[9px] uppercase tracking-wider">
-                    <span>Assignment</span>
-                    <span>Ping</span>
-                  </div>
-                  <div class="flex justify-between text-app-fg font-medium">
-                    <span>Layers 1 - 8</span>
-                    <span class="text-app-cyan drop-shadow-[0_0_5px_rgba(6,182,212,0.5)]">24ms</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- Card 2 -->
-            <div class="glass-panel rounded-2xl p-6 relative overflow-hidden group hover:border-app-violet/50 transition-colors duration-300">
-              <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-app-violet/0 via-app-violet to-app-violet/0 opacity-0 group-hover:opacity-100 transition-opacity"></div>
-
-              <div class="flex justify-between items-start mb-6">
-                <div>
-                  <div class="font-mono text-[13px] text-white flex items-center gap-2 font-semibold">
-                    <div class="w-2 h-2 rounded-full bg-app-emerald shadow-neon-emerald"></div>
-                    QmWorkerB...9c
-                  </div>
-                  <div class="mt-3 inline-flex items-center px-2 py-1 rounded text-[9px] font-mono font-bold bg-app-violet/10 text-app-violet border border-app-violet/30 shadow-neon-violet uppercase tracking-wider">
-                    Accelerated - METAL
-                  </div>
-                </div>
-                <div class="w-10 h-10 rounded-full bg-app-bg border border-app-border flex items-center justify-center shadow-inner">
-                  <i data-lucide="cpu" class="w-5 h-5 text-app-muted"></i>
-                </div>
-              </div>
-              
-              <div class="space-y-4 font-mono text-[11px]">
-                <div class="flex justify-between border-b border-app-border/50 pb-2">
-                  <span class="text-app-dim uppercase tracking-wider text-[9px]">Hardware</span>
-                  <span class="text-app-fg font-medium">Apple M3 Max</span>
-                </div>
-                <div class="flex justify-between border-b border-app-border/50 pb-2">
-                  <span class="text-app-dim uppercase tracking-wider text-[9px]">Compute</span>
-                  <span class="text-white">40 FP16 TFLOPS</span>
-                </div>
-                
-                <div class="pt-2">
-                  <div class="flex justify-between mb-2">
-                    <span class="text-app-dim uppercase tracking-wider text-[9px]">Unified RAM</span>
-                    <span class="text-app-fg font-medium">42.0 / 128.0 GB</span>
-                  </div>
-                  <div class="h-1.5 w-full bg-app-bg rounded-full overflow-hidden border border-app-border p-px">
-                    <div class="h-full bg-gradient-to-r from-app-violet/50 to-app-violet rounded-full shadow-neon-violet" style="width: 32%"></div>
-                  </div>
-                </div>
-                
-                <div class="bg-app-bg/50 p-3 rounded-lg border border-app-border/50 mt-4 shadow-inner">
-                  <div class="flex justify-between text-app-dim mb-1 text-[9px] uppercase tracking-wider">
-                    <span>Assignment</span>
-                    <span>Ping</span>
-                  </div>
-                  <div class="flex justify-between text-app-fg font-medium">
-                    <span>Layers 9 - 16</span>
-                    <span class="text-app-cyan drop-shadow-[0_0_5px_rgba(6,182,212,0.5)]">45ms</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- Card 3 -->
-            <div class="glass-panel rounded-2xl p-6 relative overflow-hidden group hover:border-app-amber/50 transition-colors duration-300">
-              <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-app-amber/0 via-app-amber to-app-amber/0 opacity-0 group-hover:opacity-100 transition-opacity"></div>
-
-              <div class="flex justify-between items-start mb-6">
-                <div>
-                  <div class="font-mono text-[13px] text-white flex items-center gap-2 font-semibold">
-                    <div class="w-2 h-2 rounded-full bg-app-amber shadow-neon-amber"></div>
-                    QmWorkerC...2a
-                  </div>
-                  <div class="mt-3 inline-flex items-center px-2 py-1 rounded text-[9px] font-mono font-bold bg-app-amber/10 text-app-amber border border-app-amber/30 shadow-neon-amber uppercase tracking-wider">
-                    CPU ONLY - FALLBACK
-                  </div>
-                </div>
-                <div class="w-10 h-10 rounded-full bg-app-bg border border-app-border flex items-center justify-center shadow-inner">
-                  <i data-lucide="server" class="w-5 h-5 text-app-muted"></i>
-                </div>
-              </div>
-              
-              <div class="space-y-4 font-mono text-[11px]">
-                <div class="flex justify-between border-b border-app-border/50 pb-2">
-                  <span class="text-app-dim uppercase tracking-wider text-[9px]">Hardware</span>
-                  <span class="text-app-fg font-medium">AMD Ryzen 9 7950X</span>
-                </div>
-                <div class="flex justify-between border-b border-app-border/50 pb-2">
-                  <span class="text-app-dim uppercase tracking-wider text-[9px]">Compute</span>
-                  <span class="text-white">32 Threads</span>
-                </div>
-                
-                <div class="pt-2">
-                  <div class="flex justify-between mb-2">
-                    <span class="text-app-dim uppercase tracking-wider text-[9px]">RAM Usage</span>
-                    <span class="text-app-fg font-medium">18.5 / 64.0 GB</span>
-                  </div>
-                  <div class="h-1.5 w-full bg-app-bg rounded-full overflow-hidden border border-app-border p-px">
-                    <div class="h-full bg-gradient-to-r from-app-amber/50 to-app-amber rounded-full shadow-neon-amber" style="width: 28%"></div>
-                  </div>
-                </div>
-                
-                <div class="bg-app-bg/50 p-3 rounded-lg border border-app-border/50 mt-4 shadow-inner">
-                  <div class="flex justify-between text-app-dim mb-1 text-[9px] uppercase tracking-wider">
-                    <span>Assignment</span>
-                    <span>Ping</span>
-                  </div>
-                  <div class="flex justify-between text-app-fg font-medium">
-                    <span>KV Cache Sync</span>
-                    <span class="text-app-cyan drop-shadow-[0_0_5px_rgba(6,182,212,0.5)]">12ms</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-          </div>
+      <!-- ═══ VIEW: LOGS ═══ -->
+      <div id="view-logs" class="absolute inset-0 hidden view-section flex flex-col p-6 z-10">
+        <div class="flex items-center justify-between mb-3 max-w-4xl mx-auto w-full">
+          <h2 class="text-[10px] font-medium uppercase tracking-widest text-ink-dim">Diagnostic output</h2>
+          <button id="btn-clear-logs" class="btn-ghost px-3 py-1.5 text-[11px] font-mono uppercase tracking-wider">clear</button>
         </div>
-      </div>
-
-      <!-- VIEW 4: SYSTEM LOGS -->
-      <div id="view-logs" class="absolute inset-0 hidden view-section p-6 bg-[#020202] flex flex-col z-10">
-        <div class="flex items-center justify-between mb-4 max-w-5xl mx-auto w-full">
-          <h2 class="text-xs font-mono font-bold text-app-dim uppercase tracking-widest flex items-center gap-2">
-            <i data-lucide="terminal" class="w-4 h-4"></i> Diagnostic Output
-          </h2>
-          <button id="btn-clear-logs" class="text-[10px] font-mono font-semibold text-app-muted hover:text-white border border-app-border bg-app-panel px-3 py-1.5 rounded transition-colors">CLEAR LOGS</button>
-        </div>
-        
-        <div class="flex-1 max-w-5xl mx-auto w-full glass-panel-heavy rounded-xl p-1 relative overflow-hidden border border-app-border shadow-2xl">
-          <!-- CRT styling -->
-          <div class="absolute inset-0 scanlines pointer-events-none rounded-xl"></div>
-          
-          <div id="terminal-output" class="h-full bg-black/80 rounded-lg p-5 font-mono text-[12px] overflow-y-auto whitespace-pre-wrap leading-[1.7] select-text">
-            <!-- Logs will spawn here via JS -->
-          </div>
+        <div class="flex-1 max-w-4xl mx-auto w-full border border-ink-line rounded-lg bg-black/60 overflow-hidden flex">
+          <div id="terminal-output" class="flex-1 p-4 font-mono text-[12px] leading-relaxed overflow-y-auto whitespace-pre-wrap select-text"></div>
         </div>
       </div>
 
     </div>
   </main>
 
-  <!-- JAVASCRIPT LOGIC -->
+  <!-- ─── JAVASCRIPT ───────────────────────────────────────────────────── -->
   <script>
     lucide.createIcons();
 
