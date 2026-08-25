@@ -482,6 +482,42 @@
         if (!r.ok) throw new Error(`cached-models ${r.status}`);
         return r.json();
       }
+      async peers() {
+        const r = await fetch(`${this.base}/api/peers`);
+        if (!r.ok) throw new Error(`peers ${r.status}`);
+        return r.json();
+      }
+      async join(model, code, masterAddr, computeScore) {
+        const r = await fetch(`${this.base}/api/session/join`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model,
+            code,
+            master_addr: masterAddr || null,
+            compute_score: (computeScore != null ? computeScore : null),
+          }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.error || `join ${r.status}`);
+        return body;
+      }
+      async benchmark() {
+        const r = await fetch(`${this.base}/api/benchmark`, { method: 'POST' });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.error || `benchmark ${r.status}`);
+        return body;
+      }
+      async downloadModel(model) {
+        const r = await fetch(`${this.base}/api/download-model`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.error || `download ${r.status}`);
+        return body;
+      }
       async startHost(model, maxTokens, listen) {
         const r = await fetch(`${this.base}/api/session/host`, {
           method: 'POST',
