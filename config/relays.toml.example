@@ -1,0 +1,6 @@
+# Relay nodes let peers behind NAT reach each other.
+# Each entry must be a full multiaddr ending in /p2p/<peer-id>.
+# Run your own with: synapse relay --listen 0.0.0.0:4001
+relays = [
+  "/dns4/your-relay.example.com/udp/4001/quic-v1/p2p/12D3KooWExample",
+]
