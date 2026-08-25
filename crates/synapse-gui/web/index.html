@@ -568,30 +568,34 @@
           appendLog('ERROR', 'WebSocket not open. Start a master session first.');
           return false;
         }
-        this.ws.send(JSON.stringify({ type: 'prompt', id: crypto.randomUUID(), text }));
+        // Use timestamp + random so we don't depend on a secure context.
+        const id = `p-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+        this.ws.send(JSON.stringify({ type: 'prompt', id, text }));
         return true;
       }
     }
 
-
     const state = {
       codec: 'LZ4',
       isStreaming: false,
-      simInterval: null,
+      computeScore: null, // measured benchmark score, sent with join
+      lastTps: null,
     };
 
     const DOM = {
       navBtns: document.querySelectorAll('.nav-btn'),
       views: document.querySelectorAll('.view-section'),
       headerTitle: document.getElementById('header-title'),
-      
+      headerModel: document.getElementById('header-model'),
+
       codecLz4: document.getElementById('codec-lz4'),
       codecZstd: document.getElementById('codec-zstd'),
-      
+
+      thread: document.getElementById('chat-thread'),
       chatHistory: document.getElementById('chat-history'),
       promptInput: document.getElementById('prompt-input'),
       btnRun: document.getElementById('btn-run'),
-      
+
       metricTs: document.getElementById('metric-ts'),
       metricTtft: document.getElementById('metric-ttft'),
       metricOrig: document.getElementById('metric-orig'),
