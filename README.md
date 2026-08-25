@@ -30,3 +30,6 @@ synapse join
 synapse demo
 ```
 
+Host starts a master and prints a pairing code. Join connects a worker to that master with the code. Demo runs the whole thing on one machine with no network, which is the fastest way to check a build.
+
+Each command takes options. The useful ones: the model option points at any small llama model on Hugging Face, join wants the code the host printed, and the prompt option skips typing. Pass the help flag for the full list.
