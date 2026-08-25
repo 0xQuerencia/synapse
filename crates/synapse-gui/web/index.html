@@ -820,88 +820,103 @@
       addUserMessage(text);
       DOM.promptInput.value = '';
 
+      const start = performance.now();
+      DOM.metricTs.innerText = '0.0';
+      DOM.metricTtft.innerText = '—';
+
       try {
-        const models = await api.cachedModels();
-        if (models.length === 0) {
-          appendLog('ERROR', 'No cached models. Run `cargo run -p synapse-cli -- demo --model <id>` once.');
-          state.isStreaming = false;
-          DOM.btnRun.disabled = false;
-          DOM.promptInput.disabled = false;
-          return;
+        const status = await api.status();
+        if (status.session.role !== 'master') {
+          const models = await api.cachedModels();
+          if (models.length === 0) {
+            appendLog('ERROR', 'No cached models. Run `synapse demo --model <id>` once.');
+            finishInference();
+            return;
+          }
+          const model = models[0];
+          setEdgeFlow(true);
+          appendLog('INFO', `Starting master with model=${model} max_tokens=200`);
+          await api.startHost(model, 200, '0.0.0.0:0');
+          appendLog('NET', 'POST /api/session/host → 200');
         }
-        const model = models[0];
-        DOM.metricTs.innerText = '0.0';
-        DOM.metricTtft.innerText = '---';
-        DOM.edgesAnim.forEach(e => e.classList.remove('hidden'));
-        appendLog('INFO', `Starting master with model=${model} max_tokens=200`);
-        const start = performance.now();
-        const host = await api.startHost(model, 200, '0.0.0.0:0');
-        const ttft = (performance.now() - start) | 0;
-        appendLog('NET', `POST /api/session/host → pairing=${host.pairing_code} (${ttft}ms)`);
-        DOM.metricTtft.innerText = `${ttft}`;
-        // Open the WS *after* the master is running.
-        api.openWS();
-        // Hand off the event stream to the renderer.
+
         const assistant = openAssistantMessage();
         api.onEvent = (id, ev) => renderWsEvent(assistant, ev, start);
-        // Wait a tick for WS to open, then send the prompt.
-        setTimeout(() => api.sendPrompt(text), 250);
+        api.openWS();
+
+        const trySend = () => {
+          if (api.ws && api.ws.readyState === WebSocket.OPEN) {
+            if (!api.sendPrompt(text)) {
+              appendLog('ERROR', 'Failed to send prompt to master.');
+              finishInference();
+            }
+          } else {
+            setTimeout(trySend, 100);
+          }
+        };
+        trySend();
       } catch (e) {
         appendLog('ERROR', `Failed to start: ${e.message}`);
         finishInference();
       }
     });
 
-    // Real-time event stream. We update the assistant message div
-    // as Token events arrive, then close the turn on
-    // GenerationDone.
     function openAssistantMessage() {
       const wrapper = document.createElement('div');
-      wrapper.className = "flex gap-4 max-w-3xl";
       wrapper.innerHTML = `
-        <div class="w-10 h-10 rounded-xl bg-gradient-to-b from-app-panel to-app-bg border border-app-border shadow-md flex items-center justify-center flex-shrink-0 relative">
-          <div class="absolute inset-0 rounded-xl border border-app-violet/30 mix-blend-overlay"></div>
-          <i data-lucide="cpu" class="w-5 h-5 text-app-violet"></i>
+        <div class="flex items-center gap-2 mb-1.5">
+          <span class="text-[10px] font-mono font-medium uppercase tracking-widest text-ink-mute">synapse</span>
+          <span class="text-[10px] font-mono text-ink-faint">${getTimestamp()}</span>
         </div>
-        <div class="space-y-1.5 pt-1 relative flex-1">
-          <div class="flex items-center gap-2 mb-2">
-            <span class="text-[10px] font-mono font-semibold text-app-violet uppercase tracking-wider bg-app-violet/10 px-2 py-0.5 rounded">SYS-NODE-01</span>
-            <span class="text-[10px] font-mono text-app-dim">${getTimestamp()}</span>
-          </div>
-          <div class="text-app-fg text-[15px] leading-relaxed font-sans glass-panel px-5 py-4 rounded-2xl rounded-tl-sm shadow-sm border-app-border/50 message-content">
-            <span></span>
-            <span class="cursor-blink"></span>
-          </div>
-        </div>
+        <div class="message-content text-[14.5px] leading-relaxed text-zinc-100 whitespace-pre-wrap break-words"><span></span><span class="caret"></span></div>
       `;
-      DOM.chatHistory.appendChild(wrapper);
-      lucide.createIcons({root: wrapper});
+      DOM.thread.appendChild(wrapper);
       DOM.chatHistory.scrollTop = DOM.chatHistory.scrollHeight;
       return wrapper;
     }
 
+    function addUserMessage(text) {
+      // Remove the empty-state hint once real traffic starts.
+      const hint = DOM.thread.querySelector('.text-center.pt-10');
+      if (hint) hint.remove();
+
+      const wrapper = document.createElement('div');
+      wrapper.className = 'flex justify-end';
+      wrapper.innerHTML = `
+        <div class="max-w-[85%] bg-ink-raise border border-ink-line rounded-2xl rounded-br-sm px-4 py-2.5 text-[14.5px] leading-relaxed text-zinc-100 whitespace-pre-wrap break-words">${escapeHTML(text)}</div>
+      `;
+      DOM.thread.appendChild(wrapper);
+      DOM.chatHistory.scrollTop = DOM.chatHistory.scrollHeight;
+    }
+
     function renderWsEvent(wrapper, ev, startMs) {
       const textSpan = wrapper.querySelector('.message-content span:first-child');
-      const cursor = wrapper.querySelector('.cursor-blink');
+      const caret = wrapper.querySelector('.caret');
       if (ev.type === 'token') {
         textSpan.innerHTML += escapeHTML(ev.text);
         DOM.chatHistory.scrollTop = DOM.chatHistory.scrollHeight;
-        // Update live TTFT once we see the first token.
-        if (DOM.metricTtft.innerText === '---' || DOM.metricTtft.innerText.endsWith('ms')) {
+        if (DOM.metricTtft.innerText === '—') {
           const ttft = (performance.now() - startMs) | 0;
           DOM.metricTtft.innerText = `${ttft}`;
         }
       } else if (ev.type === 'worker_connected') {
         appendLog('NET', 'Worker connected (sharded inference engaged).');
-        DOM.edgesAnim.forEach(e => e.classList.remove('hidden'));
+        setEdgeFlow(true);
       } else if (ev.type === 'generation_done') {
-        if (cursor) cursor.remove();
-        const ts = ((performance.now() - startMs) / 1000).toFixed(1);
-        DOM.metricTs.innerText = ts;
-        DOM.metricPing.innerText = '-- ms';
-        appendLog('INFO', `Generation done: ${ev.tokens_generated} tokens in ${ts}s, reason=${ev.reason}`);
+        if (caret) caret.remove();
+        const elapsedSecs = (performance.now() - startMs) / 1000;
+        const tps = elapsedSecs > 0 ? (ev.tokens_generated / elapsedSecs).toFixed(1) : '0.0';
+        DOM.metricTs.innerText = tps;
+        state.lastTps = tps;
+        DOM.metricPing.innerText = '— ms';
+        appendLog('INFO', `Generation done: ${ev.tokens_generated} tokens in ${elapsedSecs.toFixed(1)}s (${tps} tok/s), reason=${ev.reason}`);
         finishInference();
       }
+    }
+
+    function setEdgeFlow(on) {
+      if (!DOM.edgeGroup) return;
+      DOM.edgeGroup.classList.toggle('hidden', !on);
     }
 
     function finishInference() {
@@ -909,9 +924,9 @@
       DOM.btnRun.disabled = false;
       DOM.promptInput.disabled = false;
       DOM.promptInput.focus();
-      DOM.edgesAnim.forEach(e => e.classList.add('hidden'));
+      setEdgeFlow(false);
     }
-    
+
     DOM.promptInput.addEventListener('keydown', (e) => {
       if(e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
