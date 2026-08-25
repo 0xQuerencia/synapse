@@ -23,3 +23,19 @@
 
 # TypeScript incremental build cache
 *.tsbuildinfo
+
+# local agent scratch
+/.claude/
+
+# abandoned react/vite scaffolding (gui v3 is a single self contained html)
+/crates/synapse-gui/web/package.json
+/crates/synapse-gui/web/package-lock.json
+/crates/synapse-gui/web/tsconfig.json
+/crates/synapse-gui/web/vite.config.ts
+
+# agent instruction files stay local
+/AGENTS.md
+/GEMINI.md
+/.github/copilot-instructions.md
+/docs/AI_CONTEXT.md
+/docs/skills/
