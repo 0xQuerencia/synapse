@@ -53,7 +53,7 @@ impl NgramDraftCache {
             entries.push((next_token, 1));
         }
         // Keep sorted by count descending for fast draft lookup.
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     }
 
     /// Draft the next N tokens greedily from the cache.
@@ -132,16 +132,16 @@ pub fn verify_draft(draft_tokens: &[u32], logits: &Tensor) -> Result<Verificatio
 
     let mut accepted = 0;
 
-    for i in 0..draft_tokens.len().min(draft_len) {
-        // Get logits for position i → predicts token at position i+1
-        // But if we're checking position i, we compare argmax(logits[i]) against draft_tokens[i]
+    for (i, &drafted) in draft_tokens.iter().enumerate().take(draft_len) {
+        // Position i's logits predict the token at i+1, so we compare
+        // argmax(logits[i]) against draft_tokens[i].
         let position_logits = logits.narrow(1, i, 1)?.squeeze(1)?;
         let predicted = position_logits
             .argmax(candle_core::D::Minus1)?
             .squeeze(0)?
             .to_scalar::<u32>()?;
 
-        if predicted == draft_tokens[i] {
+        if predicted == drafted {
             accepted += 1;
         } else {
             // First mismatch — the correction token is what the model actually predicted.
@@ -251,7 +251,7 @@ mod tests {
         // Position 0 matches (3), position 1 mismatch (predict 6 instead of 5)
         let mut logits_data = vec![0.0_f32; draft_len * vocab_size];
         logits_data[0 * vocab_size + 3] = 10.0; // position 0 → 3 ✓
-        logits_data[1 * vocab_size + 6] = 10.0; // position 1 → 6 ✗ (draft said 5)
+        logits_data[vocab_size + 6] = 10.0; // position 1 → 6 ✗ (draft said 5)
         logits_data[2 * vocab_size + 7] = 10.0; // position 2 → 7 (not checked)
 
         let logits = Tensor::new(logits_data.as_slice(), &candle_core::Device::Cpu)
