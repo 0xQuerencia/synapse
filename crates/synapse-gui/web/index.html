@@ -603,68 +603,151 @@
       badgeSavings: document.getElementById('badge-savings'),
       barSavings: document.getElementById('bar-savings'),
       metricPing: document.getElementById('metric-ping'),
-      
-      edgesAnim: document.querySelectorAll('.animate-flow'),
+
+      edgeGroup: document.querySelector('.animate-flow-group'),
       terminal: document.getElementById('terminal-output'),
       btnClearLogs: document.getElementById('btn-clear-logs'),
-      
-      dots: [
-        document.getElementById('step1-dot'),
-        document.getElementById('step2-dot'),
-        document.getElementById('step3-dot'),
-        document.getElementById('step4-dot')
-      ]
+
+      roleLabel: document.getElementById('hardware-role-label'),
     };
 
-    // --- Tab Routing ---
+    // ─── Tab routing ────────────────────────────────────────────────
     DOM.navBtns.forEach(btn => {
       btn.addEventListener('click', () => {
-        DOM.navBtns.forEach(b => {
-          b.classList.remove('bg-gradient-to-r', 'from-app-violet/20', 'to-transparent', 'text-app-violet', 'border-app-violet', 'shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]');
-          b.classList.add('text-app-muted', 'border-transparent');
-          // Reset icon glow
-          const icon = b.querySelector('i');
-          icon.classList.remove('drop-shadow-[0_0_5px_rgba(139,92,246,0.8)]');
-        });
-        
-        btn.classList.add('bg-gradient-to-r', 'from-app-violet/20', 'to-transparent', 'text-app-violet', 'border-app-violet', 'shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]');
-        btn.classList.remove('text-app-muted', 'border-transparent');
-        btn.querySelector('i').classList.add('drop-shadow-[0_0_5px_rgba(139,92,246,0.8)]');
-
+        DOM.navBtns.forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
         DOM.headerTitle.innerText = btn.querySelector('span').innerText;
 
         const targetId = btn.getAttribute('data-target');
         DOM.views.forEach(v => {
-          if (v.id === targetId) {
-            v.classList.remove('hidden');
-            if(v.id === 'view-chat' || v.id === 'view-swarm') {
-              v.classList.add('flex');
-            }
-          } else {
-            v.classList.add('hidden');
-            v.classList.remove('flex');
-          }
+          const show = v.id === targetId;
+          v.classList.toggle('hidden', !show);
+          v.classList.toggle('flex', show && (v.id === 'view-chat' || v.id === 'view-swarm' || v.id === 'view-logs'));
         });
       });
     });
+    // view-logs declares flex in base classes too; keep router authoritative.
+    document.getElementById('view-logs').classList.add('hidden');
 
-    // --- Codec Toggles ---
+    // ─── Codec toggle ───────────────────────────────────────────────
     function setCodec(c) {
       if(state.isStreaming) return;
       state.codec = c;
-      if(c === 'LZ4') {
-        DOM.codecLz4.className = "px-3 py-1.5 text-xs font-mono font-semibold rounded-md bg-app-panel border border-app-borderHover text-app-cyan shadow-sm transition-all";
-        DOM.codecZstd.className = "px-3 py-1.5 text-xs font-mono font-medium rounded-md text-app-muted hover:text-app-fg transition-all bg-transparent border border-transparent";
-      } else {
-        DOM.codecZstd.className = "px-3 py-1.5 text-xs font-mono font-semibold rounded-md bg-app-panel border border-app-borderHover text-app-cyan shadow-sm transition-all";
-        DOM.codecLz4.className = "px-3 py-1.5 text-xs font-mono font-medium rounded-md text-app-muted hover:text-app-fg transition-all bg-transparent border border-transparent";
-      }
-      appendLog('INFO', `Compression codec shifted to ${c}`);
+      const on  = 'px-2.5 py-1 text-[11px] font-mono rounded [background:#1c1c21] text-ink-fg transition-colors';
+      const off = 'px-2.5 py-1 text-[11px] font-mono rounded text-ink-dim hover:text-ink-mute transition-colors';
+      DOM.codecLz4.className  = c === 'LZ4'  ? on : off;
+      DOM.codecZstd.className = c === 'ZSTD' ? on : off;
+      appendLog('INFO', `Compression codec set to ${c}.`);
     }
     DOM.codecLz4.addEventListener('click', () => setCodec('LZ4'));
     DOM.codecZstd.addEventListener('click', () => setCodec('ZSTD'));
 
-    // --- Terminal Logging ---
+    // ─── Connect by code ────────────────────────────────────────────
+    const btnCopyCode = document.getElementById('btn-copy-code');
+    if (btnCopyCode) {
+      btnCopyCode.addEventListener('click', async () => {
+        const code = (document.getElementById('pairing-code-value') || {}).innerText || '';
+        try {
+          await navigator.clipboard.writeText(code.trim());
+          appendLog('INFO', `Pairing code copied to clipboard.`);
+        } catch (e) {
+          appendLog('WARN', `Copy failed — code is ${code.trim()}`);
+        }
+      });
+    }
+
+    // Join another node's swarm as a worker, using a pairing code.
+    const btnJoin = document.getElementById('btn-join');
+    if (btnJoin) {
+      btnJoin.addEventListener('click', async () => {
+        const model = (document.getElementById('join-model').value || '').trim();
+        const code = (document.getElementById('join-code').value || '').trim().toUpperCase();
+        const addr = (document.getElementById('join-addr').value || '').trim();
+        const statusEl = document.getElementById('join-status');
+        const setStatus = (msg, tone) => {
+          if (!statusEl) return;
+          statusEl.innerText = msg;
+          statusEl.className = `text-[11px] ${tone === 'good' ? 'text-ink-live' : tone === 'bad' ? 'text-ink-bad' : 'text-ink-info'}`;
+        };
+
+        if (!model) { setStatus('Model id is required.', 'bad'); return; }
+        if (!code) { setStatus('Pairing code is required.', 'bad'); return; }
+
+        btnJoin.disabled = true;
+        setStatus('Joining…', 'info');
+        const scoreNote = state.computeScore != null ? ` score=${state.computeScore}` : '';
+        appendLog('NET', `POST /api/session/join model=${model} code=${code}${scoreNote}`);
+        try {
+          const res = await api.join(model, code, addr || null, state.computeScore);
+          setStatus(`Joined as worker (peer …${String(res.peer_id || '').slice(-6)}).`, 'good');
+          appendLog('INFO', `Worker session started — peer ${res.peer_id}`);
+        } catch (e) {
+          setStatus(`Join failed: ${e.message}`, 'bad');
+          appendLog('ERROR', `Join failed: ${e.message}`);
+        } finally {
+          btnJoin.disabled = false;
+        }
+      });
+    }
+
+    // Contribute: download model + run compute benchmark.
+    const btnDownload = document.getElementById('btn-download');
+    if (btnDownload) {
+      btnDownload.addEventListener('click', async () => {
+        const model = (document.getElementById('join-model').value || '').trim();
+        const label = document.getElementById('btn-download-label');
+        const statusEl = document.getElementById('join-status');
+        if (!model) {
+          if (statusEl) { statusEl.innerText = 'Enter a model id first.'; statusEl.className = 'text-[11px] text-ink-warn'; }
+          return;
+        }
+        btnDownload.disabled = true;
+        const orig = label ? label.innerText : '';
+        if (label) label.innerText = 'downloading…';
+        appendLog('NET', `POST /api/download-model model=${model}`);
+        try {
+          await api.downloadModel(model);
+          if (label) label.innerText = '1 · downloaded ✓';
+          appendLog('INFO', `Model ready locally: ${model}`);
+        } catch (e) {
+          if (label) label.innerText = orig;
+          appendLog('ERROR', `Download failed: ${e.message}`);
+          if (statusEl) { statusEl.innerText = `Download failed: ${e.message}`; statusEl.className = 'text-[11px] text-ink-bad'; }
+        } finally {
+          btnDownload.disabled = false;
+        }
+      });
+    }
+
+    const btnBenchmark = document.getElementById('btn-benchmark');
+    if (btnBenchmark) {
+      btnBenchmark.addEventListener('click', async () => {
+        const label = document.getElementById('btn-benchmark-label');
+        const resultBox = document.getElementById('benchmark-result');
+        const scoreEl = document.getElementById('benchmark-score');
+        const deviceEl = document.getElementById('benchmark-device');
+        btnBenchmark.disabled = true;
+        const orig = label ? label.innerText : '';
+        if (label) label.innerText = 'running…';
+        appendLog('NET', 'POST /api/benchmark');
+        try {
+          const res = await api.benchmark();
+          state.computeScore = res.score;
+          if (scoreEl) scoreEl.innerText = String(res.score);
+          if (deviceEl) deviceEl.innerText = `${res.device} · ${res.cpu_threads} threads`;
+          if (resultBox) resultBox.classList.remove('hidden');
+          if (label) label.innerText = '2 · re-run compute test';
+          appendLog('INFO', `Compute score: ${res.score} (${res.device}, ${res.cpu_threads} threads)`);
+        } catch (e) {
+          if (label) label.innerText = orig;
+          appendLog('ERROR', `Benchmark failed: ${e.message}`);
+        } finally {
+          btnBenchmark.disabled = false;
+        }
+      });
+    }
+
+    // ─── Terminal logging ───────────────────────────────────────────
     function getTimestamp() {
       const now = new Date();
       return now.toISOString().split('T')[1].slice(0, -1);
