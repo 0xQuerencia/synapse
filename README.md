@@ -7,3 +7,5 @@ Synapse cuts a model into layers and hands the pieces out over a peer to peer ne
 ## how it works
 
 1. The master owns the embedding, the first chunk of layers, and the output head. It runs the show: pairing codes, routing, sampling.
+2. Workers take the rest of the layers. A token hops from the master through each worker and back, one hidden state at a time.
+3. An optional relay on a public machine lets people behind home routers find each other. It relays encrypted traffic and seeds discovery.
