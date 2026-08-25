@@ -37,3 +37,7 @@ Each command takes options. The useful ones: the model option points at any smal
 ## the gui
 
 There is also a local web interface in the gui crate. Build it, run the binary it produces, and it prints a local url. You get the console, a live network map, per node hardware stats, and a connect by code panel. A contribute page exists too, for handing friends a pre filled join link.
+
+## config
+
+Relay and bootstrap addresses live in toml files under config. Entries must be full multiaddrs ending in the peer id. Placeholders are skipped at load.
