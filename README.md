@@ -11,3 +11,13 @@ Synapse cuts a model into layers and hands the pieces out over a peer to peer ne
 3. An optional relay on a public machine lets people behind home routers find each other. It relays encrypted traffic and seeds discovery.
 
 Peers find each other three ways. On one network, multicast DNS just works. Across the internet, a DHT keyed by model id locates masters serving the model you want. When both sides sit behind NAT, relay circuits plus hole punching connect them.
+
+## getting started
+
+```
+git clone <repo url>
+cd synapse
+cargo build
+```
+
+Rust is the only requirement. Candle does the math, libp2p does the networking, and everything is tuned for the cpu you build on, so a plain build is already quick.
