@@ -81,3 +81,87 @@ cargo build --release -p synapse-gui</pre>
         <div class="flex items-center gap-3 mb-3">
           <span class="w-6 h-6 shrink-0 rounded-full border border-ink-lineHi text-ink-mute flex items-center justify-center font-medium text-[11px] mono">2</span>
           <h3 class="font-semibold text-[14px]">Open your own Synapse GUI</h3>
+        </div>
+        <p class="text-ink-dim text-[13px] mb-3">Run it locally and open the link it prints (your own localhost).</p>
+        <pre class="bg-black/60 border border-ink-line rounded-lg p-3 text-[12px] text-zinc-300 overflow-x-auto">./target/release/synapse-gui</pre>
+        <p class="text-ink-faint text-[11px] mt-2">Then open <code class="text-ink-mute">http://127.0.0.1:8080</code> → go to <b class="text-ink-mute">Network</b>.</p>
+      </div>
+
+      <!-- Step 3 -->
+      <div class="border border-ink-line rounded-xl p-5 bg-ink-surface">
+        <div class="flex items-center gap-3 mb-3">
+          <span class="w-6 h-6 shrink-0 rounded-full border border-ink-lineHi text-ink-mute flex items-center justify-center font-medium text-[11px] mono">3</span>
+          <h3 class="font-semibold text-[14px]">Download → Compute test → Join</h3>
+        </div>
+        <p class="text-ink-dim text-[13px] mb-3">Once your own GUI is running, use the link below — it opens your join panel with the model and pairing code already filled in:</p>
+        <a id="open-join-link" href="#" target="_blank"
+          class="block text-center bg-ink-fg text-black hover:bg-zinc-300 font-medium text-[12px] py-2.5 rounded-md transition-colors mb-3">
+          Open my join page (pre-filled)
+        </a>
+        <p class="text-ink-faint text-[11px] mb-3">Assumes your GUI runs on the default
+          <code class="text-ink-mute">127.0.0.1:8080</code>. If you started it on a different port, fill the panel manually:</p>
+        <ol class="text-[13px] text-ink-fg space-y-1.5 list-decimal list-inside">
+          <li><b>Download model</b> — set it to <code id="step-model" class="text-ink-info text-[12px]">…</code></li>
+          <li><b>Run compute test</b> — measures your machine's score</li>
+          <li>Paste the host's code <code id="step-code" class="text-ink-live">…</code>, then <b>Join as worker</b></li>
+        </ol>
+        <div class="mt-4 text-[12px] border-t border-ink-line pt-3 text-ink-dim leading-relaxed">
+          <b class="text-ink-mute">Host address:</b> ask the host for their reachable address.
+          Same WiFi → auto-discovered (mDNS), leave blank.
+          Different networks → you need a shared VPN (Tailscale is free) or relay address in the form
+          <code class="text-ink-info">/ip4/&lt;ip&gt;/udp/&lt;port&gt;/quic-v1</code>.
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="mt-8 text-[12px] text-ink-dim leading-relaxed border-t border-ink-line pt-5">
+      <p class="mb-2"><b class="text-ink-mute">Why a download?</b>
+        Contributing compute means running model layers + peer-to-peer networking, which a browser can't do.</p>
+      <p><b class="text-ink-mute">Networking:</b> on the same WiFi it just works. Across the internet both machines are behind NAT — you'll need Tailscale or a relay.</p>
+    </div>
+  </div>
+
+  <script>
+    const base = `${window.location.protocol}//${window.location.host}`;
+    async function refresh() {
+      try {
+        const r = await fetch(`${base}/api/worker-info`);
+        if (!r.ok) throw new Error(r.status);
+        const d = await r.json();
+        document.getElementById('info-model').innerText = d.model_id || '—';
+        document.getElementById('step-model').innerText = d.model_id || '(model id)';
+        const code = d.pairing_code || '--------';
+        document.getElementById('info-code').innerText = code;
+        document.getElementById('step-code').innerText = code;
+        const joinLink = document.getElementById('open-join-link');
+        if (joinLink && d.pairing_code && d.model_id) {
+          const params = new URLSearchParams({ code: d.pairing_code, model: d.model_id });
+          joinLink.href = `http://127.0.0.1:8080/?${params.toString()}`;
+        }
+        const pill = document.getElementById('status-pill');
+        const reason = document.getElementById('info-reason');
+        if (d.supports_workers) {
+          pill.innerText = 'ACCEPTING WORKERS';
+          pill.className = 'text-[10px] mono px-2 py-0.5 rounded border border-ink-live/40 text-ink-live';
+          reason.classList.add('hidden');
+        } else {
+          pill.innerText = 'NOT ACCEPTING WORKERS';
+          pill.className = 'text-[10px] mono px-2 py-0.5 rounded border border-ink-warn/40 text-ink-warn';
+          reason.innerText = d.reason || '';
+          reason.classList.remove('hidden');
+        }
+      } catch (e) {
+        document.getElementById('status-pill').innerText = 'HOST UNREACHABLE';
+      }
+    }
+    document.getElementById('copy-code').addEventListener('click', async () => {
+      const c = document.getElementById('info-code').innerText.trim();
+      try { await navigator.clipboard.writeText(c); document.getElementById('copy-code').innerText = 'copied'; }
+      catch (e) {}
+    });
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>
