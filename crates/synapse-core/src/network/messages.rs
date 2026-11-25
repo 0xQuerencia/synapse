@@ -14,8 +14,8 @@ pub enum RequestMessage {
     ReleaseShard(crate::inference::assignment::LeaseKey),
     NodeHello {
         hello: NodeHello,
-        /// Pairing code is now sent as a SHA-256 hash (never plaintext after Phase 4).
-        /// For backward compat, this field is kept but the handler validates the hash.
+        /// Reserved field, empty in protocol 0.4. Shared secrets and static
+        /// hashes must never be sent to discovery candidates.
         pairing_code: String,
     },
     ActivationRequest(ActivationRequest),
@@ -65,13 +65,58 @@ pub enum ResponseMessage {
 impl ResponseMessage {
     /// Create a `Rejected` response, truncating the reason to `MAX_REJECTED_REASON_LEN`.
     pub fn rejected(reason: &str) -> Self {
-        let truncated = if reason.len() > MAX_REJECTED_REASON_LEN {
-            &reason[..MAX_REJECTED_REASON_LEN]
-        } else {
-            reason
-        };
+        let mut end = reason.len().min(MAX_REJECTED_REASON_LEN);
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        let truncated = &reason[..end];
         ResponseMessage::Rejected {
             reason: truncated.to_owned(),
+        }
+    }
+}
+
+impl RequestMessage {
+    pub fn validate_wire(&self) -> Result<(), crate::ProtocolError> {
+        match self {
+            Self::NodeHello {
+                hello,
+                pairing_code,
+            } => {
+                if !pairing_code.is_empty() {
+                    return Err(crate::ProtocolError::AuthenticationFailed);
+                }
+                hello.validate()
+            }
+            Self::ActivationRequest(value) => value.validate(),
+            Self::ClearCache(value) => value.validate(),
+            Self::Challenge(value) => value.validate(),
+            Self::ChallengeResponse(value) => value.validate(),
+            Self::WeightRequest(value) => value.validate(),
+            Self::CapabilityPing(value) => value.validate(),
+            Self::HealthPing => Ok(()),
+            Self::KvTruncate(value) => value.validate(),
+        }
+    }
+}
+
+impl ResponseMessage {
+    pub fn validate_wire(&self) -> Result<(), crate::ProtocolError> {
+        match self {
+            // Protocol 0.4 requires a coordinator proof, never a bare ACK.
+            Self::Authenticated => Err(crate::ProtocolError::AuthenticationFailed),
+            Self::ActivationResponse(value) => value.validate(),
+            Self::ClearCacheAck(value) => value.validate(),
+            Self::Rejected { reason } if reason.len() <= MAX_REJECTED_REASON_LEN => Ok(()),
+            Self::Rejected { .. } => Err(crate::ProtocolError::InvalidField {
+                field: "reason",
+                reason: "rejection exceeds length limit",
+            }),
+            Self::ChallengeIssued(value) => value.validate(),
+            Self::WeightTransfer(value) => value.validate(),
+            Self::CapabilityAck { .. } => Ok(()),
+            Self::HealthPong(value) => value.validate(),
+            Self::KvTruncateAck(value) => value.validate(),
         }
     }
 }
@@ -161,5 +206,14 @@ mod tests {
             offset: 0,
         };
         assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn rejection_truncates_on_a_utf8_boundary() {
+        let reason = "é".repeat(255) + "界";
+        let ResponseMessage::Rejected { reason } = ResponseMessage::rejected(&reason) else {
+            panic!("expected rejection");
+        };
+        assert_eq!(reason.len(), 510);
     }
 }

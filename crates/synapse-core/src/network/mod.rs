@@ -4,6 +4,7 @@ pub mod connectivity;
 mod messages;
 mod node;
 mod peer_cache;
+pub mod quota;
 
 pub use codec::{ProtocolCodec, SynapseProtocol};
 pub use connection_pool::{ConnectionPool, ConnectionState, PoolStats};
