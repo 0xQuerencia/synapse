@@ -73,7 +73,7 @@ impl NodeIdentity {
             e
         })?;
         let mut bytes = Vec::new();
-        file.by_ref()
+        Read::by_ref(&mut file)
             .take(MAX_KEY_FILE_BYTES + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_KEY_FILE_BYTES {

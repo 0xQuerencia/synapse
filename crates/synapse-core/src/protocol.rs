@@ -3,7 +3,9 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: &str = "synapse/0.3.0";
+pub const PROTOCOL_VERSION: &str = "synapse/0.4.0";
+pub const CHALLENGE_TTL_SECS: u64 = 60;
+pub const MAX_CLOCK_SKEW_SECS: u64 = 5;
 
 /// Maximum nonce length (bytes, hex-encoded).
 pub const MAX_NONCE_LEN: usize = 128;
@@ -647,6 +649,17 @@ impl Challenge {
         Ok(())
     }
 
+    pub fn validate_at(&self, now: u64) -> Result<(), ProtocolError> {
+        self.validate()?;
+        if self.nonce.len() != 32
+            || self.timestamp > now.saturating_add(MAX_CLOCK_SKEW_SECS)
+            || now.saturating_sub(self.timestamp) >= CHALLENGE_TTL_SECS
+        {
+            return Err(ProtocolError::AuthenticationFailed);
+        }
+        Ok(())
+    }
+
     /// Generate a fresh challenge using OS randomness.
     pub fn generate() -> Self {
         use rand::RngCore;
@@ -668,7 +681,8 @@ impl Challenge {
 
 /// Worker → Master: response to authentication challenge.
 ///
-/// - `pairing_code_hash`: SHA-256 hex digest of the normalised pairing code.
+/// - `pairing_code_hash`: HMAC-SHA256 of a fresh challenge and both peer IDs;
+///   the historical field name is retained, but a static code hash is rejected.
 /// - `nonce`: echo of the challenge nonce (replay protection).
 /// - `signature`: Ed25519 signature over `Challenge::signing_payload()`.
 /// - `public_key`: protobuf-encoded public key (matches claimed `PeerId`).

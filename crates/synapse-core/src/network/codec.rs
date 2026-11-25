@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::{RequestMessage, ResponseMessage};
 use crate::protocol::MAX_WIRE_MESSAGE_BYTES;
 
-pub const SYNAPSE_PROTOCOL: &str = "/synapse/0.3.0";
+pub const SYNAPSE_PROTOCOL: &str = "/synapse/0.4.0";
 const MAX_PROTOCOL_MESSAGE_BYTES: usize = MAX_WIRE_MESSAGE_BYTES;
 
 #[derive(Clone, Default)]
