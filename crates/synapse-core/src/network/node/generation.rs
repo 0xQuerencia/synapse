@@ -10,9 +10,7 @@ use super::{
 };
 use crate::inference::{ToyLlama, payload_to_tensor, tensor_to_payload};
 use crate::network::node::speculation::MAX_DRAFT_LEN;
-use crate::{
-    StaticShardAssignment, WeightedShardParticipant, plan_static_shards, plan_weighted_shards,
-};
+use crate::{WeightedShardParticipant, plan_weighted_shards};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RouteParticipant {
@@ -62,79 +60,42 @@ fn build_generation_route(
     master_capability: Option<crate::NodeCapability>,
     workers_in_order: &[RouteWorkerCandidate],
 ) -> Result<GenerationRoutePlan, String> {
-    let mut participants = Vec::with_capacity(workers_in_order.len() + 1);
-    participants.push(RouteParticipant::Master);
-    participants.extend(
-        workers_in_order
-            .iter()
-            .map(|worker| RouteParticipant::Worker(worker.peer_id)),
-    );
-
-    // ─── Phase 3: capability-aware planner ─────────────────────────
-    // If every worker has a structured `WorkerCapability` (i.e. the
-    // worker has sent at least one `CapabilityPing` heartbeat),
-    // use the new planner. Otherwise fall back to the legacy
-    // capability-scalar path so a pre-Phase-2 worker still works.
-    let all_workers_have_wire = workers_in_order.iter().all(|w| w.wire_capability.is_some());
-    let _all_workers_have_legacy = workers_in_order.iter().all(|w| w.capability.is_some());
-
-    let assignments = if all_workers_have_wire && !workers_in_order.is_empty() {
-        // Master owns a fixed lower prefix; workers split the rest
-        // proportionally based on `per_layer_throughput`.
-        let workers_only: Vec<(RouteParticipant, crate::WorkerCapability)> = workers_in_order
-            .iter()
-            .map(|w| {
-                (
-                    RouteParticipant::Worker(w.peer_id),
-                    w.wire_capability.clone().expect("checked above"),
-                )
+    let master = master_capability.ok_or("master memory capacity is unknown")?;
+    let mut seen = HashSet::new();
+    let mut participants = vec![WeightedShardParticipant {
+        participant: RouteParticipant::Master,
+        capability: master,
+    }];
+    for worker in workers_in_order {
+        if !seen.insert(worker.peer_id) {
+            return Err("duplicate worker in route candidates".to_owned());
+        }
+        let capability = worker
+            .wire_capability
+            .as_ref()
+            .map(|wire| crate::NodeCapability {
+                compute_score: wire.compute_score,
+                available_ram_mb: wire.available_ram_mb,
             })
-            .collect();
-        let worker_assignments = crate::plan_weighted_shards_capable(total_layers, &workers_only)
-            .map_err(|e| format!("capability-aware planner failed: {e}"))?;
-        // Shift worker ranges up by the master's prefix so the
-        // master and workers don't overlap.
-        let master_split = total_layers / (workers_in_order.len() + 1);
-        let mut all: Vec<StaticShardAssignment<RouteParticipant>> = Vec::new();
-        if master_split > 0 {
-            all.push(StaticShardAssignment {
-                participant: RouteParticipant::Master,
-                layer_range: 0..master_split,
-            });
-        }
-        let mut cumulative = master_split;
-        for mut a in worker_assignments {
-            let len = a.layer_range.len();
-            a.layer_range = cumulative..cumulative + len;
-            cumulative += len;
-            all.push(a);
-        }
-        all
-    } else {
-        let weighted_inputs = master_capability.and_then(|master_capability| {
-            let mut weighted = Vec::with_capacity(workers_in_order.len() + 1);
-            weighted.push(WeightedShardParticipant {
-                participant: RouteParticipant::Master,
-                capability: master_capability,
-            });
-            for worker in workers_in_order {
-                let capability = worker.capability?;
-                weighted.push(WeightedShardParticipant {
-                    participant: RouteParticipant::Worker(worker.peer_id),
-                    capability,
-                });
-            }
-            Some(weighted)
+            .or(worker.capability)
+            .ok_or("worker memory capacity is unknown")?;
+        participants.push(WeightedShardParticipant {
+            participant: RouteParticipant::Worker(worker.peer_id),
+            capability,
         });
-
-        if let Some(weighted_inputs) = weighted_inputs {
-            plan_weighted_shards(total_layers, &weighted_inputs)
-                .map_err(|error| format!("failed to build weighted generation route: {error}"))?
-        } else {
-            plan_static_shards(total_layers, &participants)
-                .map_err(|error| format!("failed to build static generation route: {error}"))?
-        }
-    };
+    }
+    // One plan covers the full model, including the coordinator. Never shift
+    // a complete worker plan by a second independently calculated prefix.
+    let assignments = plan_weighted_shards(total_layers, &participants)
+        .map_err(|error| format!("no feasible generation route: {error}"))?;
+    crate::shard::validate_exact_coverage(
+        total_layers,
+        &assignments
+            .iter()
+            .map(|assignment| assignment.layer_range.clone())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| error.to_string())?;
 
     let mut master_layer_range = None;
     let mut worker_hops = Vec::new();
@@ -151,9 +112,7 @@ fn build_generation_route(
         }
     }
 
-    let master_layer_range = master_layer_range.ok_or_else(|| {
-        "invalid generation route: master shard was not assigned any layers".to_owned()
-    })?;
+    let master_layer_range = master_layer_range.unwrap_or(0..0);
 
     Ok(GenerationRoutePlan {
         master_layer_range,
@@ -1915,28 +1874,47 @@ mod tests {
         let workers = vec![
             RouteWorkerCandidate {
                 peer_id: worker_a,
-                capability: None,
+                capability: Some(NodeCapability {
+                    compute_score: 1,
+                    available_ram_mb: 4096,
+                }),
                 wire_capability: None,
             },
             RouteWorkerCandidate {
                 peer_id: worker_b,
-                capability: None,
+                capability: Some(NodeCapability {
+                    compute_score: 1,
+                    available_ram_mb: 4096,
+                }),
                 wire_capability: None,
             },
             RouteWorkerCandidate {
                 peer_id: worker_c,
-                capability: None,
+                capability: Some(NodeCapability {
+                    compute_score: 1,
+                    available_ram_mb: 4096,
+                }),
                 wire_capability: None,
             },
             RouteWorkerCandidate {
                 peer_id: worker_d,
-                capability: None,
+                capability: Some(NodeCapability {
+                    compute_score: 1,
+                    available_ram_mb: 4096,
+                }),
                 wire_capability: None,
             },
         ];
 
-        let route_plan =
-            build_generation_route(17, None, &workers).expect("route planning should succeed");
+        let route_plan = build_generation_route(
+            17,
+            Some(NodeCapability {
+                compute_score: 1,
+                available_ram_mb: 4096,
+            }),
+            &workers,
+        )
+        .expect("route planning should succeed");
 
         let routed_workers: Vec<_> = route_plan
             .worker_hops
@@ -1963,16 +1941,25 @@ mod tests {
         let worker_b = PeerId::random();
         let route_plan = build_generation_route(
             8,
-            None,
+            Some(NodeCapability {
+                compute_score: 1,
+                available_ram_mb: 4096,
+            }),
             &[
                 RouteWorkerCandidate {
                     peer_id: worker_a,
-                    capability: None,
+                    capability: Some(NodeCapability {
+                        compute_score: 1,
+                        available_ram_mb: 4096,
+                    }),
                     wire_capability: None,
                 },
                 RouteWorkerCandidate {
                     peer_id: worker_b,
-                    capability: None,
+                    capability: Some(NodeCapability {
+                        compute_score: 1,
+                        available_ram_mb: 4096,
+                    }),
                     wire_capability: None,
                 },
             ],
@@ -2067,37 +2054,90 @@ mod tests {
     }
 
     #[test]
-    fn route_planner_falls_back_to_static_when_capabilities_missing() {
-        let worker_a = PeerId::random();
-        let worker_b = PeerId::random();
+    fn route_planner_rejects_unknown_memory_and_infeasible_routes() {
+        let worker = RouteWorkerCandidate {
+            peer_id: PeerId::random(),
+            capability: None,
+            wire_capability: None,
+        };
+        assert!(build_generation_route(8, None, &[]).is_err());
+        assert!(
+            build_generation_route(
+                8,
+                Some(NodeCapability {
+                    compute_score: 1,
+                    available_ram_mb: 4096
+                }),
+                &[worker]
+            )
+            .is_err()
+        );
+        assert!(
+            build_generation_route(
+                8,
+                Some(NodeCapability {
+                    compute_score: 1,
+                    available_ram_mb: 50
+                }),
+                &[]
+            )
+            .is_err()
+        );
+    }
 
-        let route_plan = build_generation_route(
-            8,
+    #[test]
+    fn wire_capability_never_shifts_workers_beyond_model_end() {
+        let capability = crate::WorkerCapability {
+            compute_score: 1,
+            available_ram_mb: 4096,
+            hardware: crate::HardwareSummary {
+                has_gpu: false,
+                backend: crate::ComputeBackend::Cpu,
+                estimated_fp16_tflops: None,
+                vram_total_bytes: None,
+                vram_free_bytes: None,
+                cpu_threads: 1,
+            },
+        };
+        let worker = RouteWorkerCandidate {
+            peer_id: PeerId::random(),
+            capability: None,
+            wire_capability: Some(capability),
+        };
+        let route = build_generation_route(
+            12,
             Some(NodeCapability {
-                compute_score: 10,
-                available_ram_mb: 4_096,
+                compute_score: 1,
+                available_ram_mb: 4096,
             }),
-            &[
-                RouteWorkerCandidate {
-                    peer_id: worker_a,
-                    capability: None,
-                    wire_capability: None,
-                },
-                RouteWorkerCandidate {
-                    peer_id: worker_b,
-                    capability: Some(NodeCapability {
-                        compute_score: 1,
-                        available_ram_mb: 4_096,
-                    }),
-                    wire_capability: None,
-                },
-            ],
+            &[worker],
         )
-        .expect("fallback route planning should work");
+        .unwrap();
+        assert_eq!(route.master_layer_range, 0..6);
+        assert_eq!(route.worker_hops[0].layer_range, 6..12);
+    }
 
-        assert_eq!(route_plan.master_layer_range, 0..3);
-        assert_eq!(route_plan.worker_hops[0].layer_range, 3..6);
-        assert_eq!(route_plan.worker_hops[1].layer_range, 6..8);
+    #[test]
+    fn coordinator_can_own_no_transformer_layers() {
+        let worker = RouteWorkerCandidate {
+            peer_id: PeerId::random(),
+            capability: Some(NodeCapability {
+                compute_score: 1,
+                available_ram_mb: 4096,
+            }),
+            wire_capability: None,
+        };
+        let route = build_generation_route(
+            12,
+            Some(NodeCapability {
+                compute_score: 1,
+                available_ram_mb: 0,
+            }),
+            &[worker],
+        )
+        .unwrap();
+        assert_eq!(route.master_layer_range, 0..0);
+        assert_eq!(route.worker_hops[0].layer_range, 0..12);
     }
 
     #[test]
@@ -2106,16 +2146,25 @@ mod tests {
         let worker_b = PeerId::random();
         let route_plan = build_generation_route(
             8,
-            None,
+            Some(NodeCapability {
+                compute_score: 1,
+                available_ram_mb: 4096,
+            }),
             &[
                 RouteWorkerCandidate {
                     peer_id: worker_a,
-                    capability: None,
+                    capability: Some(NodeCapability {
+                        compute_score: 1,
+                        available_ram_mb: 4096,
+                    }),
                     wire_capability: None,
                 },
                 RouteWorkerCandidate {
                     peer_id: worker_b,
-                    capability: None,
+                    capability: Some(NodeCapability {
+                        compute_score: 1,
+                        available_ram_mb: 4096,
+                    }),
                     wire_capability: None,
                 },
             ],
