@@ -88,7 +88,7 @@ pub struct SynapseBehaviour {
     pub relay_server: Toggle<relay::Behaviour>,
     pub dcutr: dcutr::Behaviour,
     pub autonat: autonat::Behaviour,
-    pub kad: kad::Behaviour<kad::store::MemoryStore>,
+    pub kad: Toggle<kad::Behaviour<kad::store::MemoryStore>>,
     pub ping: ping::Behaviour,
     pub mdns: Toggle<mdns::tokio::Behaviour>,
     pub connection_limits: libp2p::connection_limits::Behaviour,
@@ -162,6 +162,7 @@ struct WorkerRegistryEntry {
     layers_assigned: Option<u32>,
     tokens_per_sec: Option<f32>,
     util_pct: Option<f32>,
+    observed_decode: Option<crate::inference::routing::DecodeObservation>,
 }
 
 #[derive(Default)]
@@ -267,6 +268,7 @@ impl WorkerRegistry {
                 layers_assigned: None,
                 tokens_per_sec: None,
                 util_pct: None,
+                observed_decode: None,
             });
         entry.peer_id = peer_id;
         entry.state = state;
@@ -332,6 +334,7 @@ pub struct NodeStatusSnapshot {
     pub ready_ranges: Vec<crate::inference::registry::SignedAvailability>,
     pub listen_addresses: Vec<String>,
     pub worker_state: Option<crate::network::worker::WorkerSnapshot>,
+    pub route_decision: Option<crate::inference::routing::RouteDecision>,
     /// Every worker the registry knows about, with connection state.
     pub peers: Vec<PeerSummary>,
     /// Number of workers that have fully authenticated (challenge-response).
@@ -461,6 +464,11 @@ pub struct SynapseNode {
     memory_profile: Option<crate::inference::memory::ModelMemoryProfile>,
     active_memory_estimate: Option<crate::inference::memory::MemoryEstimate>,
     ready_registry: crate::inference::registry::ReadyRegistry,
+    max_route_stages: usize,
+    route_decision: Option<crate::inference::routing::RouteDecision>,
+    peer_rtts: HashMap<PeerId, (Duration, Instant)>,
+    local_decode_observation: Option<crate::inference::routing::DecodeObservation>,
+    local_step_compute_micros: u64,
     role: SynapseRole,
     model: ModelIdentity,
     swarm: Swarm<SynapseBehaviour>,
@@ -722,6 +730,7 @@ impl SynapseNode {
                 .as_ref()
                 .map(|model| model.layer_offset()..model.layer_offset() + model.owned_layers()),
             memory_budget_bytes: self.memory_limit_bytes,
+            route_decision: self.route_decision.clone(),
             listen_addresses: self.swarm.listeners().map(ToString::to_string).collect(),
             worker_state: matches!(self.role, SynapseRole::Worker { .. })
                 .then(|| self.worker_snapshot()),

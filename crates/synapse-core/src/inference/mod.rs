@@ -8,6 +8,7 @@ pub mod model_loader;
 pub mod pipeline;
 pub mod prompt_format;
 pub mod registry;
+pub mod routing;
 pub mod tensor_wire;
 pub mod tokenizer;
 

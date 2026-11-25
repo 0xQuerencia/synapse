@@ -36,6 +36,7 @@ impl SynapseNode {
         let net_config = NetConfig::load_strict_default()
             .map_err(|error| NetworkError::Transport(error.to_string()))?;
         let lan_discovery = net_config.discovery.allow_lan_discovery;
+        let dht_discovery = net_config.discovery.allow_dht_discovery;
         let relay_config = crate::network::connectivity::RelayLimits::default()
             .to_libp2p_config()
             .map_err(NetworkError::Transport)?;
@@ -80,9 +81,12 @@ impl SynapseNode {
                 let autonat = autonat::Behaviour::new(local_peer_id, autonat::Config::default());
 
                 // Kademlia DHT — internet-wide peer discovery.
-                let kad_store = kad::store::MemoryStore::new(local_peer_id);
-                let mut kad = kad::Behaviour::new(local_peer_id, kad_store);
-                kad.set_mode(Some(kad::Mode::Server));
+                let kad = Toggle::from(dht_discovery.then(|| {
+                    let store = kad::store::MemoryStore::new(local_peer_id);
+                    let mut behaviour = kad::Behaviour::new(local_peer_id, store);
+                    behaviour.set_mode(Some(kad::Mode::Server));
+                    behaviour
+                }));
 
                 // Ping — keepalive and liveness checks.
                 let ping = ping::Behaviour::new(ping::Config::default());
@@ -173,6 +177,11 @@ impl SynapseNode {
             memory_profile: None,
             active_memory_estimate: None,
             ready_registry: Default::default(),
+            max_route_stages: 4,
+            route_decision: None,
+            peer_rtts: Default::default(),
+            local_decode_observation: None,
+            local_step_compute_micros: 0,
             role,
             model,
             swarm,
@@ -312,6 +321,10 @@ impl SynapseNode {
                 .map_err(|error| NetworkError::Inference(error.to_string()))?,
         );
         self.pipeline = None;
+        self.local_decode_observation = None;
+        for entry in self.worker_registry.entries.values_mut() {
+            entry.observed_decode = None;
+        }
         self.tokenizer = Some(std::sync::Arc::new(tokenizer));
         self.total_layers = total;
         self.model_config = Some(config);
@@ -441,6 +454,17 @@ impl SynapseNode {
         Ok(())
     }
 
+    /// Bound the planner's remote stages (the coordinator IO is additional).
+    pub fn set_max_route_stages(&mut self, limit: usize) -> Result<(), NetworkError> {
+        if !(1..=8).contains(&limit) || self.generation_active {
+            return Err(NetworkError::Inference(
+                "stage limit must be 1..=8 and set before generation".into(),
+            ));
+        }
+        self.max_route_stages = limit;
+        Ok(())
+    }
+
     pub fn local_peer_id(&self) -> libp2p::PeerId {
         *self.swarm.local_peer_id()
     }
@@ -451,14 +475,15 @@ impl SynapseNode {
         let net_config = self.net_config.clone();
         if net_config.discovery.allow_dht_discovery {
             for addr in &net_config.bootstrap {
-                if let Some(peer_id) = extract_peer_id(addr) {
-                    self.swarm
-                        .behaviour_mut()
-                        .kad
-                        .add_address(&peer_id, addr.clone());
+                if let Some(peer_id) = extract_peer_id(addr)
+                    && let Some(kad) = self.swarm.behaviour_mut().kad.as_mut()
+                {
+                    kad.add_address(&peer_id, addr.clone());
                 }
             }
-            if let Err(error) = self.swarm.behaviour_mut().kad.bootstrap() {
+            if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut()
+                && let Err(error) = kad.bootstrap()
+            {
                 warn!(%error, "DHT bootstrap unavailable");
             }
         }
@@ -479,11 +504,8 @@ impl SynapseNode {
         match &self.role {
             // Masters advertise that they serve this model so workers can find them.
             SynapseRole::Master { .. } if net_config.discovery.allow_dht_discovery => {
-                if let Err(e) = self
-                    .swarm
-                    .behaviour_mut()
-                    .kad
-                    .start_providing(model_key.clone())
+                if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut()
+                    && let Err(e) = kad.start_providing(model_key.clone())
                 {
                     warn!("DHT start_providing failed: {}", e);
                 }
@@ -526,7 +548,9 @@ impl SynapseNode {
                         self.model.id
                     );
                     if net_config.discovery.allow_dht_discovery {
-                        self.swarm.behaviour_mut().kad.get_providers(model_key);
+                        if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
+                            kad.get_providers(model_key);
+                        }
                     }
                 }
             }

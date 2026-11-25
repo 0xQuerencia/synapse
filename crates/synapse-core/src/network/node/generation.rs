@@ -13,6 +13,7 @@ use crate::network::node::speculation::MAX_DRAFT_LEN;
 #[cfg(test)]
 use crate::{WeightedShardParticipant, plan_weighted_shards};
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RouteParticipant {
     Master,
@@ -130,9 +131,11 @@ fn ensure_worker_available(
 }
 
 impl SynapseNode {
-    fn plan_model_route(&self) -> anyhow::Result<GenerationRoutePlan> {
-        use crate::inference::pipeline::TensorRoles;
-        use crate::shard::{BoundedShardParticipant, plan_bounded_shards};
+    fn plan_model_route(&mut self) -> anyhow::Result<GenerationRoutePlan> {
+        use crate::inference::{
+            pipeline::TensorRoles,
+            routing::{RouteCandidate, select_route},
+        };
         let profile = self
             .memory_profile
             .as_ref()
@@ -144,21 +147,24 @@ impl SynapseNode {
             .ok_or_else(|| anyhow::anyhow!("context overflow"))?;
         let local_capacity =
             profile.layer_capacity(self.memory_limit_bytes, context, TensorRoles::COORDINATOR)?;
-        let mut participants = vec![BoundedShardParticipant {
-            participant: RouteParticipant::Master,
-            compute_score: self
-                .measured_compute_score
-                .ok_or_else(|| anyhow::anyhow!("local throughput unmeasured"))?,
+        let coordinator = RouteCandidate {
+            id: self.local_peer_id().to_string(),
             max_layers: if self.coordinator_only {
                 0
             } else {
                 local_capacity
             },
-        }];
+            measured_compute_score: self
+                .measured_compute_score
+                .ok_or_else(|| anyhow::anyhow!("local throughput unmeasured"))?,
+            measured_rtt_micros: None,
+            observed_decode: self.local_decode_observation.clone(),
+        };
+        let mut candidates = Vec::new();
         let mut seen = HashSet::new();
         for peer in &self.worker_peers {
             anyhow::ensure!(seen.insert(*peer), "duplicate route candidate");
-            if !self.authenticated_workers.contains(peer) {
+            if !self.authenticated_workers.contains(peer) || self.revocations.contains(peer) {
                 continue;
             }
             let cap = self
@@ -171,30 +177,71 @@ impl SynapseNode {
             let max_layers = profile
                 .layer_capacity(bytes, context, TensorRoles::WORKER)
                 .unwrap_or(0);
-            let compute_score = cap.compute_score.unwrap_or(0);
-            if max_layers > 0 && compute_score > 0 {
-                participants.push(BoundedShardParticipant {
-                    participant: RouteParticipant::Worker(*peer),
-                    compute_score,
-                    max_layers,
-                });
+            let measured_compute_score = cap.compute_score.unwrap_or(0);
+            if max_layers == 0 || measured_compute_score == 0 {
+                continue;
             }
+            candidates.push(RouteCandidate {
+                id: peer.to_string(),
+                max_layers,
+                measured_compute_score,
+                measured_rtt_micros: self
+                    .peer_rtts
+                    .get(peer)
+                    .filter(|(_, at)| at.elapsed().as_secs() <= 300)
+                    .map(|(rtt, _)| rtt.as_micros().min(u64::MAX as u128) as u64),
+                observed_decode: self
+                    .worker_registry
+                    .entries
+                    .get(peer)
+                    .and_then(|entry| entry.observed_decode.clone()),
+            });
         }
-        let assignments = plan_bounded_shards(self.total_layers, &participants)?;
+        // Capacity first preserves feasible coverage within the explicit eight
+        // candidate bound; IDs make ties independent of connection arrival.
+        candidates.sort_by(|a, b| {
+            b.max_layers
+                .cmp(&a.max_layers)
+                .then(b.measured_compute_score.cmp(&a.measured_compute_score))
+                .then(a.id.cmp(&b.id))
+        });
+        let available = candidates.len();
+        candidates.truncate(8);
+        let mut selected = select_route(
+            self.total_layers,
+            &coordinator,
+            &candidates,
+            self.max_route_stages,
+            context,
+            super::assignments::unix_now(),
+        )?;
+        if available > 8 {
+            selected.decision.explanation.push_str(&format!(
+                " Search bounded to eight of {available} capable members."
+            ));
+        }
+        info!(mode=%selected.decision.mode,remote_stages=selected.decision.selected_remote_stages,
+            predicted_decode_micros=?selected.decision.predicted_decode_micros,"selected feasible measured topology route");
+        self.route_decision = Some(selected.decision);
         let mut route = GenerationRoutePlan {
             master_layer_range: 0..0,
             worker_hops: Vec::new(),
         };
-        for assignment in assignments {
-            match assignment.participant {
-                RouteParticipant::Master => route.master_layer_range = assignment.layer_range,
-                RouteParticipant::Worker(peer_id) => route.worker_hops.push(WorkerRouteHop {
-                    peer_id,
-                    layer_range: assignment.layer_range,
-                }),
+        for stage in selected.stages {
+            if stage.id == coordinator.id {
+                route.master_layer_range = stage.layer_range;
+            } else {
+                route.worker_hops.push(WorkerRouteHop {
+                    peer_id: stage.id.parse()?,
+                    layer_range: stage.layer_range,
+                });
             }
         }
         Ok(route)
+    }
+
+    fn generation_context_limit(&self) -> usize {
+        self.token_ids.len() + self.current_max_tokens() - self.tokens_generated
     }
 
     /// Called when a new prompt arrives from the CLI REPL channel.
@@ -348,6 +395,8 @@ impl SynapseNode {
         // compute each worker's share of total step latency once it
         // completes (see `publish_step_telemetry`).
         self.step_started_at = Some(Instant::now());
+        let local_started = Instant::now();
+        self.local_step_compute_micros = 0;
         self.step_hop_durations_ms.clear();
 
         // Decide what this step feeds through the route:
@@ -436,6 +485,12 @@ impl SynapseNode {
             }
         };
 
+        if let Err(error) = pipeline.model_device().synchronize() {
+            self.fail_generation(format!("device synchronization failed: {error}"));
+            return;
+        }
+        self.local_step_compute_micros =
+            local_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         // Every KV cache along the route now holds these positions too —
         // track the count so speculative rollbacks know the base length.
         self.kv_cache_len += activation_tokens.len();
@@ -653,8 +708,6 @@ impl SynapseNode {
         peer: Option<PeerId>,
         worker_output: candle_core::Tensor,
     ) {
-        self.publish_step_telemetry();
-
         // Phase 10: speculative rounds verify a whole draft block instead
         // of sampling one token.
         if let Some(round) = self.spec_round.take() {
@@ -676,6 +729,7 @@ impl SynapseNode {
             }
         };
 
+        let head_started = Instant::now();
         let logits = match pipeline.head_last_token(&worker_output) {
             Ok(logits) => logits,
             Err(error) => {
@@ -691,6 +745,20 @@ impl SynapseNode {
                 return;
             }
         };
+
+        if self.tokens_generated > 0 {
+            let head_micros = head_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            self.local_decode_observation = Some(crate::inference::routing::DecodeObservation {
+                layers: pipeline.owned_layers(),
+                context_limit: self.generation_context_limit(),
+                elapsed_micros: self
+                    .local_step_compute_micros
+                    .saturating_add(head_micros)
+                    .max(1),
+                sampled_at_unix: super::assignments::unix_now(),
+            });
+        }
+        self.publish_step_telemetry();
 
         let tokenizer = match &self.tokenizer {
             Some(tokenizer) => Arc::clone(tokenizer),
@@ -1428,6 +1496,19 @@ impl SynapseNode {
                 // Phase 1 Task 1.5: Record latency for adaptive timeout calculation
                 if let Some(dispatch_time) = in_flight.dispatch_time {
                     let latency = dispatch_time.elapsed();
+                    if in_flight.pass == ActivationPass::Decode {
+                        let context_limit = self.generation_context_limit();
+                        if let Some(entry) = self.worker_registry.entries.get_mut(&peer) {
+                            entry.observed_decode =
+                                Some(crate::inference::routing::DecodeObservation {
+                                    layers: current_hop.layer_range.len(),
+                                    context_limit,
+                                    elapsed_micros: latency.as_micros().min(u64::MAX as u128).max(1)
+                                        as u64,
+                                    sampled_at_unix: super::assignments::unix_now(),
+                                });
+                        }
+                    }
                     // Update per-worker latency window (last 20 samples)
                     self.worker_latencies
                         .entry(peer)
@@ -1456,7 +1537,7 @@ impl SynapseNode {
                     .map(|d| d.elapsed().as_secs_f32())
                     .unwrap_or(0.0);
                 if latency_secs > 0.0 && in_flight.sequence_position > 0 {
-                    let throughput = in_flight.sequence_position as f32 / latency_secs;
+                    let throughput = 1.0_f32 / latency_secs;
                     let recalibrated = self
                         .batch_profiles
                         .entry(peer)

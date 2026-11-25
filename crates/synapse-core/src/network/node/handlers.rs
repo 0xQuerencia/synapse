@@ -55,6 +55,7 @@ impl SynapseNode {
                 info!(%peer_id, ?cause, "connection closed");
                 self.transport_peer_disconnected(peer_id);
                 self.ready_registry.remove_peer(peer_id);
+                self.peer_rtts.remove(&peer_id);
                 if matches!(self.role, SynapseRole::Worker { .. }) {
                     let was_authenticated = self.authenticated_workers.remove(&peer_id);
                     let was_greeted = self.greeted_peers.remove(&peer_id);
@@ -239,12 +240,31 @@ impl SynapseNode {
                     observed_addr = %info.observed_addr,
                     "identify: received peer info"
                 );
-                // Add the peer's listen addresses to the DHT for discovery.
-                for addr in &info.listen_addrs {
-                    self.swarm
-                        .behaviour_mut()
-                        .kad
-                        .add_address(&peer_id, addr.clone());
+                // Only configured DHT membership/entry points contribute
+                // addresses. DHT is absent entirely when discovery is off.
+                let approved = self
+                    .net_config
+                    .discovery
+                    .allowed_peers
+                    .contains(&peer_id.to_string())
+                    || self
+                        .net_config
+                        .bootstrap
+                        .iter()
+                        .chain(&self.net_config.relays)
+                        .any(|addr| super::helpers::extract_peer_id(addr) == Some(peer_id));
+                if approved && let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
+                    for addr in info.listen_addrs.iter().take(8) {
+                        let mut pinned = addr.clone();
+                        if super::helpers::extract_peer_id(&pinned).is_none() {
+                            pinned.push(libp2p::multiaddr::Protocol::P2p(peer_id));
+                        }
+                        if crate::netconfig::validate_direct_peer_addr(&pinned)
+                            .is_ok_and(|peer| peer == peer_id)
+                        {
+                            kad.add_address(&peer_id, pinned);
+                        }
+                    }
                 }
 
                 // Cache authenticated workers for faster reconnection
@@ -328,6 +348,10 @@ impl SynapseNode {
     fn handle_ping_event(&mut self, event: ping::Event) {
         match event.result {
             Ok(duration) => {
+                if self.peer_rtts.len() < 64 || self.peer_rtts.contains_key(&event.peer) {
+                    self.peer_rtts
+                        .insert(event.peer, (duration, Instant::now()));
+                }
                 debug!(peer = %event.peer, rtt_ms = duration.as_millis(), "ping: ok");
             }
             Err(error) => {
