@@ -1464,43 +1464,28 @@ impl ToyLlama {
 pub fn shard_files(weights_path: &Path) -> Result<Vec<PathBuf>> {
     let index_path = weights_path.with_file_name("model.safetensors.index.json");
     if !index_path.exists() {
+        anyhow::ensure!(
+            weights_path
+                .extension()
+                .is_some_and(|ext| ext == "safetensors"),
+            "expected a safetensors checkpoint or index"
+        );
+        anyhow::ensure!(weights_path.is_file(), "missing weights file");
         return Ok(vec![weights_path.to_path_buf()]);
     }
-    let content = std::fs::read_to_string(&index_path)
-        .with_context(|| format!("failed to read shard index {}", index_path.display()))?;
-    let index: serde_json::Value = serde_json::from_str(&content)
-        .with_context(|| format!("shard index {} is not valid JSON", index_path.display()))?;
-    let weight_map = index
-        .get("weight_map")
-        .and_then(serde_json::Value::as_object)
-        .context("shard index is missing its weight_map")?;
-    let dir = weights_path.parent().unwrap_or_else(|| Path::new("."));
-    let mut shards: Vec<PathBuf> = weight_map
-        .values()
-        .filter_map(serde_json::Value::as_str)
+    let directory = weights_path.parent().unwrap_or_else(|| Path::new("."));
+    super::model_loader::read_safetensors_index(&index_path)?
+        .into_iter()
         .map(|name| {
-            if name.contains('/')
-                || name.contains('\\')
-                || name == ".."
-                || name.starts_with("../")
-                || name.contains("..")
-            {
-                bail!("shard index lists an unsafe path: {name}");
-            }
-            Ok(dir.join(name))
+            let path = directory.join(name);
+            anyhow::ensure!(
+                path.is_file(),
+                "missing checkpoint shard {}",
+                path.display()
+            );
+            Ok(path)
         })
-        .collect::<Result<Vec<_>>>()?;
-    if shards.is_empty() {
-        bail!("shard index contains no shard files");
-    }
-    shards.sort();
-    shards.dedup();
-    info!(
-        shard_count = shards.len(),
-        ?dir,
-        "resolved multi-shard checkpoint"
-    );
-    Ok(shards)
+        .collect()
 }
 
 // ─── ShardedModel trait ─────────────────────────────────────────────────────
