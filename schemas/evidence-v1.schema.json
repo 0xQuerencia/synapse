@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:synapse:schema:evidence:1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "package": {
+      "type": "string",
+      "pattern": "^PR-(0[1-9]|[1-4][0-9]|5[0-6])$"
+    },
+    "status": {
+      "enum": [
+        "proposed",
+        "implemented",
+        "locally_tested",
+        "awaiting_evidence",
+        "accepted",
+        "released"
+      ]
+    },
+    "source_revision": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "dirty_worktree": {
+      "type": "boolean"
+    },
+    "environment": {
+      "type": "string",
+      "minLength": 1
+    },
+    "topology": {
+      "enum": [
+        "none",
+        "loopback",
+        "physical_lan",
+        "physical_wan",
+        "simulated_wan"
+      ]
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "urn:synapse:schema:evidence-command:1",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "artifact": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "argv",
+          "exit_code",
+          "artifact"
+        ]
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reviewer": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "release_artifact": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "package",
+    "status",
+    "source_revision",
+    "dirty_worktree",
+    "environment",
+    "topology",
+    "commands",
+    "limitations",
+    "reviewer",
+    "release_artifact"
+  ]
+}

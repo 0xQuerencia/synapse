@@ -1,0 +1,19 @@
+{
+  "protocol": "/synapse/0.4.0",
+  "encoding": "bincode-1-fixed-int-little-endian",
+  "marker": 255,
+  "vectors": [
+    {
+      "request": "HealthPing",
+      "variant_index": 7,
+      "body_hex": "07000000",
+      "frame_hex": "ff0400000007000000"
+    }
+  ],
+  "limits": {
+    "max_tensor_bytes": 67108864,
+    "max_frame_payload_bytes": 67112960,
+    "max_dimensions": 8,
+    "max_sequence_len": 4096
+  }
+}
