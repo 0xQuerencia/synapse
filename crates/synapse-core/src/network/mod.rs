@@ -7,6 +7,7 @@ mod peer_cache;
 pub mod quota;
 pub mod session;
 pub mod stream;
+pub mod worker;
 
 pub use codec::{ProtocolCodec, SynapseProtocol};
 pub use connection_pool::{ConnectionPool, ConnectionState, PoolStats};

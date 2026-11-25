@@ -5,6 +5,9 @@ use std::{collections::HashMap, hash::Hash, time::Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResponseKind {
+    Hello,
+    Capability,
+    Artifact,
     Activation,
     CacheClear,
     Truncate,
@@ -23,7 +26,7 @@ pub struct ResponseScope {
     pub trace_id: String,
 }
 impl ResponseScope {
-    fn validate(&self) -> bool {
+    pub(crate) fn validate(&self) -> bool {
         [&self.session_id, &self.trace_id].iter().all(|value| {
             !value.is_empty()
                 && value.len() <= crate::protocol::MAX_TRACE_ID_LEN
@@ -62,6 +65,13 @@ pub struct PendingRequests<K> {
     capacity: usize,
 }
 impl<K: Copy + Eq + Hash> PendingRequests<K> {
+    pub fn scope(&self, id: K) -> Option<&ResponseScope> {
+        self.entries.get(&id).map(|pending| &pending.scope)
+    }
+
+    pub fn remove(&mut self, id: K) -> Option<ResponseScope> {
+        self.entries.remove(&id).map(|pending| pending.scope)
+    }
     pub fn new(capacity: usize) -> Result<Self, StreamError> {
         if capacity == 0 || capacity > 4096 {
             return Err(StreamError::Capacity);
