@@ -5,6 +5,7 @@ mod messages;
 mod node;
 mod peer_cache;
 pub mod quota;
+pub mod session;
 pub mod stream;
 
 pub use codec::{ProtocolCodec, SynapseProtocol};
