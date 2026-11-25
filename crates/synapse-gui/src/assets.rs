@@ -1,7 +1,7 @@
 //! Embedded static-asset serving for the self-contained HTML GUI.
 //!
-//! The current frontend is a single `web/index.html` (Tailwind via
-//! CDN, vanilla JS, no build step). `rust-embed` packs it into the
+//! The current frontend uses local HTML, CSS and JavaScript with no
+//! CDN or build step. `rust-embed` packs it into the
 //! binary at compile time; we serve it at `/` and as the SPA
 //! fallback for any other path. The HTML talks to the Rust
 //! backend via `/api/*` REST and `/ws` WebSocket on the same
@@ -26,10 +26,7 @@ pub async fn serve_root() -> Response {
 
 /// Serve the worker onboarding page at a clean `/contribute` URL.
 pub async fn serve_contribute() -> Response {
-    match Assets::get("contribute.html") {
-        Some(file) => file_response("contribute.html", file),
-        None => (StatusCode::NOT_FOUND, "contribute.html missing from embed").into_response(),
-    }
+    serve_index()
 }
 
 /// Final fallback for any request that didn't match the API or WS
@@ -43,7 +40,7 @@ pub async fn spa_fallback(req: Request) -> Response {
     {
         return file_response(path, file);
     }
-    serve_index()
+    (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
 fn serve_index() -> Response {

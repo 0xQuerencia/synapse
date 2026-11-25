@@ -17,8 +17,8 @@ use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
-use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, info, warn};
+use tokio::sync::mpsc;
+use tracing::{debug, info};
 
 use synapse_core::network::{ChatEvent, StopReason};
 
@@ -33,7 +33,7 @@ pub struct OllamaClient {
 impl OllamaClient {
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
         let http = Client::builder()
-            .timeout(Duration::from_secs(60 * 60)) // generation can be slow
+            .timeout(Duration::from_secs(120))
             .build()
             .context("build reqwest client")?;
         Ok(Self {
@@ -56,7 +56,17 @@ impl OllamaClient {
         if !resp.status().is_success() {
             return Err(anyhow!("ollama /api/tags returned {}", resp.status()));
         }
-        let body: TagsResponse = resp.json().await.context("decode /api/tags")?;
+        let mut chunks = resp.bytes_stream();
+        let mut raw = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk?;
+            anyhow::ensure!(
+                raw.len().saturating_add(chunk.len()) <= 1024 * 1024,
+                "Ollama model listing exceeds 1 MiB"
+            );
+            raw.extend_from_slice(&chunk);
+        }
+        let body: TagsResponse = serde_json::from_slice(&raw).context("decode /api/tags")?;
         Ok(body.models.into_iter().map(|m| m.name).collect())
     }
 
@@ -68,7 +78,7 @@ impl OllamaClient {
         model: &str,
         prompt: &str,
         max_tokens: u32,
-        bcast: &broadcast::Sender<ChatEvent>,
+        bcast: &mpsc::Sender<ChatEvent>,
         mut cancel: mpsc::Receiver<()>,
     ) -> Result<()> {
         let url = format!("{}/api/generate", self.base_url);
@@ -97,13 +107,12 @@ impl OllamaClient {
             .with_context(|| format!("POST {url}"))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("ollama /api/generate returned {status}: {text}"));
+            return Err(anyhow!("ollama /api/generate returned {status}"));
         }
 
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
-        let mut total_tokens: usize = 0;
+        let mut output_bytes = 0usize;
 
         loop {
             tokio::select! {
@@ -115,6 +124,7 @@ impl OllamaClient {
                 chunk = stream.next() => {
                     let Some(chunk) = chunk else { break };
                     let chunk = chunk.context("read ollama chunk")?;
+                    anyhow::ensure!(buf.len().saturating_add(chunk.len()) <= 1024 * 1024, "Ollama frame exceeds 1 MiB");
                     buf.extend_from_slice(&chunk);
 
                     // ollama's stream emits one JSON object per line
@@ -127,22 +137,19 @@ impl OllamaClient {
                         if line.is_empty() {
                             continue;
                         }
-                        let frame: GenerateChunk = match serde_json::from_slice(&line) {
-                            Ok(f) => f,
-                            Err(e) => {
-                                warn!(error = %e, "skip malformed ollama frame");
-                                continue;
-                            }
-                        };
+                        let frame: GenerateChunk = serde_json::from_slice(&line).context("malformed Ollama frame")?;
                         if let Some(t) = frame.response
                             && !t.is_empty() {
-                                total_tokens += 1;
-                                let _ = bcast.send(ChatEvent::Token(t));
+                                output_bytes = output_bytes.saturating_add(t.len());
+                                anyhow::ensure!(output_bytes <= 4 * 1024 * 1024, "Ollama output exceeds 4 MiB");
+                                tokio::time::timeout(Duration::from_secs(1), bcast.send(ChatEvent::Token(t))).await.context("Ollama consumer stalled")?.context("Ollama consumer disconnected")?;
                             }
                         if frame.done {
                             let reason = frame
                                 .done_reason
                                 .unwrap_or_else(|| "stop".to_owned());
+                            let total_tokens = frame.eval_count.context("Ollama omitted authoritative output token count")?;
+                            anyhow::ensure!(total_tokens <= max_tokens as usize, "Ollama exceeded output token limit");
                             info!(tokens = total_tokens, %reason, "ollama done");
                             // Map ollama's done_reason to our StopReason.
                             // ollama emits "stop" on a natural end (EOS/stop
@@ -151,10 +158,10 @@ impl OllamaClient {
                                 "length" => StopReason::MaxTokens,
                                 _ => StopReason::Eos,
                             };
-                            let _ = bcast.send(ChatEvent::GenerationDone {
+                            tokio::time::timeout(Duration::from_secs(1), bcast.send(ChatEvent::GenerationDone {
                                 tokens_generated: total_tokens,
                                 reason: stop,
-                            });
+                            })).await.context("Ollama consumer stalled")?.context("Ollama consumer disconnected")?;
                             return Ok(());
                         }
                     }
@@ -162,12 +169,9 @@ impl OllamaClient {
             }
         }
 
-        // Stream ended without a `done` frame.
-        let _ = bcast.send(ChatEvent::GenerationDone {
-            tokens_generated: total_tokens,
-            reason: StopReason::MaxTokens,
-        });
-        Ok(())
+        Err(anyhow!(
+            "Ollama stream ended without a completed generation"
+        ))
     }
 }
 
@@ -189,4 +193,6 @@ struct GenerateChunk {
     done: bool,
     #[serde(default)]
     done_reason: Option<String>,
+    #[serde(default)]
+    eval_count: Option<usize>,
 }

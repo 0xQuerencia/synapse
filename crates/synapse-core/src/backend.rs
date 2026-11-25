@@ -173,6 +173,7 @@ impl CandleBackend {
         }
         let model: Box<dyn ShardedModel> = if files.weights.extension().is_some_and(|e| e == "gguf")
         {
+            crate::inference::pipeline::validate_gguf_config(&files.weights, &config)?;
             Box::new(ToyLlamaGGUF::load(&files.weights)?)
         } else {
             Box::new(ToyLlama::load(&config, &files.weights)?)
