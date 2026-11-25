@@ -12,6 +12,7 @@ anyhow = { workspace = true }
 axum = { version = "0.7", features = ["ws", "macros"] }
 clap = { workspace = true }
 futures = { workspace = true }
+libc = "0.2"
 mime_guess = "2"
 rand = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
