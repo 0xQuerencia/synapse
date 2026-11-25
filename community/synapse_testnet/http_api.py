@@ -11,6 +11,9 @@ from .service import Service
 
 MAX_BODY=32768
 ROUTES={
+ 'GET /v1/operator/status': ('operator_status', ()),
+ 'POST /v1/operator/events': ('pending_events', ('limit',)),
+ 'POST /v1/operator/events/ack': ('acknowledge_event', ('event','fingerprint')),
  'POST /v1/operator/invites': ('issue_invite', ('member','role','recipient','ttl')),
  'POST /v1/operator/invites/revoke': ('revoke_invite', ('invite',)),
  'POST /v1/auth/enroll': ('redeem_invite', ('claim','signature')),
@@ -24,6 +27,10 @@ ROUTES={
  'GET /v1/catalog': ('catalog', ()),
  'GET /v1/credits/balance': ('balance', ()),
  'GET /v1/credits/history': ('history', ()),
+ 'GET /v1/contributor/profile': ('contributor_profile', ()),
+ 'POST /v1/contributor/profile': ('set_contributor_profile', ('opted_in','alias')),
+ 'GET /v1/contributor/leaderboard': ('leaderboard', ()),
+ 'GET /v1/disputes': ('disputes', ()),
  'GET /v1/contributor/stats': ('stats', ()),
  'GET /v1/worker/assignments': ('assignments', ()),
  'POST /v1/devices/challenge': ('device_challenge', ('device',)),
