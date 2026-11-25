@@ -152,7 +152,19 @@ where
     T: AsyncRead + Unpin + Send,
     M: for<'de> Deserialize<'de>,
 {
-    tokio::time::timeout(FRAME_TIMEOUT, async {
+    read_frame_with_timeout(io, kind, FRAME_TIMEOUT).await
+}
+
+async fn read_frame_with_timeout<T, M>(
+    io: &mut T,
+    kind: FrameKind,
+    timeout: Duration,
+) -> io::Result<M>
+where
+    T: AsyncRead + Unpin + Send,
+    M: for<'de> Deserialize<'de>,
+{
+    tokio::time::timeout(timeout, async {
         let mut header = [0_u8; 5];
         io.read_exact(&mut header).await?;
         if header[0] != FRAME_MARKER {
@@ -264,6 +276,70 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn deterministic_malformed_corpus_never_dispatches_invalid_messages() {
+        use rand::{Rng, RngCore, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x53594e41505345);
+        let valid = frame(
+            &bincode::serialize(&RequestMessage::ClearCache(crate::ClearCache {
+                trace_id: "bounded-corpus".into(),
+            }))
+            .unwrap(),
+        );
+        let mut rejected = 0usize;
+        for index in 0..1024 {
+            let case = if index < valid.len() {
+                let mut mutation = valid.clone();
+                mutation[index] ^= 0xff;
+                mutation
+            } else {
+                let mut body = vec![0; rng.gen_range(0..=1024)];
+                rng.fill_bytes(&mut body);
+                if body.len() >= 4 {
+                    body[..4].copy_from_slice(&(index as u32 % 16).to_le_bytes());
+                }
+                frame(&body)
+            };
+            match ProtocolCodec
+                .read_request(&SynapseProtocol, &mut Cursor::new(&case))
+                .await
+            {
+                Ok(message) => assert!(message.validate_wire().is_ok()),
+                Err(_) => rejected += 1,
+            }
+            match ProtocolCodec
+                .read_response(&SynapseProtocol, &mut Cursor::new(&case))
+                .await
+            {
+                Ok(message) => assert!(message.validate_wire().is_ok()),
+                Err(_) => rejected += 1,
+            }
+        }
+        assert!(rejected > 1900, "malformed corpus unexpectedly accepted");
+    }
+
+    #[tokio::test]
+    async fn stalled_peer_hits_frame_deadline() {
+        struct StalledReader;
+        impl AsyncRead for StalledReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut [u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                std::task::Poll::Pending
+            }
+        }
+        let error = read_frame_with_timeout::<_, RequestMessage>(
+            &mut StalledReader,
+            FrameKind::Request,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
     #[tokio::test]
     async fn oversized_control_is_rejected_after_tag() {

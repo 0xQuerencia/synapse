@@ -1,7 +1,5 @@
-//! Phase 6: Connection Pooling
-//!
-//! Pre-warmed connection pool to top workers for zero-latency request dispatch.
-//! Eliminates connection establishment overhead (20-40ms per request).
+//! Bounded connection health tracking. A queued connection is not considered
+//! healthy until a real health check succeeds.
 
 use libp2p::PeerId;
 use std::{
@@ -42,7 +40,7 @@ impl ConnectionState {
             peer_id,
             last_used: now,
             last_health_check: now,
-            is_healthy: true,
+            is_healthy: false,
             failed_checks: 0,
             request_count: 0,
         }
@@ -51,7 +49,7 @@ impl ConnectionState {
     /// Mark connection as used (resets idle timer).
     pub fn mark_used(&mut self) {
         self.last_used = Instant::now();
-        self.request_count += 1;
+        self.request_count = self.request_count.saturating_add(1);
     }
 
     /// Update health check status.
@@ -61,7 +59,7 @@ impl ConnectionState {
             self.is_healthy = true;
             self.failed_checks = 0;
         } else {
-            self.failed_checks += 1;
+            self.failed_checks = self.failed_checks.saturating_add(1);
             if self.failed_checks >= 3 {
                 self.is_healthy = false;
             }
@@ -96,6 +94,7 @@ impl ConnectionPool {
 
     /// Create a connection pool with custom capacity.
     pub fn with_capacity(max_pool_size: usize) -> Self {
+        let max_pool_size = max_pool_size.min(256);
         Self {
             warm_connections: HashMap::with_capacity(max_pool_size),
             max_pool_size,
@@ -255,6 +254,8 @@ mod tests {
         assert_eq!(pool.warm_connections.len(), 3);
 
         for peer in &peers {
+            assert!(!pool.has_warm_connection(peer));
+            pool.update_peer_health(peer, true);
             assert!(pool.has_warm_connection(peer));
         }
     }
@@ -272,6 +273,8 @@ mod tests {
         assert_eq!(pool.warm_connections.len(), 2);
 
         for peer in &new_peers {
+            assert!(!pool.has_warm_connection(peer));
+            pool.update_peer_health(peer, true);
             assert!(pool.has_warm_connection(peer));
         }
         for peer in &old_peers {
@@ -285,6 +288,8 @@ mod tests {
         let peer = PeerId::random();
         pool.prewarm(&[peer]);
 
+        assert!(!pool.has_warm_connection(&peer));
+        pool.update_peer_health(&peer, true);
         assert!(pool.has_warm_connection(&peer));
 
         // First failure shouldn't mark as unhealthy
@@ -327,7 +332,7 @@ mod tests {
 
         let stats = pool.stats();
         assert_eq!(stats.total_connections, 3);
-        assert_eq!(stats.healthy_connections, 3);
+        assert_eq!(stats.healthy_connections, 0);
         assert_eq!(stats.total_requests, 2);
     }
 }

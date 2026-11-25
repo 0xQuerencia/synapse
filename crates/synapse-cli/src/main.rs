@@ -71,6 +71,9 @@ enum Command {
         /// Per-node inference memory limit (MiB), enforced before shard loading.
         #[arg(long)]
         memory_mib: Option<u64>,
+        /// Exact inference reservation limit, useful for reproducible small models.
+        #[arg(long, conflicts_with = "memory_mib")]
+        memory_bytes: Option<u64>,
         /// Keep transformer layers entirely on the authenticated workers.
         #[arg(long)]
         coordinator_only: bool,
@@ -87,6 +90,11 @@ enum Command {
         code: String,
         #[arg(long)]
         memory_mib: Option<u64>,
+        #[arg(long, conflicts_with = "memory_mib")]
+        memory_bytes: Option<u64>,
+        /// Linux process virtual address-space cap; distinct from inference memory.
+        #[arg(long)]
+        address_space_mib: Option<u64>,
         #[arg(long)]
         events_jsonl: Option<PathBuf>,
         #[arg(long, default_value = "0.0.0.0:0")]
@@ -169,6 +177,7 @@ async fn main() -> Result<()> {
             timeout_secs,
             events_jsonl,
             memory_mib,
+            memory_bytes,
             coordinator_only,
         }) => {
             host(
@@ -184,6 +193,7 @@ async fn main() -> Result<()> {
                     timeout_secs,
                     events_jsonl,
                     memory_mib,
+                    memory_bytes,
                     coordinator_only,
                 },
             )
@@ -194,11 +204,27 @@ async fn main() -> Result<()> {
             model,
             code,
             memory_mib,
+            memory_bytes,
+            address_space_mib,
             events_jsonl,
             listen,
-        }) => join(master_addr, model, code, memory_mib, events_jsonl, listen).await,
+        }) => {
+            join(
+                master_addr,
+                model,
+                code,
+                JoinOptions {
+                    memory_mib,
+                    memory_bytes,
+                    address_space_mib,
+                    events_jsonl,
+                    listen,
+                },
+            )
+            .await
+        }
         Some(Command::Connect { model, code }) => {
-            join(None, model, code, None, None, "0.0.0.0:0".into()).await
+            join(None, model, code, JoinOptions::default()).await
         }
         Some(Command::Relay { listen }) => relay_server(listen).await,
         Some(Command::Peers) => {
@@ -442,13 +468,13 @@ async fn onboarding_gateway() -> Result<()> {
             let model = prompt_model_choice(&cached_models)?;
             let master_addr = prompt_optional("Master address (optional, press Enter for mDNS)")?;
             let code = prompt_required("Pairing code (shown by host)")?;
-            join(master_addr, model, code, None, None, "0.0.0.0:0".into()).await
+            join(master_addr, model, code, JoinOptions::default()).await
         }
         2 => {
             println!("\n[info] connect discovers master via DHT");
             let model = prompt_model_choice(&cached_models)?;
             let code = prompt_required("Pairing code (shown by host)")?;
-            join(None, model, code, None, None, "0.0.0.0:0".into()).await
+            join(None, model, code, JoinOptions::default()).await
         }
         3 => {
             let model = prompt_model_choice(&cached_models)?;
@@ -586,6 +612,7 @@ struct HostOptions {
     timeout_secs: u64,
     events_jsonl: Option<PathBuf>,
     memory_mib: Option<u64>,
+    memory_bytes: Option<u64>,
     coordinator_only: bool,
 }
 impl Default for HostOptions {
@@ -597,6 +624,7 @@ impl Default for HostOptions {
             timeout_secs: 120,
             events_jsonl: None,
             memory_mib: None,
+            memory_bytes: None,
             coordinator_only: false,
         }
     }
@@ -638,7 +666,13 @@ impl EventLog {
     }
 }
 
-fn inference_budget(mib: Option<u64>) -> Result<Option<u64>> {
+fn inference_budget(mib: Option<u64>, bytes: Option<u64>) -> Result<Option<u64>> {
+    if let Some(bytes) = bytes {
+        if mib.is_some() || bytes == 0 {
+            bail!("choose one positive inference memory limit")
+        }
+        return Ok(Some(bytes));
+    }
     mib.map(|value| {
         value
             .checked_mul(1024 * 1024)
@@ -715,7 +749,7 @@ async fn host(
     )
     .await?;
 
-    if let Some(bytes) = inference_budget(options.memory_mib)? {
+    if let Some(bytes) = inference_budget(options.memory_mib, options.memory_bytes)? {
         node.set_memory_limit_bytes(bytes)?;
     }
     node.set_coordinator_only(options.coordinator_only)?;
@@ -886,14 +920,37 @@ async fn host(
 
 // ─── Join (Worker) ───────────────────────────────────────────────────────────
 
+struct JoinOptions {
+    memory_mib: Option<u64>,
+    memory_bytes: Option<u64>,
+    address_space_mib: Option<u64>,
+    events_jsonl: Option<PathBuf>,
+    listen: String,
+}
+impl Default for JoinOptions {
+    fn default() -> Self {
+        Self {
+            memory_mib: None,
+            memory_bytes: None,
+            address_space_mib: None,
+            events_jsonl: None,
+            listen: "0.0.0.0:0".into(),
+        }
+    }
+}
+
 async fn join(
     master_addr: Option<String>,
     model: String,
     code: String,
-    memory_mib: Option<u64>,
-    events_jsonl: Option<PathBuf>,
-    listen: String,
+    options: JoinOptions,
 ) -> Result<()> {
+    if let Some(cap) = inference_budget(options.address_space_mib, None)? {
+        let actual = synapse_core::network::worker::apply_address_space_limit_bytes(cap)?;
+        println!(
+            "[resource] Linux virtual address-space ceiling: {actual} bytes (not an RSS limit)"
+        );
+    }
     validate_pairing_code(&code).context("pairing code format validation failed")?;
 
     let model = ModelIdentity::new(model);
@@ -913,36 +970,36 @@ async fn join(
                 manual_master
                     .as_ref()
                     .map(|addr| addr.to_string())
-                    .unwrap_or_else(|| "mDNS".to_owned())
+                    .unwrap_or_else(|| "pinned discovery configuration".to_owned())
             ),
             format!("model: {}", model.id),
         ],
     );
 
-    println!("\n[status] downloading model...");
+    println!("\n[status] verifying model artifacts...");
     let mut node = SynapseNode::new(
         SynapseRole::Worker {
             pairing_code: code,
             manual_master,
         },
         model,
-        parse_listen_addr(&listen).map_err(|error| anyhow!(error))?,
+        parse_listen_addr(&options.listen).map_err(|error| anyhow!(error))?,
     )
     .await?;
 
-    if let Some(bytes) = inference_budget(memory_mib)? {
+    if let Some(bytes) = inference_budget(options.memory_mib, options.memory_bytes)? {
         node.set_memory_limit_bytes(bytes)?;
     }
     node.load_model().await?;
     println!("[ok] model loaded\n");
 
     println!("peer id: {}", node.local_peer_id());
-    println!("[status] searching for master via mDNS...\n");
+    println!("[status] waiting for an authenticated configured master...\n");
     let mut status = node.status_receiver();
-    let mut events = EventLog::new(events_jsonl.as_ref())?;
+    let mut events = EventLog::new(options.events_jsonl.as_ref())?;
     events.record(
         "node_started",
-        serde_json::json!({"peer_id":node.local_peer_id().to_string(),"memory_mib":memory_mib}),
+        serde_json::json!({"peer_id":node.local_peer_id().to_string(),"memory_budget_bytes":inference_budget(options.memory_mib, options.memory_bytes)?}),
     )?;
     let monitor = tokio::spawn(async move {
         while status.changed().await.is_ok() {

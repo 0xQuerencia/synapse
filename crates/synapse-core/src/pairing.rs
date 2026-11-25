@@ -83,52 +83,99 @@ pub fn validate_pairing_code(code: &str) -> Result<(), ProtocolError> {
 
 const MAX_PAIRING_ATTEMPTS: u8 = 5;
 const LOCKOUT_BASE_DURATION: Duration = Duration::from_secs(30);
+const MAX_LOCKOUT: Duration = Duration::from_secs(300);
+const ATTEMPT_TTL: Duration = Duration::from_secs(15 * 60);
+const GLOBAL_WINDOW: Duration = Duration::from_secs(60);
+const MAX_TRACKED_PEERS: usize = 1024;
+const MAX_GLOBAL_FAILURES: u16 = 128;
 
 #[derive(Debug, Default)]
 pub struct PairingRateLimiter {
     attempts: HashMap<String, PairingAttemptState>,
+    global_window_started: Option<Instant>,
+    global_failures: u16,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PairingAttemptState {
     count: u8,
     locked_until: Option<Instant>,
+    last_attempt: Instant,
 }
 
 impl PairingRateLimiter {
     pub fn check(&self, peer_key: &str) -> Result<(), Duration> {
-        if let Some(state) = self.attempts.get(peer_key)
-            && let Some(locked_until) = state.locked_until
-        {
-            let now = Instant::now();
-            if now < locked_until {
-                return Err(locked_until - now);
+        self.check_at(peer_key, Instant::now())
+    }
+
+    pub fn check_at(&self, peer_key: &str, now: Instant) -> Result<(), Duration> {
+        if peer_key.is_empty() || peer_key.len() > 128 {
+            return Err(LOCKOUT_BASE_DURATION);
+        }
+        if let Some(started) = self.global_window_started {
+            let elapsed = now.saturating_duration_since(started);
+            if elapsed < GLOBAL_WINDOW && self.global_failures >= MAX_GLOBAL_FAILURES {
+                return Err(GLOBAL_WINDOW - elapsed);
             }
+        }
+        if let Some(state) = self.attempts.get(peer_key) {
+            if let Some(until) = state.locked_until
+                && now < until
+            {
+                return Err(until - now);
+            }
+        } else if self.attempts.len() >= MAX_TRACKED_PEERS {
+            return Err(LOCKOUT_BASE_DURATION);
         }
         Ok(())
     }
 
     pub fn record_failure(&mut self, peer_key: &str) {
-        let state = self.attempts.entry(peer_key.to_owned()).or_default();
+        self.record_failure_at(peer_key, Instant::now());
+    }
 
+    pub fn record_failure_at(&mut self, peer_key: &str, now: Instant) {
+        if peer_key.is_empty() || peer_key.len() > 128 {
+            return;
+        }
+        if self
+            .global_window_started
+            .is_none_or(|started| now.saturating_duration_since(started) >= GLOBAL_WINDOW)
+        {
+            self.global_window_started = Some(now);
+            self.global_failures = 0;
+        }
+        self.global_failures = self.global_failures.saturating_add(1);
+        self.cleanup_at(now);
+        if !self.attempts.contains_key(peer_key) && self.attempts.len() >= MAX_TRACKED_PEERS {
+            return;
+        }
+        let state = self
+            .attempts
+            .entry(peer_key.to_owned())
+            .or_insert(PairingAttemptState {
+                count: 0,
+                locked_until: None,
+                last_attempt: now,
+            });
         state.count = state.count.saturating_add(1);
-
+        state.last_attempt = now;
         if state.count >= MAX_PAIRING_ATTEMPTS {
-            let overflow = state.count - MAX_PAIRING_ATTEMPTS;
-            let lockout = LOCKOUT_BASE_DURATION * 2u32.saturating_pow(overflow.into());
-            state.locked_until = Some(Instant::now() + lockout);
+            let overflow = (state.count - MAX_PAIRING_ATTEMPTS).min(4);
+            let lockout = (LOCKOUT_BASE_DURATION * (1u32 << overflow)).min(MAX_LOCKOUT);
+            state.locked_until = now.checked_add(lockout);
         }
     }
 
     pub fn record_success(&mut self, peer_key: &str) {
         self.attempts.remove(peer_key);
     }
-
     pub fn cleanup(&mut self) {
-        let now = Instant::now();
-        self.attempts.retain(|_, state| {
-            state.count > 0 && state.locked_until.is_none_or(|until| until > now)
-        });
+        self.cleanup_at(Instant::now());
+    }
+    pub fn cleanup_at(&mut self, now: Instant) {
+        self.attempts
+            .retain(|_, state| now.saturating_duration_since(state.last_attempt) < ATTEMPT_TTL);
     }
 }
 
@@ -401,21 +448,13 @@ pub struct InviteRedemptions {
 
 impl InviteRedemptions {
     pub fn load(path: &std::path::Path) -> Result<Self, crate::identity::IdentityError> {
-        use std::io::Read;
-        let file = match std::fs::File::open(path) {
-            Ok(file) => file,
+        let bytes = match crate::identity::read_private_state(path, 1024 * 1024) {
+            Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
             }
             Err(error) => return Err(error.into()),
         };
-        let mut bytes = Vec::new();
-        file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > 1024 * 1024 {
-            return Err(crate::identity::IdentityError::InvalidKey(
-                "invite ledger exceeds limit".into(),
-            ));
-        }
         let ledger: Self = serde_json::from_slice(&bytes)
             .map_err(|e| crate::identity::IdentityError::InvalidKey(e.to_string()))?;
         if ledger.redeemed.len() > INVITE_MAX_REDEMPTIONS {
@@ -464,6 +503,36 @@ impl InviteRedemptions {
 mod security_tests {
     use super::*;
     use libp2p::PeerId;
+
+    #[test]
+    fn pairing_limiter_bounds_churn_and_eventually_expires_partial_attempts() {
+        let now = Instant::now();
+        let mut limiter = PairingRateLimiter::default();
+        for i in 0..2048 {
+            limiter.record_failure_at(&format!("peer-{i}"), now);
+        }
+        assert_eq!(limiter.attempts.len(), MAX_TRACKED_PEERS);
+        assert!(limiter.check_at("new-peer", now).is_err());
+        limiter.cleanup_at(now + ATTEMPT_TTL);
+        assert!(limiter.attempts.is_empty());
+        assert!(limiter.check_at("new-peer", now + ATTEMPT_TTL).is_ok());
+    }
+
+    #[test]
+    fn pairing_backoff_cannot_overflow_or_be_reset_by_peer_rotation() {
+        let now = Instant::now();
+        let mut limiter = PairingRateLimiter::default();
+        for _ in 0..255 {
+            limiter.record_failure_at("one-peer", now);
+        }
+        let delay = limiter
+            .check_at("one-peer", now + GLOBAL_WINDOW)
+            .unwrap_err();
+        assert!(delay <= MAX_LOCKOUT);
+        assert!(limiter.check_at("another-peer", now).is_err());
+        limiter.record_success("one-peer");
+        assert!(limiter.check_at("another-peer", now).is_err());
+    }
 
     fn identities() -> (tempfile::TempDir, crate::NodeIdentity, crate::NodeIdentity) {
         let dir = tempfile::tempdir().unwrap();

@@ -31,25 +31,34 @@ pub fn parse_listen_addr(input: &str) -> Result<Multiaddr, String> {
         return input.parse().map_err(|error| format!("{error}"));
     }
 
-    let (host, port) = input
-        .rsplit_once(':')
-        .ok_or_else(|| "expected either multiaddr or host:port".to_owned())?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| "port must be a valid u16".to_owned())?;
-
-    if host == "0.0.0.0" {
-        return format!("/ip4/0.0.0.0/udp/{port}/quic-v1")
+    if let Ok(socket) = input.parse::<std::net::SocketAddr>() {
+        let host = match socket.ip() {
+            std::net::IpAddr::V4(ip) => format!("/ip4/{ip}"),
+            std::net::IpAddr::V6(ip) => format!("/ip6/{ip}"),
+        };
+        return format!("{host}/udp/{}/quic-v1", socket.port())
             .parse()
             .map_err(|error| format!("{error}"));
     }
-
-    if host == "127.0.0.1" || host == "localhost" {
+    let (host, port) = input
+        .rsplit_once(':')
+        .ok_or_else(|| "expected multiaddr, IP:port, [IPv6]:port or hostname:port".to_owned())?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| "port must be a valid u16".to_owned())?;
+    if host == "localhost" {
         return format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
             .parse()
             .map_err(|error| format!("{error}"));
     }
-
+    if host.is_empty()
+        || host.len() > 253
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte))
+    {
+        return Err("invalid hostname; IPv6 addresses require brackets".into());
+    }
     format!("/dns4/{host}/udp/{port}/quic-v1")
         .parse()
         .map_err(|error| format!("{error}"))
@@ -63,5 +72,19 @@ mod tests {
     fn parses_host_port_as_quic_multiaddr() {
         let addr = parse_listen_addr("0.0.0.0:0").expect("address should parse");
         assert_eq!(addr.to_string(), "/ip4/0.0.0.0/udp/0/quic-v1");
+    }
+
+    #[test]
+    fn explicit_ip_addresses_do_not_become_dns_queries() {
+        assert_eq!(
+            parse_listen_addr("192.0.2.1:4001").unwrap().to_string(),
+            "/ip4/192.0.2.1/udp/4001/quic-v1"
+        );
+        assert_eq!(
+            parse_listen_addr("[::1]:4001").unwrap().to_string(),
+            "/ip6/::1/udp/4001/quic-v1"
+        );
+        assert!(parse_listen_addr("::1:4001").is_err());
+        assert!(parse_listen_addr("user:secret@example.com:4001").is_err());
     }
 }

@@ -224,8 +224,12 @@ fn private_create_options() -> OpenOptions {
 }
 
 fn open_private_file(path: &Path) -> Result<File, IdentityError> {
+    open_private_file_bounded(path, MAX_KEY_FILE_BYTES)
+}
+
+fn open_private_file_bounded(path: &Path, max_bytes: u64) -> Result<File, IdentityError> {
     let before = fs::symlink_metadata(path)?;
-    if !before.file_type().is_file() || before.len() > MAX_KEY_FILE_BYTES {
+    if !before.file_type().is_file() || before.len() > max_bytes {
         return Err(IdentityError::UnsafeFile);
     }
     let mut options = OpenOptions::new();
@@ -237,7 +241,7 @@ fn open_private_file(path: &Path) -> Result<File, IdentityError> {
     }
     let file = options.open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_KEY_FILE_BYTES {
+    if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(IdentityError::UnsafeFile);
     }
     #[cfg(unix)]
@@ -251,6 +255,20 @@ fn open_private_file(path: &Path) -> Result<File, IdentityError> {
         }
     }
     Ok(file)
+}
+
+pub(crate) fn read_private_state(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let file = open_private_file_bounded(path, max_bytes).map_err(|error| match error {
+        IdentityError::Io(error) => error,
+        error => std::io::Error::other(error),
+    })?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::other("private state exceeds size limit"));
+    }
+    Ok(bytes)
 }
 
 fn publish_private_state_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -333,6 +351,22 @@ pub(crate) fn lock_private_state(path: &Path) -> std::io::Result<File> {
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let file = options.open(PathBuf::from(lock_name))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("state lock is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0
+            // SAFETY: geteuid has no arguments or pointer preconditions.
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(std::io::Error::other(
+                "state lock must be private and owned",
+            ));
+        }
+    }
     file.try_lock().map_err(std::io::Error::other)?;
     Ok(file)
 }
@@ -347,7 +381,7 @@ pub struct RevocationList {
 
 impl RevocationList {
     pub fn load(path: &Path) -> Result<Self, IdentityError> {
-        let bytes = match fs::read(path) {
+        let bytes = match read_private_state(path, 1024 * 1024) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
@@ -380,10 +414,12 @@ impl RevocationList {
 
     /// Commit to disk before changing the live deny list.
     pub fn revoke(&mut self, peer: PeerId, path: &Path) -> Result<(), IdentityError> {
-        if self.revoked.len() >= 10_000 && !self.contains(&peer) {
+        let _lock = lock_private_state(path)?;
+        let mut next = Self::load(path)?;
+        next.revoked.extend(self.revoked.iter().cloned());
+        if next.revoked.len() > 10_000 || (next.revoked.len() == 10_000 && !next.contains(&peer)) {
             return Err(IdentityError::InvalidKey("revocation list is full".into()));
         }
-        let mut next = self.clone();
         next.revoked.insert(peer.to_string());
         let bytes =
             serde_json::to_vec(&next).map_err(|e| IdentityError::InvalidKey(e.to_string()))?;
@@ -629,5 +665,48 @@ mod tests {
         let mut list = RevocationList::default();
         assert!(list.revoke(peer, dir.path()).is_err());
         assert!(!list.contains(&peer));
+    }
+
+    #[test]
+    fn independent_revokers_preserve_each_others_durable_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("revoked.json");
+        let mut first = RevocationList::default();
+        let mut second = RevocationList::default();
+        let a = PeerId::random();
+        let b = PeerId::random();
+        first.revoke(a, &path).unwrap();
+        second.revoke(b, &path).unwrap();
+        let loaded = RevocationList::load(&path).unwrap();
+        assert!(loaded.contains(&a) && loaded.contains(&b));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_security_state_does_not_follow_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("revoked.json");
+        RevocationList::default()
+            .revoke(PeerId::random(), &path)
+            .unwrap();
+        let link = dir.path().join("alias.json");
+        std::os::unix::fs::symlink(path, &link).unwrap();
+        assert!(RevocationList::load(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_state_lock_cannot_guard_a_security_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("revoked.json");
+        let lock = dir.path().join("revoked.json.lock");
+        fs::write(&lock, "").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap();
+        let mut revoked = RevocationList::default();
+        let peer = PeerId::random();
+        assert!(revoked.revoke(peer, &path).is_err());
+        assert!(!revoked.contains(&peer));
+        assert!(!path.exists());
     }
 }

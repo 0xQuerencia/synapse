@@ -2,7 +2,7 @@
 //! prompts, tensor bytes or KV state; the admission book owns those resources.
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
-use std::{io::Read, path::Path, time::Instant};
+use std::{path::Path, time::Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -34,13 +34,8 @@ impl EpochCounter {
     /// processes sharing the same device identity; corruption fails closed.
     pub fn advance(path: &Path) -> Result<u64, SessionError> {
         let _lock = crate::identity::lock_private_state(path)?;
-        let current = match std::fs::File::open(path) {
-            Ok(file) => {
-                let mut bytes = Vec::new();
-                file.take(4097).read_to_end(&mut bytes)?;
-                if bytes.len() > 4096 {
-                    return Err(std::io::Error::other("epoch journal exceeds limit").into());
-                }
+        let current = match crate::identity::read_private_state(path, 4096) {
+            Ok(bytes) => {
                 let record: EpochJournal =
                     serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
                 if record.version != 1 {

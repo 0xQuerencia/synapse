@@ -168,6 +168,8 @@ def run(args: argparse.Namespace) -> dict:
                 command.append("--coordinator-only")
             if args.memory_mib is not None:
                 command.extend(["--memory-mib", str(args.memory_mib)])
+            if args.host_memory_bytes is not None:
+                command.extend(["--memory-bytes", str(args.host_memory_bytes)])
             host = spawn("host", command)
 
             def host_ready():
@@ -187,6 +189,8 @@ def run(args: argparse.Namespace) -> dict:
                     "--events-jsonl", str(output / f"{name}.jsonl"), "--listen", "127.0.0.1:0"]
                 if args.memory_mib is not None:
                     command.extend(["--memory-mib", str(args.memory_mib)])
+                if args.worker_memory_bytes is not None:
+                    command.extend(["--memory-bytes", str(args.worker_memory_bytes)])
                 spawn(name, command)
             def host_completed():
                 if host.poll() is not None:
@@ -252,10 +256,14 @@ def main() -> int:
     parser.add_argument("--prompt", default="<s> </s> Hello")
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--memory-mib", type=int)
+    parser.add_argument("--host-memory-bytes", type=int)
+    parser.add_argument("--worker-memory-bytes", type=int)
     parser.add_argument("--output", default=str(ROOT / "artifacts" / f"local-cluster-{time.time_ns()}"))
     args = parser.parse_args()
     if args.timeout <= 0 or args.tokens <= 0:
         parser.error("timeout and token limit must be positive")
+    if args.memory_mib is not None and (args.host_memory_bytes is not None or args.worker_memory_bytes is not None):
+        parser.error("choose MiB or exact per-role byte limits, not both")
     result = run(args)
     print(json.dumps({"success": result["success"], "output": str(Path(args.output).resolve()), "error": result.get("error")}))
     return 0 if result["success"] else 1
