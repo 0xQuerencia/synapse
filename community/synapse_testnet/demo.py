@@ -11,8 +11,8 @@ from .service import Service
 from .http_api import Server
 from .synthetic import MODEL, receipt_body, observed
 
-def setup(path, sharded=True):
-    service=Service(path)
+def setup(path, sharded=True, *, service=None):
+    service=Service(path) if service is None else service
     operator=service.bootstrap('pilot','operator',100_000_000)
     tokens={r:service.add_member(operator,r,role) for r,role in [('client','requester'),('worker-a','worker'),('worker-b','worker'),('verifier','verifier'),('reviewer','verifier')]}
     tokens['operator']=operator
@@ -35,8 +35,8 @@ def call(server, token, path, body=None):
     with urllib.request.urlopen(request,timeout=8) as r:
         return json.load(r)['result']
 
-def execute(path, sharded=True):
-    service,tokens,keys=setup(path,sharded)
+def execute(path, sharded=True, *, service=None):
+    service,tokens,keys=setup(path,sharded,service=service)
     with Server(service) as server:
         t=threading.Thread(target=server.serve_forever,daemon=True); t.start()
         try:
