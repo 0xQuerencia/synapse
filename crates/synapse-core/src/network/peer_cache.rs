@@ -1,157 +1,197 @@
-//! DHT peer discovery cache for faster cold starts.
-//!
-//! Caches discovered providers to disk so workers can reconnect to known
-//! masters without waiting for DHT queries (which can take 5-30 seconds).
+//! Bounded, expiring discovery hints. Cached addresses are never authority.
 
-use libp2p::{Multiaddr, PeerId};
+use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
-use tracing::{info, warn};
+use tracing::warn;
 
 const CACHE_FILE_NAME: &str = "peer_cache.json";
-const CACHE_TTL: Duration = Duration::from_secs(5 * 60); // 5 minutes
+const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_CACHE_BYTES: u64 = 1024 * 1024;
+const MAX_MODELS: usize = 64;
+const MAX_PEERS_PER_MODEL: usize = 64;
+const MAX_ADDRS_PER_PEER: usize = 8;
 
-/// Cached peer discovery entry with timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CachedPeer {
     pub peer_id: String,
     pub addrs: Vec<String>,
     pub model_id: String,
-    pub cached_at: u64, // Unix timestamp
+    pub cached_at: u64,
 }
 
-/// Persistent peer cache stored at ~/.synapse/peer_cache.json
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerCache {
-    /// Map: model_id → list of known provider peers
     #[serde(default)]
     pub providers: HashMap<String, Vec<CachedPeer>>,
 }
 
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn fresh(timestamp: u64, now: u64) -> bool {
+    now.checked_sub(timestamp)
+        .is_some_and(|age| age < CACHE_TTL.as_secs())
+}
+
+fn valid_model(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= crate::protocol::MAX_MODEL_ID_LEN
+        && model.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn pinned_address(peer: PeerId, addr: &Multiaddr) -> Option<Multiaddr> {
+    let mut candidate = addr.clone();
+    if !matches!(candidate.iter().last(), Some(Protocol::P2p(_))) {
+        candidate.push(Protocol::P2p(peer));
+    }
+    (crate::netconfig::validate_direct_peer_addr(&candidate).ok()? == peer).then_some(candidate)
+}
+
 impl PeerCache {
-    /// Load cache from disk, or create empty if missing/invalid.
     pub fn load() -> Self {
-        match Self::cache_path() {
-            Ok(path) => match fs::read_to_string(&path) {
-                Ok(contents) => match serde_json::from_str::<PeerCache>(&contents) {
-                    Ok(cache) => {
-                        info!(path = %path.display(), entries = cache.providers.len(), "loaded peer cache");
-                        cache
-                    }
-                    Err(error) => {
-                        warn!(%error, "failed to parse peer cache, starting fresh");
-                        Self::default()
-                    }
-                },
-                Err(_) => {
-                    info!("no existing peer cache, starting fresh");
-                    Self::default()
-                }
-            },
-            Err(error) => {
-                warn!(%error, "failed to determine cache path");
-                Self::default()
-            }
-        }
-    }
-
-    /// Save cache to disk.
-    pub fn save(&self) {
-        match Self::cache_path() {
-            Ok(path) => {
-                if let Some(parent) = path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                match serde_json::to_string_pretty(self) {
-                    Ok(json) => {
-                        if let Err(error) = fs::write(&path, json) {
-                            warn!(%error, "failed to write peer cache");
-                        } else {
-                            info!(path = %path.display(), "saved peer cache");
-                        }
-                    }
-                    Err(error) => {
-                        warn!(%error, "failed to serialize peer cache");
-                    }
-                }
-            }
-            Err(error) => {
-                warn!(%error, "failed to determine cache path");
-            }
-        }
-    }
-
-    /// Get fresh cached peers for a model (TTL < 5 minutes).
-    pub fn get_providers(&self, model_id: &str) -> Vec<(PeerId, Vec<Multiaddr>)> {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        self.providers
-            .get(model_id)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|entry| now - entry.cached_at < CACHE_TTL.as_secs())
-                    .filter_map(|entry| {
-                        let peer_id = entry.peer_id.parse::<PeerId>().ok()?;
-                        let addrs: Vec<Multiaddr> =
-                            entry.addrs.iter().filter_map(|s| s.parse().ok()).collect();
-                        if addrs.is_empty() {
-                            None
-                        } else {
-                            Some((peer_id, addrs))
-                        }
-                    })
-                    .collect()
-            })
+        Self::cache_path()
+            .ok()
+            .and_then(|path| Self::load_from_path(&path).ok())
             .unwrap_or_default()
     }
 
-    /// Add or update a provider entry.
-    pub fn add_provider(&mut self, model_id: String, peer_id: PeerId, addrs: Vec<Multiaddr>) {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+    pub fn load_from_path(path: &Path) -> std::io::Result<Self> {
+        let file = fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_CACHE_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_CACHE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "peer cache exceeds size limit",
+            ));
+        }
+        let mut cache: Self = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        if cache.providers.len() > MAX_MODELS
+            || cache
+                .providers
+                .values()
+                .any(|peers| peers.len() > MAX_PEERS_PER_MODEL)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "peer cache exceeds entry limit",
+            ));
+        }
+        cache.prune_stale();
+        Ok(cache)
+    }
 
+    pub fn save(&self) {
+        if let Err(error) = Self::cache_path().and_then(|path| self.save_to_path(&path)) {
+            warn!(%error, "failed to persist peer discovery cache");
+        }
+    }
+
+    pub fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
+        if bytes.len() as u64 > MAX_CACHE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "peer cache exceeds size limit",
+            ));
+        }
+        crate::identity::write_private_state(path, &bytes)
+    }
+
+    pub fn get_providers(&self, model_id: &str) -> Vec<(PeerId, Vec<Multiaddr>)> {
+        self.get_providers_at(model_id, now_seconds())
+    }
+
+    pub fn get_providers_at(&self, model_id: &str, now: u64) -> Vec<(PeerId, Vec<Multiaddr>)> {
+        if !valid_model(model_id) {
+            return Vec::new();
+        }
+        self.providers
+            .get(model_id)
+            .into_iter()
+            .flatten()
+            .take(MAX_PEERS_PER_MODEL)
+            .filter(|entry| entry.model_id == model_id && fresh(entry.cached_at, now))
+            .filter_map(|entry| {
+                let peer_id = entry.peer_id.parse::<PeerId>().ok()?;
+                let addrs: Vec<_> = entry
+                    .addrs
+                    .iter()
+                    .take(MAX_ADDRS_PER_PEER)
+                    .filter_map(|value| value.parse::<Multiaddr>().ok())
+                    .filter_map(|addr| pinned_address(peer_id, &addr))
+                    .collect();
+                (!addrs.is_empty()).then_some((peer_id, addrs))
+            })
+            .collect()
+    }
+
+    pub fn add_provider(&mut self, model_id: String, peer_id: PeerId, addrs: Vec<Multiaddr>) {
+        self.prune_stale();
+        if !valid_model(&model_id)
+            || (!self.providers.contains_key(&model_id) && self.providers.len() >= MAX_MODELS)
+        {
+            return;
+        }
+        let addrs: Vec<_> = addrs
+            .iter()
+            .take(MAX_ADDRS_PER_PEER)
+            .filter_map(|addr| pinned_address(peer_id, addr))
+            .map(|addr| addr.to_string())
+            .collect();
+        if addrs.is_empty() {
+            return;
+        }
         let entry = CachedPeer {
             peer_id: peer_id.to_string(),
-            addrs: addrs.iter().map(|a| a.to_string()).collect(),
+            addrs,
             model_id: model_id.clone(),
-            cached_at: now,
+            cached_at: now_seconds(),
         };
-
-        self.providers
-            .entry(model_id)
-            .or_default()
-            .retain(|e| e.peer_id != entry.peer_id); // Remove old entry if exists
-        self.providers.get_mut(&entry.model_id).unwrap().push(entry);
-    }
-
-    /// Prune stale entries older than TTL.
-    pub fn prune_stale(&mut self) {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        for entries in self.providers.values_mut() {
-            entries.retain(|e| now - e.cached_at < CACHE_TTL.as_secs());
+        let peers = self.providers.entry(model_id).or_default();
+        peers.retain(|peer| peer.peer_id != entry.peer_id);
+        if peers.len() < MAX_PEERS_PER_MODEL {
+            peers.push(entry);
         }
-        self.providers.retain(|_, v| !v.is_empty());
     }
 
-    fn cache_path() -> Result<PathBuf, std::io::Error> {
-        let home = std::env::var("HOME")
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME not set"))?;
-        Ok(Path::new(&home).join(".synapse").join(CACHE_FILE_NAME))
+    pub fn remove_peer(&mut self, peer: PeerId) {
+        let key = peer.to_string();
+        for peers in self.providers.values_mut() {
+            peers.retain(|entry| entry.peer_id != key);
+        }
+        self.providers.retain(|_, peers| !peers.is_empty());
+    }
+
+    pub fn prune_stale(&mut self) {
+        let now = now_seconds();
+        for (model, entries) in &mut self.providers {
+            entries.retain(|entry| entry.model_id == *model && fresh(entry.cached_at, now));
+            entries.truncate(MAX_PEERS_PER_MODEL);
+        }
+        self.providers
+            .retain(|model, entries| valid_model(model) && !entries.is_empty());
+    }
+
+    fn cache_path() -> std::io::Result<PathBuf> {
+        let home_dir = std::env::var_os("HOME")
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME not set"))?;
+        Ok(PathBuf::from(home_dir)
+            .join(".synapse")
+            .join(CACHE_FILE_NAME))
     }
 }
 
@@ -159,29 +199,63 @@ impl PeerCache {
 mod tests {
     use super::*;
 
+    fn cache() -> (PeerCache, PeerId) {
+        let mut cache = PeerCache::default();
+        let peer = PeerId::random();
+        cache.add_provider(
+            "model-a".into(),
+            peer,
+            vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
+        );
+        (cache, peer)
+    }
+
     #[test]
     fn cache_ttl_filtering() {
-        let mut cache = PeerCache::default();
-        let peer_id = PeerId::random();
-        let addr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+        let (mut cache, _) = cache();
+        assert_eq!(cache.get_providers("model-a").len(), 1);
+        cache.providers.get_mut("model-a").unwrap()[0].cached_at = 0;
+        assert!(cache.get_providers("model-a").is_empty());
+    }
 
-        cache.add_provider("model-a".to_string(), peer_id, vec![addr]);
+    #[test]
+    fn future_timestamps_and_wrong_model_are_not_fresh() {
+        let (mut cache, _) = cache();
+        cache.providers.get_mut("model-a").unwrap()[0].cached_at = u64::MAX;
+        assert!(cache.get_providers_at("model-a", 100).is_empty());
+        let entry = &mut cache.providers.get_mut("model-a").unwrap()[0];
+        entry.cached_at = 100;
+        entry.model_id = "other-model".into();
+        assert!(cache.get_providers_at("model-a", 100).is_empty());
+    }
 
-        // Should be fresh
+    #[test]
+    fn cached_addresses_are_bound_to_the_named_peer() {
+        let (mut cache, peer) = cache();
         let providers = cache.get_providers("model-a");
-        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].1[0].iter().last(), Some(Protocol::P2p(peer)));
+        let other = PeerId::random();
+        cache.providers.get_mut("model-a").unwrap()[0].addrs =
+            vec![format!("/ip4/127.0.0.1/tcp/4001/p2p/{other}")];
+        assert!(cache.get_providers("model-a").is_empty());
+    }
 
-        // Manually set to expired
-        cache
-            .providers
-            .get_mut("model-a")
-            .unwrap()
-            .first_mut()
-            .unwrap()
-            .cached_at = 0;
-
-        // Should be filtered out
-        let providers = cache.get_providers("model-a");
-        assert_eq!(providers.len(), 0);
+    #[test]
+    fn bounded_cache_persists_and_revocation_removes_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        let (mut cache, peer) = cache();
+        cache.save_to_path(&path).unwrap();
+        assert_eq!(
+            PeerCache::load_from_path(&path)
+                .unwrap()
+                .get_providers("model-a")
+                .len(),
+            1
+        );
+        cache.remove_peer(peer);
+        assert!(cache.get_providers("model-a").is_empty());
+        fs::write(&path, vec![b' '; MAX_CACHE_BYTES as usize + 1]).unwrap();
+        assert!(PeerCache::load_from_path(&path).is_err());
     }
 }
