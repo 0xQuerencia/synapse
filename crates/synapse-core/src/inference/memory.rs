@@ -20,6 +20,7 @@ pub struct MemoryEstimate {
 pub struct ModelMemoryProfile {
     config: ToyLlamaConfig,
     dtype_bytes: u64,
+    source_dtype_bytes: u64,
 }
 
 fn product(values: &[u64]) -> Result<u64> {
@@ -40,15 +41,57 @@ impl ModelMemoryProfile {
     /// per tensor. No optimistic advertised bit-width is used for admission.
     pub fn new(config: &ToyLlamaConfig, gguf: bool) -> Result<Self> {
         config.validate()?;
-        let dtype_bytes = if gguf || config.torch_dtype == "float32" {
+        let dtype_bytes = if gguf {
             4
         } else {
-            2
+            super::pipeline::execution_dtype(config, &super::pipeline::get_best_device()?)
+                .size_in_bytes() as u64
         };
         Ok(Self {
             config: config.clone(),
             dtype_bytes,
+            source_dtype_bytes: dtype_bytes,
         })
+    }
+
+    /// Header-only inspection accounts for an original F32/F64 tensor that
+    /// coexists with its BF16/F16 converted copy during loading.
+    pub fn from_verified_files(
+        config: &ToyLlamaConfig,
+        files: &super::model_loader::ModelFiles,
+    ) -> Result<Self> {
+        let gguf = files
+            .weights
+            .extension()
+            .is_some_and(|extension| extension == "gguf");
+        let mut profile = Self::new(config, gguf)?;
+        profile.account_source_dtypes(files)?;
+        Ok(profile)
+    }
+
+    fn account_source_dtypes(&mut self, files: &super::model_loader::ModelFiles) -> Result<()> {
+        if files
+            .weights
+            .extension()
+            .is_none_or(|extension| extension != "gguf")
+        {
+            for path in super::pipeline::shard_files(&files.weights)? {
+                // Only headers are inspected; no tensor is decoded/copied.
+                let mapped = unsafe { candle_core::safetensors::MmapedSafetensors::new(&path)? };
+                for (_, tensor) in mapped.tensors() {
+                    ensure!(
+                        matches!(
+                            format!("{:?}", tensor.dtype()).as_str(),
+                            "F16" | "BF16" | "F32" | "F64"
+                        ),
+                        "unsupported stored model dtype"
+                    );
+                    self.source_dtype_bytes =
+                        self.source_dtype_bytes.max(tensor.dtype().size() as u64);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn estimate(
@@ -112,9 +155,10 @@ impl ModelMemoryProfile {
         let scratch_bytes = sum(&[wire_and_hidden, projection_scratch, head_scratch])?;
         // A transposed/dequantized projection can coexist with its source
         // while loading. Budget one entire layer, or the largest IO tensor.
-        let load_scratch_bytes = if n > 0 { layer_weights } else { 0 }
+        let largest_target = if n > 0 { layer_weights } else { 0 }
             .max(embedding)
             .max(output);
+        let load_scratch_bytes = product(&[largest_target / d, self.source_dtype_bytes])?;
         let runtime = sum(&[kv_bytes, scratch_bytes])?;
         let total_bytes = sum(&[weights_bytes, runtime.max(load_scratch_bytes)])?;
         Ok(MemoryEstimate {
@@ -230,5 +274,23 @@ mod tests {
         let estimate = profile.estimate(0, 8, TensorRoles::COORDINATOR).unwrap();
         assert!(estimate.scratch_bytes >= MAX_VERIFICATION_TOKENS as u64 * 100_000 * 4 * 2);
         assert!(estimate.total_bytes > estimate.weights_bytes + estimate.load_scratch_bytes);
+    }
+    #[test]
+    fn source_f32_conversion_is_reserved_before_bf16_load() {
+        let (_, files, mut config) = profile();
+        config.torch_dtype = "bfloat16".into();
+        // Simulate a half-precision accelerator execution target. CPU
+        // execution itself is F32; the stored fixture remains real F32.
+        let mut profile = ModelMemoryProfile::new(&config, false).unwrap();
+        profile.dtype_bytes = 2;
+        profile.source_dtype_bytes = 2;
+        let target_only = profile.estimate(0, 1, TensorRoles::COORDINATOR).unwrap();
+        profile.account_source_dtypes(&files).unwrap();
+        let actual = profile.estimate(0, 1, TensorRoles::COORDINATOR).unwrap();
+        assert_eq!(
+            actual.load_scratch_bytes,
+            2 * target_only.load_scratch_bytes
+        );
+        assert!(actual.total_bytes > target_only.total_bytes);
     }
 }

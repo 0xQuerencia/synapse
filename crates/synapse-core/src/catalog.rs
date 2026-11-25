@@ -376,7 +376,7 @@ pub struct CacheEntry {
 
 pub struct PinnedModel {
     pub entry: CacheEntry,
-    _pin: File,
+    _pin: CacheLock,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -432,10 +432,9 @@ impl ModelCache {
         &self.root
     }
 
-    fn lock(&self) -> Result<File> {
+    fn lock(&self) -> Result<CacheLock> {
         let file = open_lock(&self.root.join(".lock"))?;
-        lock_file(&file, true, false).context("cache is busy")?;
-        Ok(file)
+        CacheLock::acquire(file, true).context("cache is busy")
     }
 
     /// Imports regular local files only. An import never downloads, executes or
@@ -578,8 +577,10 @@ impl ModelCache {
             "cache model name differs from signed manifest"
         );
         self.verify_view(&directory, &record)?;
-        let pin = open_lock(&self.root.join("pins").join(format!("{digest}.lock")))?;
-        lock_file(&pin, false, false)?;
+        let pin = CacheLock::acquire(
+            open_lock(&self.root.join("pins").join(format!("{digest}.lock")))?,
+            false,
+        )?;
         self.replace_json(
             &directory.join("access.json"),
             &Access {
@@ -620,15 +621,14 @@ impl ModelCache {
                 break;
             }
             let pin_path = self.root.join("pins").join(format!("{digest}.lock"));
-            let pin = open_lock(&pin_path)?;
-            match lock_file(&pin, true, false) {
-                Ok(()) => {}
+            let _pin = match CacheLock::acquire(open_lock(&pin_path)?, true) {
+                Ok(pin) => pin,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     report.pinned_models.push(digest);
                     continue;
                 }
                 Err(error) => return Err(error.into()),
-            }
+            };
             fs::remove_dir_all(self.root.join("models").join(&digest))?;
             fs::remove_file(pin_path)?;
             report.removed_models.push(digest);
@@ -933,6 +933,53 @@ fn open_lock(path: &Path) -> Result<File> {
         "cache lock must be private and owned"
     );
     Ok(file)
+}
+
+/// A lock belongs to this guard's scope, not to the last descriptor referring to
+/// its open file description. Even a CLOEXEC descriptor can be inherited during
+/// another thread's fork-to-exec interval; closing our descriptor alone would
+/// leave that unrelated child temporarily holding the lock.
+struct CacheLock {
+    file: File,
+    owner_process: u32,
+}
+
+impl CacheLock {
+    fn acquire(file: File, exclusive: bool) -> std::io::Result<Self> {
+        lock_file(&file, exclusive, false)?;
+        Ok(Self {
+            file,
+            owner_process: std::process::id(),
+        })
+    }
+}
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        // A forked child must only close its inherited copy. It must not unlock
+        // a guard whose owner is still using the cache in the parent process.
+        if self.owner_process == std::process::id() {
+            unlock_file(&self.file);
+        }
+    }
+}
+
+fn unlock_file(file: &File) {
+    #[cfg(unix)]
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            // Closing is still the fallback. Never remove/recreate a lock file
+            // or relax acquisition after a filesystem unlock failure.
+            tracing::warn!(%error, "could not explicitly release cache lock");
+            break;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
 }
 
 fn lock_file(file: &File, exclusive: bool, blocking: bool) -> std::io::Result<()> {
@@ -1715,6 +1762,99 @@ mod tests {
         assert!(cache.prune(0).is_err());
         drop(lock);
         f.import(&cache);
+    }
+
+    #[test]
+    fn duplicated_writer_descriptor_does_not_extend_guard_lifetime() {
+        let f = Fixture::new();
+        let cache = f.cache();
+        let lock = cache.lock().unwrap();
+        // dup and fork both retain the same open file description. Retaining
+        // this descriptor makes the close-only release bug deterministic.
+        let inherited = lock.file.try_clone().unwrap();
+        assert!(
+            cache.prune(0).is_err(),
+            "a live writer must still exclude mutations"
+        );
+        drop(lock);
+        cache
+            .prune(0)
+            .expect("a released writer must not stay busy through an inherited descriptor");
+        assert!(inherited.metadata().unwrap().is_file());
+    }
+
+    #[test]
+    fn forked_child_drop_does_not_release_parent_writer() {
+        let f = Fixture::new();
+        let cache = f.cache();
+        let lock = cache.lock().unwrap();
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            // Only getpid/close and _exit in the multithreaded child's path:
+            // no allocation, formatting, logging or other Rust destructors.
+            drop(lock);
+            unsafe { libc::_exit(0) };
+        }
+        assert!(
+            child > 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut status = 0;
+        loop {
+            let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+            if waited == child {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted
+            );
+        }
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert!(
+            cache.prune(0).is_err(),
+            "the parent's live writer must remain exclusive"
+        );
+        drop(lock);
+        cache.prune(0).unwrap();
+    }
+
+    #[test]
+    fn duplicated_pin_descriptor_does_not_keep_released_model_pinned() {
+        let f = Fixture::new();
+        let cache = f.cache();
+        let entry = f.import(&cache);
+        let first = cache
+            .verify_model(
+                &entry.manifest_digest,
+                &f.trust,
+                CatalogUse::LocalInference,
+                1000,
+            )
+            .unwrap();
+        let second = cache
+            .verify_model(
+                &entry.manifest_digest,
+                &f.trust,
+                CatalogUse::LocalInference,
+                1000,
+            )
+            .unwrap();
+        let inherited = first._pin.file.try_clone().unwrap();
+        drop(first);
+        let result = cache.prune(0).unwrap();
+        assert_eq!(result.pinned_models, vec![entry.manifest_digest.clone()]);
+        assert!(
+            result.removed_models.is_empty(),
+            "another independently acquired live pin must remain effective"
+        );
+        drop(second);
+        let result = cache.prune(0).unwrap();
+        assert_eq!(result.removed_models, vec![entry.manifest_digest]);
+        assert_eq!(result.remaining_bytes, 0);
+        assert!(inherited.metadata().unwrap().is_file());
     }
 
     #[test]

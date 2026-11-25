@@ -60,7 +60,7 @@ pub enum NetworkError {
 pub enum ChatEvent {
     /// Worker has authenticated and is ready for generation.
     WorkerConnected,
-    /// A single decoded token was generated.
+    /// A decoded text chunk. Multiple token IDs can form one UTF-8 character.
     Token(String),
     /// Exact accepted token, including EOS/special tokens. Position is zero
     /// based within generated output, independently of decoded text chunks.
@@ -485,6 +485,8 @@ pub struct SynapseNode {
     pipeline: Option<Arc<dyn ShardedModel>>,
     /// Tokenizer for encoding/decoding text.
     tokenizer: Option<Arc<SimpleTokenizer>>,
+    /// Rolling UTF-8/text decoder state belonging only to the active turn.
+    token_decode_state: crate::inference::tokenizer::TokenDecodeState,
     /// Cached master range end for the active route plan.
     split_point: usize,
     total_layers: usize,

@@ -273,6 +273,7 @@ impl SynapseNode {
 
     /// Shared generation setup used by both single-prompt and batch paths.
     fn begin_generation_from_ids(&mut self, ids: Vec<u32>) {
+        self.token_decode_state.reset();
         self.generation_active = true;
 
         let context_limit = self
@@ -772,19 +773,7 @@ impl SynapseNode {
             }
         };
 
-        let decoded = match tokenizer.decode(&[next_token], true) {
-            Ok(text) => text,
-            Err(error) => {
-                warn!(peer = ?peer, %error, token_id = next_token, "token decode failed");
-                format!("<tok:{next_token}>")
-            }
-        };
-        self.emit(ChatEvent::TokenGenerated {
-            token_id: next_token,
-            position: self.tokens_generated,
-        });
-        self.emit(ChatEvent::Token(decoded));
-        if !self.generation_active {
+        if !self.emit_accepted_token(&tokenizer, next_token) {
             return;
         }
 
@@ -918,19 +907,7 @@ impl SynapseNode {
                 self.draft_cache.observe(&self.token_ids, token);
             }
 
-            let decoded = match tokenizer.decode(&[token], true) {
-                Ok(text) => text,
-                Err(error) => {
-                    warn!(peer = ?peer, %error, token_id = token, "token decode failed");
-                    format!("<tok:{token}>")
-                }
-            };
-            self.emit(ChatEvent::TokenGenerated {
-                token_id: token,
-                position: self.tokens_generated,
-            });
-            self.emit(ChatEvent::Token(decoded));
-            if !self.generation_active {
+            if !self.emit_accepted_token(&tokenizer, token) {
                 return;
             }
 
@@ -964,8 +941,38 @@ impl SynapseNode {
         self.local_step_pending = self.generation_active;
     }
 
+    /// All accepted tokens, including speculative drafts and special tokens,
+    /// advance the same decoder. Text is emitted only when a chunk is ready;
+    /// exact token events remain independent of UTF-8 chunk boundaries.
+    fn emit_accepted_token(
+        &mut self,
+        tokenizer: &crate::inference::SimpleTokenizer,
+        token_id: u32,
+    ) -> bool {
+        let decoded = match self.token_decode_state.push(tokenizer, token_id) {
+            Ok(text) => text,
+            Err(error) => {
+                self.fail_generation(format!("token decode failed: {error}"));
+                return false;
+            }
+        };
+        self.emit(ChatEvent::TokenGenerated {
+            token_id,
+            position: self.tokens_generated,
+        });
+        if self.generation_active
+            && let Some(text) = decoded
+        {
+            self.emit(ChatEvent::Token(text));
+        }
+        self.generation_active
+    }
+
     /// Shared end-of-turn bookkeeping for all generation paths.
     fn finish_generation(&mut self, reason: StopReason) {
+        // Match the API backend's upstream DecodeStream contract: only completed
+        // chunks are text. An unfinished terminal byte suffix is discarded.
+        self.token_decode_state.reset();
         self.release_generation_assignments();
         self.emit(ChatEvent::GenerationDone {
             tokens_generated: self.tokens_generated,

@@ -195,6 +195,7 @@ impl SynapseNode {
             exchange_complete: false,
             pipeline: None,
             tokenizer: None,
+            token_decode_state: Default::default(),
             split_point: 0,
             total_layers: 0,
             token_ids: Vec::new(),
@@ -317,7 +318,7 @@ impl SynapseNode {
             sha256: Some(digest),
         };
         self.memory_profile = Some(
-            crate::inference::memory::ModelMemoryProfile::new(&config, is_gguf)
+            crate::inference::memory::ModelMemoryProfile::from_verified_files(&config, &files)
                 .map_err(|error| NetworkError::Inference(error.to_string()))?,
         );
         self.pipeline = None;

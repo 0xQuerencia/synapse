@@ -14,12 +14,14 @@ impl SynapseNode {
             warn!(%error, "requester cannot accept output; cancelling generation");
             self.event_tx = None;
             self.generation_active = false;
+            self.token_decode_state.reset();
             self.local_step_pending = false;
             self.release_generation_assignments();
         }
     }
 
     pub(super) fn fail_generation(&mut self, message: impl Into<String>) {
+        self.token_decode_state.reset();
         self.release_generation_assignments();
         let message = message.into();
         warn!(%message, "generation failed");

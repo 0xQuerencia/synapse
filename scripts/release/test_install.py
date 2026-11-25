@@ -6,10 +6,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 import install as installer
 import package as builder
@@ -176,6 +178,81 @@ class InstallationTests(unittest.TestCase):
             self.install(self.package('1.2.0'))
         self.assertEqual(list(actual.iterdir()), [])
 
+    def test_writable_ancestors_refuse_before_creating_prefix(self):
+        paths = self.package()
+        shared = self.root / 'shared'
+        shared.mkdir()
+        self.prefix = shared / 'nested/application'
+        for mode in [0o770, 0o777]:
+            with self.subTest(mode=oct(mode)):
+                shared.chmod(mode)
+                with self.assertRaisesRegex(ValueError, 'ancestor.*writable'):
+                    self.install(paths)
+                self.assertFalse((shared / 'nested').exists())
+
+    def test_foreign_owned_ancestor_is_rejected_even_when_sticky(self):
+        paths = self.package()
+        shared = self.root / 'foreign-parent'
+        shared.mkdir()
+        self.prefix = shared / 'application'
+        original_lstat = Path.lstat
+
+        def foreign_owner(path, *args, **kwargs):
+            info = original_lstat(path, *args, **kwargs)
+            if path == shared:
+                values = list(info)
+                values[4] = os.geteuid() + 1  # An account other than this user/root.
+                return os.stat_result(values)
+            return info
+
+        # Ownership injection avoids requiring root/chown; mode and filesystem
+        # operations are real, and only the one ancestor's UID is substituted.
+        for mode in [0o755, 0o1777]:
+            with self.subTest(mode=oct(mode)):
+                shared.chmod(mode)
+                with mock.patch.object(Path, 'lstat', foreign_owner):
+                    with self.assertRaisesRegex(ValueError, 'ancestor.*owned'):
+                        self.install(paths)
+                self.assertFalse(self.prefix.exists())
+
+    def test_trusted_sticky_parent_allows_private_nested_install(self):
+        paths = self.package()
+        shared = self.root / 'sticky-parent'
+        shared.mkdir()
+        shared.chmod(0o1777)
+        self.prefix = shared / 'new-parent/application'
+        previous_umask = os.umask(0)
+        try:
+            release = self.install(paths)
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(installer.verify_release(release)['version'], '1.0.0')
+        self.assertEqual(stat.S_IMODE(self.prefix.parent.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(self.prefix.stat().st_mode), 0o700)
+
+    def test_writable_managed_directories_preserve_current_on_refusal(self):
+        current = self.install(self.package())
+        self.prefix.chmod(0o755)
+        update = self.package('1.1.0')
+        old_pointer = os.readlink(self.prefix / 'current')
+        old_digest = digest(current / 'bin/synapse')
+        for directory in [self.prefix / 'releases', self.prefix / 'bin', current, current / 'bin']:
+            for mode in [0o777, 0o1777]:
+                with self.subTest(directory=directory.name, mode=oct(mode)):
+                    directory.chmod(mode)
+                    try:
+                        with self.assertRaisesRegex(ValueError, 'managed directory'):
+                            self.install(update, update=True)
+                        with self.assertRaisesRegex(ValueError, 'managed directory'):
+                            installer.uninstall(self.prefix)
+                        if directory in [self.prefix / 'releases', self.prefix / 'bin']:
+                            with self.assertRaisesRegex(ValueError, 'managed directory'):
+                                installer.rollback(self.prefix)
+                        self.assertEqual(os.readlink(self.prefix / 'current'), old_pointer)
+                        self.assertEqual(digest(current / 'bin/synapse'), old_digest)
+                    finally:
+                        directory.chmod(0o700)
+
     def test_uninstall_preserves_unmanaged_files_by_refusing(self):
         self.install(self.package())
         personal = self.prefix / 'notes.txt'
@@ -240,6 +317,36 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual(digest(first[0]), digest(second[0]))
         with self.assertRaisesRegex(ValueError, 'overwrite'):
             builder.make_package(Path('/bin/true'), '1.0.0', installer.host_target(), first[0].parent)
+
+    def test_source_replacement_after_hash_keeps_signed_package_consistent(self):
+        binary, sbom = self.root / 'build-output', self.root / 'sbom.json'
+        original_binary = Path('/bin/true').read_bytes()
+        original_sbom = b'{"version":1}\n'
+        binary.write_bytes(original_binary)
+        sbom.write_bytes(original_sbom)
+        original_tar_open = tarfile.open
+        replacements = []
+
+        def replace_sources(*args, **kwargs):
+            if kwargs.get('mode') == 'w':
+                replacement = self.root / 'next-build-output'
+                replacement.write_bytes(b'a concurrent build replaced the executable\n')
+                os.replace(replacement, binary)
+                sbom.write_bytes(b'{"version":2,"changed":true}\n')
+                replacements.append(True)
+            return original_tar_open(*args, **kwargs)
+
+        # At archive creation the manifest hashes already exist. Changing both
+        # an inode and an in-place source must not change the archived snapshots.
+        with mock.patch.object(builder.tarfile, 'open', side_effect=replace_sources):
+            paths = builder.make_package(binary, '1.0.0', installer.host_target(), self.packages / 'snapshot', signing_key=self.key, sbom=sbom, channel='candidate')
+        self.assertEqual(replacements, [True])
+        self.assertNotEqual(binary.read_bytes(), original_binary)
+        self.assertNotEqual(sbom.read_bytes(), original_sbom)
+        release = self.install(paths)
+        self.assertEqual((release / 'bin/synapse').read_bytes(), original_binary)
+        self.assertEqual((release / 'sbom.cdx.json').read_bytes(), original_sbom)
+        self.assertEqual(installer.verify_release(release)['channel'], 'candidate')
 
     def test_semantic_versions_compare_numeric_prereleases_correctly(self):
         self.assertLess(version_key('1.0.0-rc.2'), version_key('1.0.0-rc.10'))

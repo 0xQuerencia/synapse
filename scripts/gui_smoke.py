@@ -230,10 +230,12 @@ def check_compatible_api(server: GuiServer) -> dict[str, Any]:
     require(usage == ordinary["usage"] and text == ordinary["choices"][0]["message"]["content"],
             "streaming and nonstream output/usage diverged")
     return {"prompt_tokens": 3, "completion_tokens": 8, "stream_content_events": emitted,
-            "stream_matches_json": True, "finish_reason": finish, "done_events": done}
+            "stream_matches_json": True, "finish_reason": finish, "done_events": done,
+            "completion_text": text}
 
 
-def distributed_generation(server: GuiServer, reference_ids: list[int], required: bool) -> dict[str, Any]:
+def distributed_generation(server: GuiServer, reference_ids: list[int], reference_text: str,
+                           required: bool) -> dict[str, Any]:
     if importlib.util.find_spec("websockets") is None:
         require(not required, "websockets is required for distributed GUI generation")
         return {"status": "skipped", "reason": "optional websockets package unavailable"}
@@ -250,6 +252,7 @@ def distributed_generation(server: GuiServer, reference_ids: list[int], required
         kwargs["proxy"] = None
     tokens: list[int] = []
     positions: list[int] = []
+    text_parts: list[str] = []
     started = time.monotonic()
     with connect(str(server.base_url).replace("http:", "ws:") + "/ws", **kwargs) as connection:
         require(json.loads(connection.recv(timeout=5)).get("type") == "hello", "WebSocket greeting missing")
@@ -263,6 +266,9 @@ def distributed_generation(server: GuiServer, reference_ids: list[int], required
             if event.get("type") == "token_generated":
                 tokens.append(event["token_id"])
                 positions.append(event["position"])
+            if event.get("type") == "token":
+                require(isinstance(event.get("text"), str), "WebSocket text event malformed")
+                text_parts.append(event["text"])
             if event.get("type") == "generation_done":
                 finished = event
                 break
@@ -271,11 +277,15 @@ def distributed_generation(server: GuiServer, reference_ids: list[int], required
             "distributed generation reported an incorrect terminal count/reason")
     require(tokens == reference_ids and positions == list(range(8)),
             "distributed GUI token IDs or sequence positions differ from the reference")
+    require("".join(text_parts) == reference_text,
+            "distributed decoded text differs from the local API output")
     return {"status": "passed", "token_ids": tokens, "positions": positions,
-            "tokens_generated": 8, "reason": "MaxTokens", "elapsed_seconds": time.monotonic() - started}
+            "text_matches_local_api": True, "tokens_generated": 8, "reason": "MaxTokens",
+            "elapsed_seconds": time.monotonic() - started}
 
 
-def check_worker_session(host: GuiServer, worker: GuiServer, fixture: Path, required_ws: bool) -> dict[str, Any]:
+def check_worker_session(host: GuiServer, worker: GuiServer, fixture: Path, reference_text: str,
+                         required_ws: bool) -> dict[str, Any]:
     started = host.json("POST", "/api/session/host", {"model": str(fixture), "max_tokens": 8,
         "listen": "127.0.0.1:0", "memory_mib": 64, "raw_prompt": True, "coordinator_only": True})
     code = started["pairing_code"]
@@ -304,7 +314,7 @@ def check_worker_session(host: GuiServer, worker: GuiServer, fixture: Path, requ
     reference = json.loads((fixture / "reference.json").read_text())
     reference_ids = reference["greedy_ids"][len(reference["input_ids"]):]
     require(len(reference_ids) == 8, "fixture must provide exactly eight reference output tokens")
-    generation = distributed_generation(host, reference_ids, required_ws)
+    generation = distributed_generation(host, reference_ids, reference_text, required_ws)
     if generation["status"] == "passed":
         worker.wait_status(lambda value: ((value.get("node") or {}).get("worker_state") or {}).get("active_jobs") == 0,
                            "released worker lease")
@@ -355,7 +365,9 @@ def main() -> int:
                 host, worker = servers
                 result["authentication_and_configuration"] = check_auth_and_configuration(host)
                 result["compatible_api"] = check_compatible_api(host)
-                result["worker_session"] = check_worker_session(host, worker, fixture, args.require_websocket)
+                reference_text = result["compatible_api"].pop("completion_text")
+                result["worker_session"] = check_worker_session(host, worker, fixture, reference_text,
+                                                                args.require_websocket)
                 result["status"] = "passed"
             finally:
                 for server in reversed(servers):

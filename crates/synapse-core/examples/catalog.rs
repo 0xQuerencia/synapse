@@ -1,5 +1,6 @@
 //! A real local caller for signed policy inspection and cache lifecycle.
-//! `fixture` creates original synthetic cache-test data, not inference weights.
+//! `fixture` creates original synthetic cache-test bytes. `inference-fixture`
+//! uses the original deterministic model; its random weights test mechanics only.
 use anyhow::{Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::{

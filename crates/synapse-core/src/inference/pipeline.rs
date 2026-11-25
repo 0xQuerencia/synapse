@@ -102,9 +102,35 @@ impl ToyLlamaConfig {
             metadata.get("model_type").and_then(|value| value.as_str()) == Some("llama"),
             "unsupported model architecture: this backend requires model_type=llama"
         );
+        anyhow::ensure!(
+            metadata
+                .get("hidden_act")
+                .is_none_or(|v| v.as_str() == Some("silu")),
+            "unsupported Llama activation; this backend requires silu"
+        );
+        anyhow::ensure!(
+            metadata
+                .get("rope_interleaved")
+                .is_none_or(|v| v.as_bool() == Some(false)),
+            "interleaved or malformed RoPE is unsupported"
+        );
+        anyhow::ensure!(
+            metadata
+                .get("pretraining_tp")
+                .is_none_or(|v| v.as_u64() == Some(1)),
+            "tensor-parallel checkpoint transforms are unsupported"
+        );
+        anyhow::ensure!(
+            metadata
+                .get("quantization_config")
+                .is_none_or(|v| v.is_null()),
+            "quantized safetensors configuration is unsupported; select a validated GGUF artifact"
+        );
         for unsupported in ["attention_bias", "mlp_bias"] {
             anyhow::ensure!(
-                metadata.get(unsupported).and_then(|value| value.as_bool()) != Some(true),
+                metadata
+                    .get(unsupported)
+                    .is_none_or(|value| value.as_bool() == Some(false)),
                 "unsupported Llama option: {unsupported}"
             );
         }
@@ -114,7 +140,16 @@ impl ToyLlamaConfig {
                 .is_none_or(|value| value.is_null()),
             "scaled RoPE is not supported by this backend"
         );
-        let config: Self = serde_json::from_str(&content).context("failed to parse config.json")?;
+        let mut config: Self =
+            serde_json::from_str(&content).context("failed to parse config.json")?;
+        // Llama defaults to ordinary multi-head attention when the KV-head
+        // count is omitted; defaulting to one would invent grouped-query math.
+        if !metadata
+            .as_object()
+            .is_some_and(|object| object.contains_key("num_key_value_heads"))
+        {
+            config.num_key_value_heads = config.num_attention_heads;
+        }
         config.validate()?;
         info!(
             hidden_size = config.hidden_size,
@@ -211,6 +246,19 @@ pub fn get_best_device() -> Result<Device> {
 
     info!("using CPU for inference");
     Ok(Device::Cpu)
+}
+
+/// Candle CPU matmul executes float32; half-precision checkpoint storage is
+/// converted explicitly. Accelerator backends retain the declared dtype.
+pub fn execution_dtype(config: &ToyLlamaConfig, device: &Device) -> DType {
+    if device.is_cpu() {
+        return DType::F32;
+    }
+    match config.torch_dtype.as_str() {
+        "bfloat16" => DType::BF16,
+        "float16" | "half" => DType::F16,
+        _ => DType::F32,
+    }
 }
 
 fn micro_benchmark_score(elapsed_ms: f64) -> u64 {
@@ -997,11 +1045,7 @@ impl ToyLlama {
         );
 
         let device = get_best_device().context("failed to select inference device")?;
-        let dtype = match config.torch_dtype.as_str() {
-            "bfloat16" => DType::BF16,
-            "float16" | "half" => DType::F16,
-            _ => DType::F32,
-        };
+        let dtype = execution_dtype(config, &device);
         let shards =
             shard_files_for_assignment(weights_path, &range, roles, config.tie_word_embeddings)?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&shards, dtype, &device)? };
@@ -2171,102 +2215,151 @@ pub struct ToyLlamaGGUF {
 }
 
 fn gguf_u64(content: &gguf_file::Content, key: &str) -> Result<u64> {
-    content
-        .metadata
-        .get(key)
-        .with_context(|| format!("GGUF metadata missing {key}"))?
-        .to_u64()
-        .with_context(|| format!("GGUF metadata {key} is not an integer"))
+    match content.metadata.get(key) {
+        Some(gguf_file::Value::U8(v)) => Ok(*v as u64),
+        Some(gguf_file::Value::U16(v)) => Ok(*v as u64),
+        Some(gguf_file::Value::U32(v)) => Ok(*v as u64),
+        Some(gguf_file::Value::U64(v)) => Ok(*v),
+        _ => anyhow::bail!("missing or invalid unsigned GGUF metadata: {key}"),
+    }
+}
+fn gguf_u64_or(content: &gguf_file::Content, key: &str, default: u64) -> Result<u64> {
+    if content.metadata.contains_key(key) {
+        gguf_u64(content, key)
+    } else {
+        Ok(default)
+    }
+}
+fn gguf_f64_or(content: &gguf_file::Content, key: &str, default: f64) -> Result<f64> {
+    match content.metadata.get(key) {
+        None => Ok(default),
+        Some(gguf_file::Value::F32(value)) => Ok(*value as f64),
+        Some(gguf_file::Value::F64(value)) => Ok(*value),
+        _ => anyhow::bail!("invalid floating-point GGUF metadata: {key}"),
+    }
+}
+fn gguf_config(content: &gguf_file::Content) -> Result<ToyLlamaConfig> {
+    let hidden = gguf_u64(content, "llama.embedding_length")? as usize;
+    let heads = gguf_u64(content, "llama.attention.head_count")? as usize;
+    anyhow::ensure!(
+        hidden > 0 && heads > 0 && hidden.is_multiple_of(heads),
+        "invalid GGUF attention dimensions"
+    );
+    if let Some(value) = content.metadata.get("llama.rope.scaling.type") {
+        anyhow::ensure!(
+            value.to_string().is_ok_and(|kind| kind == "none"),
+            "scaled GGUF RoPE is unsupported"
+        );
+    }
+    anyhow::ensure!(
+        gguf_f64_or(content, "llama.rope.scale_linear", 1.0)? == 1.0,
+        "linear GGUF RoPE scaling is unsupported"
+    );
+    anyhow::ensure!(
+        gguf_u64_or(
+            content,
+            "llama.rope.dimension_count",
+            (hidden / heads) as u64
+        )? as usize
+            == hidden / heads,
+        "partial GGUF RoPE is unsupported"
+    );
+    let inferred_vocab = content
+        .tensor_infos
+        .get("token_embd.weight")
+        .and_then(|t| t.shape.dims().first())
+        .copied()
+        .unwrap_or(0);
+    let config = ToyLlamaConfig {
+        hidden_size: hidden,
+        intermediate_size: gguf_u64_or(content, "llama.feed_forward_length", (4 * hidden) as u64)?
+            as usize,
+        num_hidden_layers: gguf_u64(content, "llama.block_count")? as usize,
+        vocab_size: gguf_u64_or(content, "llama.vocab_size", inferred_vocab as u64)? as usize,
+        rms_norm_eps: gguf_f64_or(content, "llama.attention.layer_norm_rms_epsilon", 1e-5)?,
+        num_attention_heads: heads,
+        num_key_value_heads: gguf_u64_or(content, "llama.attention.head_count_kv", heads as u64)?
+            as usize,
+        tie_word_embeddings: !content.tensor_infos.contains_key("output.weight"),
+        max_position_embeddings: gguf_u64_or(content, "llama.context_length", 4096)? as usize,
+        rope_theta: gguf_f64_or(content, "llama.rope.freq_base", 10000.0)?,
+        torch_dtype: "float32".into(),
+    };
+    config.validate()?;
+    anyhow::ensure!(
+        !content
+            .tensor_infos
+            .keys()
+            .any(|key| key.ends_with(".bias")),
+        "GGUF biases are unsupported"
+    );
+    let require = |name: &str, dims: &[usize]| -> Result<()> {
+        let tensor = content
+            .tensor_infos
+            .get(name)
+            .with_context(|| format!("missing GGUF tensor {name}"))?;
+        anyhow::ensure!(
+            tensor.shape.dims() == dims,
+            "GGUF shape mismatch for {name}"
+        );
+        Ok(())
+    };
+    require("token_embd.weight", &[config.vocab_size, hidden])?;
+    require("output_norm.weight", &[hidden])?;
+    if !config.tie_word_embeddings {
+        require("output.weight", &[config.vocab_size, hidden])?;
+    }
+    let kv = config.num_key_value_heads * config.head_dim();
+    for layer in 0..config.num_hidden_layers {
+        let prefix = format!("blk.{layer}");
+        for suffix in ["attn_norm.weight", "ffn_norm.weight"] {
+            require(&format!("{prefix}.{suffix}"), &[hidden])?;
+        }
+        for (suffix, dims) in [
+            ("attn_q.weight", [hidden, hidden]),
+            ("attn_k.weight", [kv, hidden]),
+            ("attn_v.weight", [kv, hidden]),
+            ("attn_output.weight", [hidden, hidden]),
+            ("ffn_gate.weight", [config.intermediate_size, hidden]),
+            ("ffn_up.weight", [config.intermediate_size, hidden]),
+            ("ffn_down.weight", [hidden, config.intermediate_size]),
+        ] {
+            require(&format!("{prefix}.{suffix}"), &dims)?;
+        }
+    }
+    Ok(config)
 }
 
-/// Read the layer count (`llama.block_count`) from a GGUF file header.
-///
-/// The node loader uses this to compute the static shard plan before
-/// constructing a `ToyLlamaGGUF` slice, since quantized files carry all
-/// model metadata in the header rather than in an HF `config.json`.
+/// Resolve and validate a GGUF model's architecture and tensor dimensions.
 pub fn gguf_layer_count(path: &Path) -> Result<usize> {
-    let mut file =
-        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let content = gguf_file::Content::read(&mut file).context("failed to parse GGUF header")?;
-    gguf_u64(&content, "llama.block_count").map(|n| n as usize)
+    let mut file = File::open(path)?;
+    let content = super::gguf_validation::read_checked(&mut file)?;
+    Ok(gguf_config(&content)?.num_hidden_layers)
 }
 
-/// Validate independent sidecar dimensions before any tensor allocation or
-/// memory reservation. A sidecar cannot understate the actual GGUF model.
+/// Reject sidecars which understate or contradict actual GGUF dimensions.
 pub fn validate_gguf_config(path: &Path, config: &ToyLlamaConfig) -> Result<()> {
     config.validate()?;
     let mut file = File::open(path)?;
-    let content = gguf_file::Content::read(&mut file)?;
+    let content = super::gguf_validation::read_checked(&mut file)?;
+    let actual = gguf_config(&content)?;
     anyhow::ensure!(
-        content
-            .metadata
-            .get("general.architecture")
-            .and_then(|value| value.to_string().ok())
-            .is_some_and(|value| value == "llama"),
-        "unsupported or missing GGUF architecture"
-    );
-    for (key, expected) in [
-        ("llama.embedding_length", config.hidden_size),
-        ("llama.block_count", config.num_hidden_layers),
-        ("llama.attention.head_count", config.num_attention_heads),
-        ("llama.vocab_size", config.vocab_size),
-    ] {
-        anyhow::ensure!(
-            gguf_u64(&content, key)? == expected as u64,
-            "GGUF sidecar mismatch for {key}"
-        );
-    }
-    for (key, expected, default) in [
-        (
-            "llama.attention.head_count_kv",
-            config.num_key_value_heads,
-            config.num_attention_heads,
-        ),
-        (
-            "llama.feed_forward_length",
-            config.intermediate_size,
-            4 * config.hidden_size,
-        ),
-        ("llama.context_length", config.max_position_embeddings, 4096),
-        (
-            "llama.rope.dimension_count",
-            config.head_dim(),
-            config.head_dim(),
-        ),
-    ] {
-        anyhow::ensure!(
-            gguf_u64_or(&content, key, default as u64) == expected as u64,
-            "GGUF sidecar mismatch for {key}"
-        );
-    }
-    anyhow::ensure!(
-        gguf_f64_or(&content, "llama.rope.freq_base", 10000.0) == config.rope_theta,
-        "GGUF sidecar RoPE mismatch"
+        config.hidden_size == actual.hidden_size
+            && config.intermediate_size == actual.intermediate_size
+            && config.num_hidden_layers == actual.num_hidden_layers
+            && config.vocab_size == actual.vocab_size
+            && config.num_attention_heads == actual.num_attention_heads
+            && config.num_key_value_heads == actual.num_key_value_heads
+            && config.max_position_embeddings == actual.max_position_embeddings,
+        "GGUF sidecar dimensions mismatch"
     );
     anyhow::ensure!(
-        (gguf_f64_or(&content, "llama.attention.layer_norm_rms_epsilon", 1e-5)
-            - config.rms_norm_eps)
-            .abs()
-            <= 1e-10,
-        "GGUF sidecar normalization mismatch"
+        (config.rope_theta - actual.rope_theta).abs() <= config.rope_theta.abs() * 1e-6
+            && (config.rms_norm_eps - actual.rms_norm_eps).abs()
+                <= config.rms_norm_eps.abs() * 1e-6,
+        "GGUF sidecar numerical metadata mismatch"
     );
     Ok(())
-}
-
-fn gguf_u64_or(content: &gguf_file::Content, key: &str, default: u64) -> u64 {
-    content
-        .metadata
-        .get(key)
-        .and_then(|v| v.to_u64().ok())
-        .unwrap_or(default)
-}
-
-fn gguf_f64_or(content: &gguf_file::Content, key: &str, default: f64) -> f64 {
-    content
-        .metadata
-        .get(key)
-        .and_then(|v| v.to_f64().ok())
-        .unwrap_or(default)
 }
 
 impl ToyLlamaGGUF {
@@ -2306,7 +2399,8 @@ impl ToyLlamaGGUF {
         let device = get_best_device().context("failed to select inference device")?;
         let mut file =
             File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        let content = gguf_file::Content::read(&mut file).context("failed to parse GGUF header")?;
+        let content = super::gguf_validation::read_checked(&mut file)
+            .context("failed to parse GGUF header")?;
         let n_layers = gguf_u64(&content, "llama.block_count")? as usize;
         drop(file);
         Self::load_range(path, 0..n_layers, &device)
@@ -2327,59 +2421,23 @@ impl ToyLlamaGGUF {
         info!(?path, ?range, "loading quantized GGUF llama weights");
         let mut file =
             File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        let content = gguf_file::Content::read(&mut file).context("failed to parse GGUF header")?;
+        let content = super::gguf_validation::read_checked(&mut file)
+            .context("failed to parse GGUF header")?;
 
-        let hidden = gguf_u64(&content, "llama.embedding_length")? as usize;
-        let n_layers = gguf_u64(&content, "llama.block_count")? as usize;
-        let n_heads = gguf_u64(&content, "llama.attention.head_count")? as usize;
-        let vocab = gguf_u64(&content, "llama.vocab_size")? as usize;
-        if range.start > range.end || range.end > n_layers {
-            bail!(
-                "layer range {}..{} exceeds GGUF block_count {}",
-                range.start,
-                range.end,
-                n_layers
-            );
-        }
-        anyhow::ensure!(
-            n_heads > 0 && hidden > 0 && hidden.is_multiple_of(n_heads),
-            "invalid GGUF attention dimensions"
+        let config = gguf_config(&content)?;
+        let (hidden, n_layers, n_heads, n_kv_heads, vocab, eps) = (
+            config.hidden_size,
+            config.num_hidden_layers,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.vocab_size,
+            config.rms_norm_eps,
         );
-        let head_dim = hidden / n_heads;
-        let rope_dim =
-            gguf_u64_or(&content, "llama.rope.dimension_count", head_dim as u64) as usize;
-        if rope_dim != head_dim {
-            bail!(
-                "unsupported partial rotary dimension {rope_dim} (head_dim={head_dim}); \
-                 only full head-dim RoPE is supported"
-            );
-        }
-        let n_kv_heads =
-            gguf_u64_or(&content, "llama.attention.head_count_kv", n_heads as u64) as usize;
-        let eps = gguf_f64_or(&content, "llama.attention.layer_norm_rms_epsilon", 1e-5);
-        let intermediate =
-            gguf_u64_or(&content, "llama.feed_forward_length", (4 * hidden) as u64) as usize;
-        let max_pos = gguf_u64_or(&content, "llama.context_length", 4096) as usize;
-        let rope_theta = gguf_f64_or(&content, "llama.rope.freq_base", 10_000.0);
-        if !hidden.is_multiple_of(n_heads) {
-            bail!("hidden_size {hidden} not divisible by head_count {n_heads}");
-        }
-
-        let config = ToyLlamaConfig {
-            hidden_size: hidden,
-            intermediate_size: intermediate,
-            num_hidden_layers: n_layers,
-            vocab_size: vocab,
-            rms_norm_eps: eps,
-            num_attention_heads: n_heads,
-            num_key_value_heads: n_kv_heads,
-            tie_word_embeddings: false,
-            max_position_embeddings: max_pos,
-            rope_theta,
-            torch_dtype: "float32".to_owned(),
-        };
-        config.validate()?;
-
+        anyhow::ensure!(
+            range.start <= range.end && range.end <= n_layers,
+            "GGUF range exceeds model depth"
+        );
+        let head_dim = config.head_dim();
         let embed_tokens = if roles.input {
             let embedding = content
                 .tensor(&mut file, "token_embd.weight", device)?
@@ -2487,7 +2545,8 @@ impl ToyLlamaGGUF {
             None
         };
 
-        let rope = RotaryEmbedding::new(head_dim, max_pos.min(4096), rope_theta, device)?;
+        let rope =
+            RotaryEmbedding::new(head_dim, config.context_limit(), config.rope_theta, device)?;
 
         info!(
             hidden,
@@ -3244,5 +3303,70 @@ mod tests {
 
         let device = get_best_device().expect("device selection should succeed");
         assert!(device.is_cpu(), "CPU-only environments must return CPU");
+    }
+}
+
+#[cfg(all(test, not(any(feature = "cuda", feature = "metal"))))]
+mod cpu_half_storage_regression {
+    use super::*;
+    #[test]
+    fn bf16_checkpoint_executes_on_cpu_with_accounted_f32_weights() {
+        let files = crate::inference::model_loader::test_model_files().unwrap();
+        let mut config = ToyLlamaConfig::from_file(&files.config).unwrap();
+        config.torch_dtype = "bfloat16".into();
+        let weights = candle_core::safetensors::load(&files.weights, &Device::Cpu).unwrap();
+        let weights: std::collections::HashMap<_, _> = weights
+            .into_iter()
+            .map(|(name, tensor)| (name, tensor.to_dtype(DType::BF16).unwrap()))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        candle_core::safetensors::save(&weights, &path).unwrap();
+        let model = ToyLlama::load(&config, &path).unwrap();
+        assert_eq!(model.model_dtype(), DType::F32);
+        let input = Tensor::new(&[[1u32, 2, 3]], &Device::Cpu).unwrap();
+        let logits = model.forward_prefill(&input).unwrap();
+        assert_eq!(ToyLlama::sample_argmax(&logits).unwrap(), 45);
+        let estimate = crate::inference::memory::ModelMemoryProfile::new(&config, false)
+            .unwrap()
+            .estimate(config.num_hidden_layers, 11, TensorRoles::COORDINATOR)
+            .unwrap();
+        assert_eq!(model.resident_weight_bytes(), estimate.weights_bytes);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_semantics_tests {
+    use super::*;
+    #[test]
+    fn unsupported_semantics_fail_before_loading_any_tensor() {
+        let files = crate::inference::model_loader::test_model_files().unwrap();
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(files.config).unwrap()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        for (key, value) in [
+            ("hidden_act", serde_json::json!("gelu")),
+            ("attention_bias", serde_json::json!("false")),
+            ("rope_interleaved", serde_json::json!(true)),
+            ("pretraining_tp", serde_json::json!(2)),
+            (
+                "quantization_config",
+                serde_json::json!({"quant_method":"awq"}),
+            ),
+        ] {
+            let mut bad = original.clone();
+            bad[key] = value;
+            std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+            assert!(ToyLlamaConfig::from_file(&path).is_err(), "accepted{key}");
+        }
+        let mut omitted = original;
+        omitted
+            .as_object_mut()
+            .unwrap()
+            .remove("num_key_value_heads");
+        std::fs::write(&path, serde_json::to_vec(&omitted).unwrap()).unwrap();
+        let config = ToyLlamaConfig::from_file(&path).unwrap();
+        assert_eq!(config.num_key_value_heads, config.num_attention_heads);
     }
 }

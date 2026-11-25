@@ -620,6 +620,7 @@ impl SynapseNode {
 
     /// Notify connected workers and clean up state before shutdown.
     pub(super) fn shutdown_cleanup(&mut self) {
+        self.token_decode_state.reset();
         self.release_generation_assignments();
         self.release_worker_assignment();
         self.pipeline = None;

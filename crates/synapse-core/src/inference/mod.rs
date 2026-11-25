@@ -2,6 +2,7 @@ pub mod admission;
 pub mod assignment;
 pub mod cache;
 pub mod compression;
+pub mod gguf_validation;
 pub mod kv_cache;
 pub mod memory;
 pub mod model_loader;

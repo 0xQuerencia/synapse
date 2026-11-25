@@ -29,11 +29,33 @@ def host_target():
     return f'{machine}-unknown-linux-gnu'
 
 
-def safe_path(path):
+def trusted_ancestor(path):
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError('installation path must not contain symlinks')
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, os.geteuid()}:
+        raise ValueError('installation path ancestor must be a directory owned by this user or root')
+    # A trusted sticky directory (normally /tmp) protects a child's name from
+    # other accounts. The owner must still be trusted: sticky does not restrict
+    # the directory owner from replacing somebody else's child.
+    if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+        raise ValueError('installation path ancestor is group/world writable without sticky protection')
+
+
+def safe_path(path, create=False):
     path = Path(os.path.abspath(os.path.expanduser(path)))
     for component in [*reversed(path.parents), path]:
-        if component.is_symlink():
-            raise ValueError('installation path must not contain symlinks')
+        try:
+            trusted_ancestor(component)
+        except FileNotFoundError:
+            if not create:
+                raise ValueError('installation does not exist') from None
+            try:
+                component.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            # Validate a concurrent creator too, before using its directory.
+            trusted_ancestor(component)
     return path
 
 
@@ -58,14 +80,10 @@ def write_owned(path, content, mode=0o600):
 
 
 def prepare_prefix(prefix, create=False):
-    prefix = safe_path(prefix)
+    prefix = safe_path(prefix, create=create)
     if prefix == Path('/'):
         raise ValueError('root directory cannot be an install prefix')
-    if not prefix.exists():
-        if not create:
-            raise ValueError('installation does not exist')
-        prefix.mkdir(parents=True, mode=0o700)
-    info = prefix.stat()
+    info = prefix.lstat()
     if info.st_uid != os.geteuid() or not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o022:
         raise ValueError('prefix must be a directory owned and writable only by this user')
     marker = prefix / MARKER
@@ -76,6 +94,11 @@ def prepare_prefix(prefix, create=False):
     value, _ = read_document(marker)
     if value != {'schema_version': 1, 'owner_uid': os.geteuid()}:
         raise ValueError('unrecognized install ownership marker')
+    # Every operation, including verify/rollback, must reject an unsafe entry
+    # point or release namespace before resolving links through it.
+    for name in ['releases', 'bin']:
+        if os.path.lexists(prefix / name):
+            owned_directory(prefix / name)
     return prefix
 
 
@@ -96,12 +119,18 @@ def locked(prefix):
         os.close(fd)
 
 
-def ensure_directory(path):
-    if not path.exists():
-        path.mkdir(mode=0o700)
+def owned_directory(path):
     info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
-        raise ValueError('managed directory is not a normal owned directory')
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        raise ValueError('managed directory must be normal, owned and not group/world writable')
+
+
+def ensure_directory(path):
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    owned_directory(path)
 
 
 def running_processes(prefix):
@@ -134,9 +163,9 @@ def pointer(prefix, name):
     target = Path(os.readlink(value))
     if target.is_absolute() or len(target.parts) != 2 or target.parts[0] != 'releases' or target.parts[1].startswith('.'):
         raise ValueError('install pointer escapes managed releases')
+    owned_directory(prefix / 'releases')
     destination = prefix / target
-    if destination.is_symlink() or not destination.is_dir():
-        raise ValueError('install pointer has no normal release directory')
+    owned_directory(destination)
     return target.as_posix()
 
 
@@ -216,8 +245,7 @@ def extract_verified(snapshot, stage, statement):
 
 
 def verify_release(directory):
-    if directory.is_symlink() or not directory.is_dir():
-        raise ValueError('release directory is unsafe')
+    owned_directory(directory)
     manifest, raw = read_document(directory / 'manifest.json')
     validate_manifest(manifest)
     statement, _ = read_document(directory / 'release-statement.json')
@@ -238,6 +266,8 @@ def verify_release(directory):
     for item in directory.rglob('*'):
         if item.is_symlink() or (not item.is_dir() and not item.is_file()):
             raise ValueError('unexpected link or special file in installation')
+        if item.is_dir():
+            owned_directory(item)
         if item.is_file():
             actual.add(item.relative_to(directory).as_posix())
     if actual != expected:
