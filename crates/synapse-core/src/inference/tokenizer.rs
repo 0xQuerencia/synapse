@@ -11,6 +11,7 @@ use tracing::info;
 /// Thin wrapper around `tokenizers::Tokenizer` for text ↔ token-ID conversion.
 pub struct SimpleTokenizer {
     inner: tokenizers::Tokenizer,
+    eos_ids: Vec<u32>,
 }
 
 impl SimpleTokenizer {
@@ -19,8 +20,42 @@ impl SimpleTokenizer {
         let inner = tokenizers::Tokenizer::from_file(path)
             .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
 
+        let mut eos_ids = Vec::new();
+        let config_path = path.with_file_name("config.json");
+        if config_path.exists() {
+            let config: serde_json::Value = serde_json::from_slice(&std::fs::read(config_path)?)?;
+            if let Some(value) = config.get("eos_token_id") {
+                let values = value
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_else(|| vec![value.clone()]);
+                for value in values {
+                    if value.is_null() {
+                        continue;
+                    }
+                    let id = value
+                        .as_u64()
+                        .and_then(|id| u32::try_from(id).ok())
+                        .ok_or_else(|| anyhow::anyhow!("invalid configured EOS token"))?;
+                    anyhow::ensure!(
+                        (id as usize) < inner.get_vocab_size(true),
+                        "EOS token outside vocabulary"
+                    );
+                    if !eos_ids.contains(&id) {
+                        eos_ids.push(id);
+                    }
+                }
+            }
+        }
+        if eos_ids.is_empty() {
+            for name in ["<|im_end|>", "</s>", "<|endoftext|>"] {
+                if let Some(id) = inner.token_to_id(name) {
+                    eos_ids.push(id);
+                }
+            }
+        }
         info!(?path, "tokenizer loaded");
-        Ok(Self { inner })
+        Ok(Self { inner, eos_ids })
     }
 
     /// Encode text into token IDs.
@@ -52,14 +87,11 @@ impl SimpleTokenizer {
     /// Return the EOS token ID, if configured.
     /// Checks common EOS token names used by Llama and SmolLM2 models.
     pub fn eos_token_id(&self) -> Option<u32> {
-        let vocab = self.inner.get_added_vocabulary().get_vocab();
-        // Try common EOS token names
-        for name in ["</s>", "<|endoftext|>", "<|im_end|>"] {
-            if let Some(id) = vocab.get(name) {
-                return Some(*id);
-            }
-        }
-        None
+        self.eos_ids.first().copied()
+    }
+
+    pub fn is_eos(&self, token_id: u32) -> bool {
+        self.eos_ids.contains(&token_id)
     }
 }
 
