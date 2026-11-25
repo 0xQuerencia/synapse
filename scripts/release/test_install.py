@@ -1,3 +1,4 @@
+import errno
 import fcntl
 import gzip
 import hashlib
@@ -22,6 +23,23 @@ class InstallationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.keys = tempfile.TemporaryDirectory(prefix='synapse-test-keys-')
+        # Use a standalone native executable: on some distributions /bin/true
+        # and /bin/sleep are symlinks to a multicall binary. A copied multicall
+        # executable renamed synapse may also change behavior.
+        cls.binary = Path(cls.keys.name) / 'native-fixture'
+        fixture = cls.binary.with_suffix('.c')
+        fixture.write_text(
+            '#include <unistd.h>\n'
+            'int main(int argc, char **argv) {\n'
+            '    (void)argv;\n'
+            '    if (argc > 1) sleep(30);\n'
+            '    return 0;\n'
+            '}\n',
+            encoding='utf-8',
+        )
+        subprocess.run(['cc', '-std=c99', '-Wall', '-Wextra', '-Werror',
+                        str(fixture), '-o', str(cls.binary)],
+                       check=True, capture_output=True)
         cls.key = Path(cls.keys.name) / 'signing.pem'
         cls.public = Path(cls.keys.name) / 'public.pem'
         subprocess.run(['openssl', 'genpkey', '-algorithm', 'ED25519', '-out', str(cls.key)], check=True, capture_output=True)
@@ -42,9 +60,9 @@ class InstallationTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def package(self, version='1.0.0', signed=False, binary='/bin/true', target=None):
+    def package(self, version='1.0.0', signed=False, binary=None, target=None):
         self.count += 1
-        return builder.make_package(Path(binary), version, target or installer.host_target(), self.packages / str(self.count), signing_key=self.key if signed else None, channel='candidate' if signed else 'development')
+        return builder.make_package(self.binary if binary is None else Path(binary), version, target or installer.host_target(), self.packages / str(self.count), signing_key=self.key if signed else None, channel='candidate' if signed else 'development')
 
     def install(self, paths, **kwargs):
         archive, statement, signature = paths
@@ -286,7 +304,7 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual((self.prefix / 'current').resolve(), current)
 
     def test_live_installed_process_blocks_update_and_uninstall(self):
-        self.install(self.package(binary='/bin/sleep'))
+        self.install(self.package())
         process = subprocess.Popen([str(self.prefix / 'bin/synapse'), '30'])
         try:
             self.assertIn(process.pid, installer.running_processes(self.prefix))
@@ -316,11 +334,19 @@ class InstallationTests(unittest.TestCase):
         first, second = self.package(), self.package()
         self.assertEqual(digest(first[0]), digest(second[0]))
         with self.assertRaisesRegex(ValueError, 'overwrite'):
-            builder.make_package(Path('/bin/true'), '1.0.0', installer.host_target(), first[0].parent)
+            builder.make_package(self.binary, '1.0.0', installer.host_target(), first[0].parent)
+
+    def test_package_source_symlink_is_rejected(self):
+        link = self.root / 'linked-executable'
+        link.symlink_to(self.binary)
+        with self.assertRaises(OSError) as error:
+            self.package(binary=link)
+        self.assertEqual(error.exception.errno, errno.ELOOP)
+        self.assertFalse(self.packages.exists())
 
     def test_source_replacement_after_hash_keeps_signed_package_consistent(self):
         binary, sbom = self.root / 'build-output', self.root / 'sbom.json'
-        original_binary = Path('/bin/true').read_bytes()
+        original_binary = self.binary.read_bytes()
         original_sbom = b'{"version":1}\n'
         binary.write_bytes(original_binary)
         sbom.write_bytes(original_sbom)
