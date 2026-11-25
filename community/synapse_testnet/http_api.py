@@ -11,6 +11,10 @@ from .service import Service
 
 MAX_BODY=32768
 ROUTES={
+ 'POST /v1/operator/invites': ('issue_invite', ('member','role','recipient','ttl')),
+ 'POST /v1/operator/invites/revoke': ('revoke_invite', ('invite',)),
+ 'POST /v1/auth/enroll': ('redeem_invite', ('claim','signature')),
+ 'POST /v1/auth/rotate': ('rotate_token', ()),
  'POST /v1/consent': ('consent', ('version','external_compute')),
  'POST /v1/quotes': ('quote', ('model','tariff','input_units','max_output')),
  'POST /v1/jobs': ('reserve', ('quote','idem')),
