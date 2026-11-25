@@ -416,6 +416,63 @@ class Service(Ledger):
             a=self.actor(db,token,{'requester','worker'})
             return [dict(r) for r in db.execute("SELECT j.id,j.kind,j.created,e.amount FROM journal j JOIN entries e ON e.tx=j.id JOIN accounts ac ON ac.id=e.account WHERE ac.owner=? AND ac.pool=? AND ac.kind='available' ORDER BY j.created DESC,j.id LIMIT ?",(a['id'],a['pool'],limit))]
 
+    def pending_events(self, token, limit=50):
+        integer(limit,1,100)
+        with self.read() as db:
+            a=self.actor(db,token,{'operator'})
+            return [dict(r) for r in db.execute('SELECT id,pool,kind,subject,created FROM outbox WHERE pool=? AND delivered=0 ORDER BY created,id LIMIT ?',(a['pool'],limit))]
+
+    def acknowledge_event(self, token, event, fingerprint):
+        ident(event); digest(fingerprint)
+        with self.tx() as db:
+            a=self.actor(db,token,{'operator'})
+            r=self.row(db,'SELECT id,pool,kind,subject,created FROM outbox WHERE id=? AND pool=?',(event,a['pool']))
+            require(sha(canonical(dict(r)))==fingerprint,'EVENT_FINGERPRINT_MISMATCH',409)
+            db.execute('UPDATE outbox SET delivered=1 WHERE id=? AND pool=? AND delivered=0',(event,a['pool']))
+            return {'acknowledged':True,'event':event}
+
+    def operator_status(self, token):
+        with self.read() as db:
+            a=self.actor(db,token,{'operator'}); p=a['pool']
+            self.reconcile(db)
+            counts={r['state']:r['n'] for r in db.execute('SELECT state,COUNT(*) AS n FROM jobs WHERE pool=? GROUP BY state',(p,))}
+            return {'pool':p,'enabled':bool(a['pool_enabled']),'jobs':counts,
+                    'pending_events':db.execute('SELECT COUNT(*) FROM outbox WHERE pool=? AND delivered=0',(p,)).fetchone()[0],
+                    'members':db.execute('SELECT COUNT(*) FROM members WHERE pool=? AND enabled=1',(p,)).fetchone()[0],
+                    'fake_credits':True,'ledger_reconciled':True}
+
+    def contributor_profile(self,token):
+        with self.read() as db:
+            a=self.actor(db,token,{'worker'},True)
+            r=db.execute('SELECT alias FROM contributor_profiles WHERE member=? AND pool=?',(a['id'],a['pool'])).fetchone()
+            return {'opted_in':r is not None,'alias':r['alias'] if r else '', 'fake_credits':True}
+
+    def set_contributor_profile(self,token,opted_in,alias):
+        require(type(opted_in) is bool,'INVALID_BOOLEAN')
+        require(isinstance(alias,str) and (bool(re.fullmatch(r'[a-z0-9][a-z0-9_-]{2,23}',alias)) if opted_in else alias==''),'INVALID_ALIAS')
+        with self.tx() as db:
+            # Opt-out remains possible even when a pool is suspended.
+            a=self.actor(db,token,{'worker'},opted_in);p=a['pool']
+            if opted_in:
+                require(not db.execute('SELECT 1 FROM contributor_profiles WHERE pool=? AND alias=? AND member!=?',(p,alias,a['id'])).fetchone(),'ALIAS_UNAVAILABLE',409)
+                db.execute('DELETE FROM contributor_profiles WHERE member=?',(a['id'],))
+                db.execute('INSERT INTO contributor_profiles VALUES(?,?,?)',(a['id'],p,alias))
+            else:db.execute('DELETE FROM contributor_profiles WHERE member=?',(a['id'],))
+            # Never preserve the opted-out alias in an immutable audit row.
+            self.audit(db,p,a['id'],'ranking_opt_in' if opted_in else 'ranking_opt_out',a['id'])
+            return {'opted_in':opted_in,'alias':alias,'fake_credits':True}
+
+    def leaderboard(self,token):
+        with self.read() as db:
+            a=self.actor(db,token,{'requester','worker'},True)
+            rows=db.execute("SELECT p.alias,COUNT(DISTINCT j.id) AS verified_jobs FROM contributor_profiles p JOIN members m ON m.id=p.member AND m.pool=p.pool JOIN devices d ON d.owner=m.id JOIN assignments s ON s.device=d.id JOIN jobs j ON j.id=s.job AND j.pool=p.pool JOIN receipts r ON r.assignment=s.id WHERE p.pool=? AND m.enabled=1 AND m.role='worker' AND m.consent=? AND j.state='settled' AND r.status='verified' GROUP BY p.alias ORDER BY verified_jobs DESC,p.alias LIMIT 100",(a['pool'],a['consent_version']))
+            return [dict(r) for r in rows]
+
+    def disputes(self,token):
+        with self.read() as db:
+            a=self.actor(db,token,{'requester','worker'})
+            return [dict(r) for r in db.execute('SELECT d.id,d.job,d.reason,d.state,d.compensation FROM disputes d JOIN jobs j ON j.id=d.job WHERE j.pool=? AND d.owner=? ORDER BY d.id LIMIT 100',(a['pool'],a['id']))]
+
     def stats(self, token):
         with self.read() as db:
             a=self.actor(db,token,{'worker'})

@@ -62,6 +62,21 @@ class PostgresIntegrationTests(unittest.TestCase):
             self.s.validate(self.v, row['assignment'], row['digest'], True, 4, evidence)
             if corrupt: break
 
+    def test_outbox_and_contributor_privacy(self):
+        from synapse_testnet.ledger import sha,canonical
+        self.s.set_contributor_profile(self.t['worker-a'],True,'test-worker')
+        self.assertEqual(self.s.leaderboard(self.client),[])
+        j=self.s.reserve(self.client,self.quote(),'outbox')['job'];self.receipts();self.s.settle(self.client,j)
+        self.assertEqual(self.s.leaderboard(self.client),[{'alias':'test-worker','verified_jobs':1}])
+        self.s.set_contributor_profile(self.t['worker-a'],False,'');self.assertEqual(self.s.leaderboard(self.client),[])
+        events=self.s.pending_events(self.op)
+        self.assertTrue(events)
+        for e in events:self.s.acknowledge_event(self.op,e['id'],sha(canonical(e)))
+        self.assertEqual(self.s.operator_status(self.op)['pending_events'],0)
+        d=self.s.dispute(self.client,j,'incorrect_charge')
+        self.assertEqual(self.s.disputes(self.client)[0]['id'],d)
+        self.assertEqual(self.s.disputes(self.t['worker-a']),[])
+
     def test_http_sharded_and_full_model(self):
         for sharded in (True, False):
             with self.subTest(sharded=sharded):
