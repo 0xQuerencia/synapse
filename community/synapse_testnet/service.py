@@ -5,6 +5,7 @@ import re
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
 from .ledger import Ledger, Denied, CAP, require, integer, ident, digest, canonical, sha, uid, split
+from .synthetic import MODEL, observed
 
 RECEIPT_FIELDS = {'assignment','job','model','epoch','input_units','output_units','evidence'}
 
@@ -42,6 +43,7 @@ class Service(Ledger):
         credential=secrets.token_urlsafe(32)
         with self.tx() as db:
             a=self.actor(db,token,{'operator'})
+            require(db.execute('SELECT COUNT(*) FROM members WHERE pool=?',(a['pool'],)).fetchone()[0]<128,'MEMBER_LIMIT',429)
             require(not db.execute('SELECT 1 FROM members WHERE id=?',(member,)).fetchone(),'MEMBER_EXISTS',409)
             db.execute('INSERT INTO members(id,pool,role,token_hash) VALUES(?,?,?,?)',(member,a['pool'],role,sha(credential.encode())))
             self.audit(db,a['pool'],a['id'],'member_enrolled',member,{'role':role})
@@ -67,7 +69,7 @@ class Service(Ledger):
 
     def approve_model(self, token, model, layers, max_context, synthetic_only):
         digest(model); integer(layers,1,256); integer(max_context,2,32768)
-        require(synthetic_only is True,'TESTNET_SYNTHETIC_MODELS_ONLY',403)
+        require(synthetic_only is True and model==MODEL and layers==4 and max_context<=256,'TESTNET_SYNTHETIC_MODELS_ONLY',403)
         with self.tx() as db:
             a=self.actor(db,token,{'operator'})
             require(not db.execute('SELECT 1 FROM models WHERE pool=? AND digest=?',(a['pool'],model)).fetchone(),'MODEL_EXISTS',409)
@@ -156,6 +158,8 @@ class Service(Ledger):
         digest(model); ident(tariff); integer(input_units,1,32768); integer(max_output,1,32768)
         with self.tx() as db:
             a=self.actor(db,token,{'requester','worker'},True); p=a['pool']
+            require(db.execute('SELECT COUNT(*) FROM quotes WHERE pool=?',(p,)).fetchone()[0]<10000,'TESTNET_QUOTE_LIMIT',429)
+            require(db.execute('SELECT COUNT(*) FROM quotes WHERE requester=? AND used=0 AND expires>?',(a['id'],self.clock())).fetchone()[0]<16,'ACTIVE_QUOTE_LIMIT',429)
             m=self.row(db,'SELECT * FROM models WHERE pool=? AND digest=? AND enabled=1',(p,model),'MODEL_UNSUPPORTED')
             require(input_units+max_output<=m['max_context'],'CONTEXT_LIMIT')
             t=self.row(db,'SELECT * FROM tariffs WHERE pool=? AND version=?',(p,tariff))
@@ -242,9 +246,11 @@ class Service(Ledger):
         digest(receipt_digest); digest(observed_evidence); integer(observed_output,0,32768); require(type(accepted) is bool,'INVALID_BOOLEAN')
         with self.tx() as db:
             a=self.actor(db,token,{'verifier'},True)
-            r=self.row(db,'SELECT r.*,s.job,j.state,j.expires FROM receipts r JOIN assignments s ON s.id=r.assignment JOIN jobs j ON j.id=s.job WHERE r.assignment=? AND j.pool=?',(assignment,a['pool']))
+            r=self.row(db,'SELECT r.*,s.job,s.first_layer,s.end_layer,j.state,j.expires FROM receipts r JOIN assignments s ON s.id=r.assignment JOIN jobs j ON j.id=s.job WHERE r.assignment=? AND j.pool=?',(assignment,a['pool']))
             require(r['digest']==receipt_digest,'RECEIPT_CONFLICT',409)
-            body=json.loads(r['body']); status='verified' if accepted and observed_output==r['output_units'] and observed_evidence==body['evidence'] else 'rejected'
+            body=json.loads(r['body'])
+            reference=observed({**body,'first_layer':r['first_layer'],'end_layer':r['end_layer']},r['output_units'])
+            status='verified' if accepted and observed_output==r['output_units'] and observed_evidence==body['evidence']==reference else 'rejected'
             if r['status']!='pending':
                 require(r['status']==status and r['verifier']==a['id'],'VALIDATION_CONFLICT',409)
                 return r['status']
