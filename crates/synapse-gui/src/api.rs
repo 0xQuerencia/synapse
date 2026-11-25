@@ -15,113 +15,18 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use synapse_core::{NodeIdentity, list_cached_hf_models};
-use tower_http::cors::CorsLayer;
 
 use crate::{
     config_io,
-    session::{MasterStartResult, SessionStore},
+    session::{HostOptions, MasterStartResult, SessionStore, WorkerOptions},
 };
 
 /// Container of all handler-shared state.
 #[derive(Clone)]
 pub struct AppState {
     pub sessions: SessionStore,
-    /// Optional shared access token. When `Some`, the `auth_guard`
-    /// middleware requires it on every request. `None` = no auth
-    /// (localhost-only mode).
-    pub token: Option<Arc<String>>,
-}
-
-/// Request gate: when a token is configured, every request must present it
-/// via `?token=`, `x-synapse-token`, `Authorization: Bearer`, or the
-/// `synapse_token` cookie. A valid `?token=` also sets the cookie so the
-/// browser (and the WebSocket upgrade, which can't send custom headers)
-/// stays authenticated for the rest of the session.
-pub async fn auth_guard(
-    State(state): State<AppState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    use axum::http::header;
-
-    let Some(expected) = state.token.as_deref() else {
-        // No token configured — open (only safe on 127.0.0.1).
-        return next.run(req).await;
-    };
-
-    let from_query = req.uri().query().and_then(|q| query_param(q, "token"));
-    let headers = req.headers();
-    let from_header = headers
-        .get("x-synapse-token")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        .or_else(|| {
-            headers
-                .get(header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
-                .map(str::to_owned)
-        });
-    let from_cookie = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|c| cookie_value(c, "synapse_token"));
-
-    let presented = from_query.clone().or(from_header).or(from_cookie);
-
-    match presented {
-        Some(tok) if ct_eq(tok.as_bytes(), expected.as_bytes()) => {
-            let set_cookie = from_query.is_some();
-            let mut resp = next.run(req).await;
-            if set_cookie
-                && let Ok(val) = header::HeaderValue::from_str(&format!(
-                    "synapse_token={expected}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400"
-                ))
-            {
-                resp.headers_mut().append(header::SET_COOKIE, val);
-            }
-            resp
-        }
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            "unauthorized — open this server with ?token=YOUR_TOKEN appended to the URL",
-        )
-            .into_response(),
-    }
-}
-
-/// Constant-time byte comparison to avoid leaking the token via timing.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-/// Pull a single value out of a `key=value&key2=value2` query string.
-fn query_param(query: &str, key: &str) -> Option<String> {
-    for pair in query.split('&') {
-        let mut it = pair.splitn(2, '=');
-        if it.next() == Some(key) {
-            return it.next().map(str::to_owned);
-        }
-    }
-    None
-}
-
-/// Pull a single cookie value out of a `Cookie:` header string.
-fn cookie_value(cookies: &str, name: &str) -> Option<String> {
-    let prefix = format!("{name}=");
-    for c in cookies.split(';') {
-        if let Some(v) = c.trim().strip_prefix(&prefix) {
-            return Some(v.to_owned());
-        }
-    }
-    None
+    pub auth: Arc<crate::auth::LocalAuth>,
+    pub inference: Option<crate::compatible_api::InferenceService>,
 }
 
 /// Build the REST sub-router. Returns a `Router<AppState>` that
@@ -144,7 +49,7 @@ pub fn router() -> axum::Router<AppState> {
         .route("/api/session/relay", post(post_relay))
         .route("/api/session/stop", post(post_stop))
         .route("/api/session/prompt", post(post_prompt))
-        .layer(CorsLayer::permissive())
+        .route("/api/worker/control", post(post_worker_control))
 }
 
 // ─── Identity / status ──────────────────────────────────────────────────────
@@ -176,7 +81,8 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
         .map_err(|e| ApiError::internal("identity", e.to_string()))?;
     let cached =
         list_cached_hf_models().map_err(|e| ApiError::internal("cached_models", e.to_string()))?;
-    let net = synapse_core::NetConfig::load_default();
+    let net = synapse_core::NetConfig::load_strict_default()
+        .map_err(|e| ApiError::bad_request(&e.to_string()))?;
     let session = state.sessions.snapshot().await;
 
     Ok(Json(StatusResponse {
@@ -185,6 +91,11 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
         bootstrap_count: net.bootstrap.len(),
         relay_count: net.relays.len(),
         session,
+        node: state.sessions.node_status().await,
+        api_model: state
+            .inference
+            .as_ref()
+            .map(|service| service.model_id().to_owned()),
     }))
 }
 
@@ -195,6 +106,8 @@ struct StatusResponse {
     bootstrap_count: usize,
     relay_count: usize,
     session: crate::session::SessionSnapshot,
+    node: Option<synapse_core::network::NodeStatusSnapshot>,
+    api_model: Option<String>,
 }
 
 async fn get_cached_models() -> Result<Json<Vec<String>>, ApiError> {
@@ -249,6 +162,7 @@ async fn post_benchmark() -> Result<Json<BenchmarkResponse>, ApiError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DownloadRequest {
     model: String,
 }
@@ -309,7 +223,7 @@ async fn get_worker_info(State(state): State<AppState>) -> Json<WorkerInfoRespon
         pairing_code: snap.pairing_code.clone(),
         // Same-LAN workers auto-discover the master via mDNS, so they don't
         // need an address. Cross-network needs a relay (see /contribute).
-        discovery: "mdns".to_owned(),
+        discovery: "explicit peer address; optional pinned discovery".to_owned(),
         host_os: std::env::consts::OS.to_owned(),
         reason: reason.to_owned(),
     })
@@ -414,6 +328,7 @@ struct ConfigResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConfigWriteRequest {
     contents: String,
 }
@@ -421,12 +336,18 @@ struct ConfigWriteRequest {
 // ─── Session lifecycle ──────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HostRequest {
     model: String,
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
     #[serde(default = "default_listen")]
     listen: String,
+    memory_mib: Option<u64>,
+    #[serde(default)]
+    raw_prompt: bool,
+    #[serde(default)]
+    coordinator_only: bool,
 }
 
 fn default_max_tokens() -> usize {
@@ -442,22 +363,33 @@ async fn post_host(
 ) -> Result<Json<MasterStartResult>, ApiError> {
     state
         .sessions
-        .start_master(req.model, req.max_tokens, req.listen)
+        .start_master(
+            req.model,
+            HostOptions {
+                max_tokens: req.max_tokens,
+                listen: req.listen,
+                memory_mib: req.memory_mib,
+                raw_prompt: req.raw_prompt,
+                coordinator_only: req.coordinator_only,
+            },
+        )
         .await
         .map(Json)
         .map_err(|e| ApiError::bad_request(&e.to_string()))
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JoinRequest {
     model: String,
     code: String,
     master_addr: Option<String>,
-    /// Optional measured benchmark score from `/api/benchmark`. When
-    /// present, the worker advertises it so the master divides layers by
-    /// this machine's real throughput instead of a thread-count guess.
+    /// Local inference reservation budget; never a caller-supplied compute score.
     #[serde(default)]
-    compute_score: Option<u64>,
+    memory_mib: Option<u64>,
+    duration_minutes: Option<u64>,
+    #[serde(default = "default_listen")]
+    listen: String,
 }
 
 async fn post_join(
@@ -466,7 +398,16 @@ async fn post_join(
 ) -> Result<Json<JoinResponse>, ApiError> {
     let peer_id = state
         .sessions
-        .start_worker(req.model, req.code, req.master_addr, req.compute_score)
+        .start_worker(
+            req.model,
+            req.code,
+            req.master_addr,
+            WorkerOptions {
+                listen: req.listen,
+                memory_mib: req.memory_mib,
+                duration_minutes: req.duration_minutes,
+            },
+        )
         .await
         .map_err(|e| ApiError::bad_request(&e.to_string()))?;
     let session = state.sessions.snapshot().await;
@@ -480,6 +421,7 @@ struct JoinResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RelayRequest {
     #[serde(default = "default_relay_listen")]
     listen: String,
@@ -518,6 +460,7 @@ async fn post_stop(State(state): State<AppState>) -> Result<Json<serde_json::Val
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PromptRequest {
     text: String,
     max_tokens: Option<usize>,
@@ -533,6 +476,23 @@ async fn post_prompt(
         .await
         .map_err(|e| ApiError::bad_request(&e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerControlRequest {
+    action: synapse_core::network::worker::WorkerAction,
+}
+async fn post_worker_control(
+    State(state): State<AppState>,
+    Json(request): Json<WorkerControlRequest>,
+) -> Result<Json<synapse_core::network::worker::WorkerSnapshot>, ApiError> {
+    state
+        .sessions
+        .worker_control(request.action)
+        .await
+        .map(Json)
+        .map_err(|e| ApiError::bad_request(&e.to_string()))
 }
 
 // ─── Errors ─────────────────────────────────────────────────────────────────

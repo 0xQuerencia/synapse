@@ -1,25 +1,85 @@
-use std::io;
-
+//! Versioned, bounded binary framing. The frame itself is not compressed;
+//! tensor payloads carry their separately validated compression metadata.
+use super::{RequestMessage, ResponseMessage};
+use crate::protocol::MAX_WIRE_MESSAGE_BYTES;
 use async_trait::async_trait;
+use bincode::Options;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response;
 use serde::{Deserialize, Serialize};
+use std::{
+    io,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
-use super::{RequestMessage, ResponseMessage};
-use crate::protocol::MAX_WIRE_MESSAGE_BYTES;
-
-pub const SYNAPSE_PROTOCOL: &str = "/synapse/0.3.0";
+pub const SYNAPSE_PROTOCOL: &str = "/synapse/0.4.0";
+pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_PROTOCOL_MESSAGE_BYTES: usize = MAX_WIRE_MESSAGE_BYTES;
+const MAX_DECODING_BYTES: usize = 2 * MAX_WIRE_MESSAGE_BYTES;
+const FRAME_TIMEOUT: Duration = Duration::from_secs(15);
+const FRAME_MARKER: u8 = 0xff;
+static DECODING_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Default)]
 pub struct ProtocolCodec;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SynapseProtocol;
-
 impl AsRef<str> for SynapseProtocol {
     fn as_ref(&self) -> &str {
         SYNAPSE_PROTOCOL
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FrameKind {
+    Request,
+    Response,
+}
+impl FrameKind {
+    fn maximum(self, ordinal: u32) -> usize {
+        // These stable ordinals are pinned by golden vectors. New control
+        // variants append to enums and retain the smaller control limit.
+        let data = match self {
+            Self::Request => ordinal == 1,
+            Self::Response => ordinal == 1 || ordinal == 5,
+        };
+        if data {
+            MAX_PROTOCOL_MESSAGE_BYTES
+        } else {
+            MAX_CONTROL_MESSAGE_BYTES
+        }
+    }
+}
+
+struct DecodeBudget<'a> {
+    bytes: usize,
+    used: &'a AtomicUsize,
+}
+impl DecodeBudget<'static> {
+    fn reserve(bytes: usize) -> io::Result<Self> {
+        Self::reserve_for(&DECODING_BYTES, bytes)
+    }
+}
+impl<'a> DecodeBudget<'a> {
+    fn reserve_for(used: &'a AtomicUsize, bytes: usize) -> io::Result<Self> {
+        used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current
+                .checked_add(bytes)
+                .filter(|next| *next <= MAX_DECODING_BYTES)
+        })
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "aggregate wire decoding budget exhausted",
+            )
+        })?;
+        Ok(Self { bytes, used })
+    }
+}
+impl Drop for DecodeBudget<'_> {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 
@@ -29,132 +89,298 @@ impl request_response::Codec for ProtocolCodec {
     type Request = RequestMessage;
     type Response = ResponseMessage;
 
-    async fn read_request<T>(
-        &mut self,
-        _protocol: &Self::Protocol,
-        io: &mut T,
-    ) -> io::Result<Self::Request>
+    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_compressed_bincode(io).await
+        let message: Self::Request = read_frame(io, FrameKind::Request).await?;
+        message.validate_wire().map_err(invalid)?;
+        Ok(message)
     }
-
     async fn read_response<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        _: &Self::Protocol,
         io: &mut T,
     ) -> io::Result<Self::Response>
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_compressed_bincode(io).await
+        let message: Self::Response = read_frame(io, FrameKind::Response).await?;
+        message.validate_wire().map_err(invalid)?;
+        Ok(message)
     }
-
     async fn write_request<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        _: &Self::Protocol,
         io: &mut T,
-        req: Self::Request,
+        message: Self::Request,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_compressed_bincode(io, &req).await
+        message.validate_wire().map_err(invalid)?;
+        write_frame(io, &message, FrameKind::Request).await
     }
-
     async fn write_response<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        _: &Self::Protocol,
         io: &mut T,
-        res: Self::Response,
+        message: Self::Response,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_compressed_bincode(io, &res).await
+        message.validate_wire().map_err(invalid)?;
+        write_frame(io, &message, FrameKind::Response).await
     }
 }
 
-/// Phase 7 Task 7.1: Binary protocol with bincode (confirmed).
-/// Phase 7 Task 7.2: Header compression - prepend message type byte + length prefix.
-/// This reduces protocol overhead by using dictionary-encoded type IDs instead of
-/// full enum variant names in the serialized payload.
-async fn read_compressed_bincode<T, M>(io: &mut T) -> io::Result<M>
+fn invalid(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+fn options(limit: usize) -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_little_endian()
+        .with_limit(limit as u64)
+        .reject_trailing_bytes()
+}
+
+async fn read_frame<T, M>(io: &mut T, kind: FrameKind) -> io::Result<M>
 where
     T: AsyncRead + Unpin + Send,
     M: for<'de> Deserialize<'de>,
 {
-    // Read message type header (1 byte dictionary-encoded) - Phase 7 Task 7.2
-    let mut type_byte = [0u8; 1];
-    io.read_exact(&mut type_byte).await?;
-
-    // Read length prefix (4 bytes, little-endian)
-    let mut len_bytes = [0u8; 4];
-    io.read_exact(&mut len_bytes).await?;
-    let payload_len = u32::from_le_bytes(len_bytes) as usize;
-
-    if payload_len > MAX_PROTOCOL_MESSAGE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "protocol message exceeds size limit",
-        ));
-    }
-
-    // Read payload
-    let mut bytes = vec![0u8; payload_len];
-    io.read_exact(&mut bytes).await?;
-
-    // Deserialize with bincode - Phase 7 Task 7.1
-    bincode::deserialize(&bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    read_frame_with_timeout(io, kind, FRAME_TIMEOUT).await
 }
 
-async fn write_compressed_bincode<T, M>(io: &mut T, message: &M) -> io::Result<()>
+async fn read_frame_with_timeout<T, M>(
+    io: &mut T,
+    kind: FrameKind,
+    timeout: Duration,
+) -> io::Result<M>
+where
+    T: AsyncRead + Unpin + Send,
+    M: for<'de> Deserialize<'de>,
+{
+    tokio::time::timeout(timeout, async {
+        let mut header = [0_u8; 5];
+        io.read_exact(&mut header).await?;
+        if header[0] != FRAME_MARKER {
+            return Err(invalid("unsupported frame marker"));
+        }
+        let len = u32::from_le_bytes(header[1..].try_into().expect("four length bytes")) as usize;
+        if !(4..=MAX_PROTOCOL_MESSAGE_BYTES).contains(&len) {
+            return Err(invalid("frame length outside limits"));
+        }
+        // Read the enum tag before allocating an attacker-controlled large body.
+        let mut tag = [0_u8; 4];
+        io.read_exact(&mut tag).await?;
+        if len > kind.maximum(u32::from_le_bytes(tag)) {
+            return Err(invalid("control frame exceeds 64 KiB"));
+        }
+        // Reserve twice the frame size because deserialization may briefly own
+        // both the encoded frame and decoded fields.
+        let _budget = DecodeBudget::reserve(len.saturating_mul(2))?;
+        let mut bytes = vec![0_u8; len];
+        bytes[..4].copy_from_slice(&tag);
+        io.read_exact(&mut bytes[4..]).await?;
+        options(len).deserialize(&bytes).map_err(invalid)
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "wire frame deadline exceeded"))?
+}
+
+async fn write_frame<T, M>(io: &mut T, message: &M, kind: FrameKind) -> io::Result<()>
 where
     T: AsyncWrite + Unpin + Send,
     M: Serialize,
 {
-    // Serialize with bincode - Phase 7 Task 7.1
-    let bytes = bincode::serialize(message)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-
-    if bytes.len() > MAX_PROTOCOL_MESSAGE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "protocol message exceeds size limit",
-        ));
+    let size = options(MAX_PROTOCOL_MESSAGE_BYTES)
+        .serialized_size(message)
+        .map_err(invalid)?;
+    if size > MAX_PROTOCOL_MESSAGE_BYTES as u64 {
+        return Err(invalid("wire message exceeds limit"));
     }
-
-    // Phase 7 Task 7.2: Write compressed header (type byte + length prefix)
-    let type_byte = compute_message_type_id(message);
-    io.write_all(&[type_byte]).await?;
-
-    let len_bytes = (bytes.len() as u32).to_le_bytes();
-    io.write_all(&len_bytes).await?;
-
-    // Write payload
-    io.write_all(&bytes).await?;
-    io.close().await
-}
-
-/// Compute dictionary-encoded message type ID for header compression.
-/// This maps enum variants to compact type IDs, reducing wire overhead.
-fn compute_message_type_id<M: Serialize>(_message: &M) -> u8 {
-    // In the current implementation, bincode already includes minimal type info.
-    // For future optimization, we could use a trait to get the actual variant.
-    // For now, we use a generic type byte that signals "compressed bincode".
-    0xFF
+    let bytes = options(MAX_PROTOCOL_MESSAGE_BYTES)
+        .serialize(message)
+        .map_err(invalid)?;
+    let tag: [u8; 4] = bytes
+        .get(..4)
+        .ok_or_else(|| invalid("missing variant tag"))?
+        .try_into()
+        .expect("four tag bytes");
+    if bytes.len() > kind.maximum(u32::from_le_bytes(tag)) {
+        return Err(invalid("control frame exceeds 64 KiB"));
+    }
+    tokio::time::timeout(FRAME_TIMEOUT, async {
+        io.write_all(&[FRAME_MARKER]).await?;
+        io.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
+        io.write_all(&bytes).await?;
+        io.close().await
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "wire write deadline exceeded"))?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::io::Cursor;
+    use libp2p::request_response::Codec;
 
+    fn frame(body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![FRAME_MARKER];
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(body);
+        bytes
+    }
+    #[tokio::test]
+    async fn health_ping_matches_golden_wire_bytes() {
+        let mut output = Cursor::new(Vec::new());
+        ProtocolCodec
+            .write_request(&SynapseProtocol, &mut output, RequestMessage::HealthPing)
+            .await
+            .unwrap();
+        assert_eq!(output.into_inner(), vec![0xff, 4, 0, 0, 0, 7, 0, 0, 0]);
+        let mut input = Cursor::new(vec![0xff, 4, 0, 0, 0, 7, 0, 0, 0]);
+        assert!(matches!(
+            ProtocolCodec
+                .read_request(&SynapseProtocol, &mut input)
+                .await
+                .unwrap(),
+            RequestMessage::HealthPing
+        ));
+    }
+    #[tokio::test]
+    async fn malformed_frames_fail_without_large_allocations() {
+        let mut cases = vec![
+            vec![],
+            vec![0xff],
+            vec![0, 4, 0, 0, 0, 7, 0, 0, 0],
+            vec![0xff, 0xff, 0xff, 0xff, 0xff],
+            frame(&[7, 0, 0, 0, 9]),
+            frame(&[0xff, 0xff, 0xff, 0xff]),
+        ];
+        // ClearCache contains a String. A malicious u64 length must not
+        // become a multi-gigabyte allocation from a tiny received frame.
+        let mut hostile = 2_u32.to_le_bytes().to_vec();
+        hostile.extend_from_slice(&u64::MAX.to_le_bytes());
+        cases.push(frame(&hostile));
+        for case in cases {
+            assert!(
+                ProtocolCodec
+                    .read_request(&SynapseProtocol, &mut Cursor::new(case))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deterministic_malformed_corpus_never_dispatches_invalid_messages() {
+        use rand::{Rng, RngCore, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x53594e41505345);
+        let valid = frame(
+            &bincode::serialize(&RequestMessage::ClearCache(crate::ClearCache {
+                trace_id: "bounded-corpus".into(),
+            }))
+            .unwrap(),
+        );
+        let mut rejected = 0usize;
+        for index in 0..1024 {
+            let case = if index < valid.len() {
+                let mut mutation = valid.clone();
+                mutation[index] ^= 0xff;
+                mutation
+            } else {
+                let mut body = vec![0; rng.gen_range(0..=1024)];
+                rng.fill_bytes(&mut body);
+                if body.len() >= 4 {
+                    body[..4].copy_from_slice(&(index as u32 % 16).to_le_bytes());
+                }
+                frame(&body)
+            };
+            match ProtocolCodec
+                .read_request(&SynapseProtocol, &mut Cursor::new(&case))
+                .await
+            {
+                Ok(message) => assert!(message.validate_wire().is_ok()),
+                Err(_) => rejected += 1,
+            }
+            match ProtocolCodec
+                .read_response(&SynapseProtocol, &mut Cursor::new(&case))
+                .await
+            {
+                Ok(message) => assert!(message.validate_wire().is_ok()),
+                Err(_) => rejected += 1,
+            }
+        }
+        assert!(rejected > 1900, "malformed corpus unexpectedly accepted");
+    }
+
+    #[tokio::test]
+    async fn stalled_peer_hits_frame_deadline() {
+        struct StalledReader;
+        impl AsyncRead for StalledReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut [u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                std::task::Poll::Pending
+            }
+        }
+        let error = read_frame_with_timeout::<_, RequestMessage>(
+            &mut StalledReader,
+            FrameKind::Request,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+    #[tokio::test]
+    async fn oversized_control_is_rejected_after_tag() {
+        let mut header = vec![FRAME_MARKER];
+        header.extend_from_slice(&((MAX_CONTROL_MESSAGE_BYTES + 1) as u32).to_le_bytes());
+        header.extend_from_slice(&7_u32.to_le_bytes());
+        let error = ProtocolCodec
+            .read_request(&SynapseProtocol, &mut Cursor::new(header))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+    #[tokio::test]
+    async fn decoded_fields_are_validated_before_dispatch() {
+        let invalid_message = RequestMessage::ClearCache(crate::ClearCache {
+            trace_id: "../escape".into(),
+        });
+        let body = bincode::serialize(&invalid_message).unwrap();
+        assert!(
+            ProtocolCodec
+                .read_request(&SynapseProtocol, &mut Cursor::new(frame(&body)))
+                .await
+                .is_err()
+        );
+    }
     #[test]
     fn protocol_and_codec_limits_match() {
         assert_eq!(
             MAX_PROTOCOL_MESSAGE_BYTES,
             crate::protocol::MAX_WIRE_MESSAGE_BYTES
         );
+    }
+    #[test]
+    fn decoding_budget_is_released_even_on_failure() {
+        let used = AtomicUsize::new(0);
+        assert!(DecodeBudget::reserve_for(&used, MAX_DECODING_BYTES + 1).is_err());
+        {
+            let _guard = DecodeBudget::reserve_for(&used, MAX_DECODING_BYTES).unwrap();
+            assert!(DecodeBudget::reserve_for(&used, 1).is_err());
+        }
+        assert_eq!(used.load(Ordering::Acquire), 0);
+        assert!(DecodeBudget::reserve_for(&used, MAX_DECODING_BYTES).is_ok());
     }
 }

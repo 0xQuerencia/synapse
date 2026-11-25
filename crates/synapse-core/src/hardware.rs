@@ -64,7 +64,7 @@ impl HardwareProbe {
         // CPU-only builds don't pull in the bindings.
         #[cfg(feature = "cuda")]
         {
-            if candle_core::utils::cuda_is_available() {
+            if candle_core::Device::new_cuda(0).is_ok() {
                 let caps = cuda_caps();
                 return Self {
                     backend: ComputeBackend::Cuda,
@@ -80,7 +80,7 @@ impl HardwareProbe {
         // Then Metal (macOS).
         #[cfg(feature = "metal")]
         {
-            if candle_core::utils::metal_is_available() {
+            if candle_core::Device::new_metal(0).is_ok() {
                 return Self {
                     backend: ComputeBackend::Metal,
                     has_accelerator: true,
@@ -119,7 +119,7 @@ struct CudaCaps {
 
 #[cfg(feature = "cuda")]
 fn cuda_caps() -> Option<CudaCaps> {
-    use cudarc::driver::{CudaDevice, result::DriverError};
+    use cudarc::driver::CudaDevice;
     let device = CudaDevice::new(0).ok()?;
     let mem = device.mem_get_info().ok();
     let name = device.name().unwrap_or_default();

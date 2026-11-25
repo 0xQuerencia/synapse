@@ -12,18 +12,14 @@ use super::{
     PROMPT_CHANNEL_CAPACITY, SynapseBehaviour, SynapseNode, SynapseRole, TIMEOUT_CHECK_INTERVAL,
     WorkerRegistry,
     helpers::{
-        extract_peer_id, local_worker_capability_snapshot, measure_relay_latencies,
-        recv_batch_prompt, recv_prompt, select_best_relay,
+        extract_peer_id, local_worker_capability_snapshot, queue_relay_connections,
+        recv_batch_prompt, recv_prompt,
     },
+};
+use crate::inference::{
+    ShardedModel, SimpleTokenizer, ToyLlama, ToyLlamaConfig, ToyLlamaGGUF, gguf_layer_count,
 };
 use crate::{ModelIdentity, NetConfig, NodeIdentity, PairingRateLimiter};
-use crate::{
-    compute_score::blend_compute_score,
-    inference::{
-        ShardedModel, SimpleTokenizer, ToyLlama, ToyLlamaConfig, ToyLlamaGGUF, download_model,
-        gguf_layer_count, verify_file_sha256,
-    },
-};
 use std::collections::VecDeque;
 
 impl SynapseNode {
@@ -37,6 +33,13 @@ impl SynapseNode {
         info!(peer_id = %identity.peer_id(), "node identity loaded");
 
         let is_relay_server = matches!(role, SynapseRole::RelayServer);
+        let net_config = NetConfig::load_strict_default()
+            .map_err(|error| NetworkError::Transport(error.to_string()))?;
+        let lan_discovery = net_config.discovery.allow_lan_discovery;
+        let dht_discovery = net_config.discovery.allow_dht_discovery;
+        let relay_config = crate::network::connectivity::RelayLimits::default()
+            .to_libp2p_config()
+            .map_err(NetworkError::Transport)?;
         let mut swarm = SwarmBuilder::with_existing_identity(identity.keypair().clone())
             .with_tokio()
             .with_tcp(
@@ -46,13 +49,15 @@ impl SynapseNode {
             )
             .map_err(|error| NetworkError::Transport(error.to_string()))?
             .with_quic()
+            .with_dns()
+            .map_err(|error| NetworkError::Transport(error.to_string()))?
             // Relay client transport — REQUIRED for circuit dialing/listening.
             // Previously `relay::client::new()` was called and its transport
             // discarded, so circuits never routed. The builder wires the
             // transport in properly.
             .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)
             .map_err(|error| NetworkError::Transport(error.to_string()))?
-            .with_behaviour(|keypair, relay_client| {
+            .with_behaviour(move |keypair, relay_client| {
                 let local_peer_id = libp2p::PeerId::from(keypair.public());
 
                 // Identify — exchanges peer info, required by relay/DCUtR.
@@ -66,8 +71,7 @@ impl SynapseNode {
 
                 // Relay server — only active for a dedicated public relay node.
                 let relay_server = Toggle::from(
-                    is_relay_server
-                        .then(|| relay::Behaviour::new(local_peer_id, relay::Config::default())),
+                    is_relay_server.then(|| relay::Behaviour::new(local_peer_id, relay_config)),
                 );
 
                 // DCUtR — hole punches through NATs after relay connection.
@@ -77,15 +81,28 @@ impl SynapseNode {
                 let autonat = autonat::Behaviour::new(local_peer_id, autonat::Config::default());
 
                 // Kademlia DHT — internet-wide peer discovery.
-                let kad_store = kad::store::MemoryStore::new(local_peer_id);
-                let mut kad = kad::Behaviour::new(local_peer_id, kad_store);
-                kad.set_mode(Some(kad::Mode::Server));
+                let kad = Toggle::from(dht_discovery.then(|| {
+                    let store = kad::store::MemoryStore::new(local_peer_id);
+                    let mut behaviour = kad::Behaviour::new(local_peer_id, store);
+                    behaviour.set_mode(Some(kad::Mode::Server));
+                    behaviour
+                }));
 
                 // Ping — keepalive and liveness checks.
                 let ping = ping::Behaviour::new(ping::Config::default());
 
                 // mDNS — LAN fast-path discovery.
-                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
+                let mdns = Toggle::from(if lan_discovery {
+                    match mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id) {
+                        Ok(behaviour) => Some(behaviour),
+                        Err(error) => {
+                            warn!(%error, "LAN discovery unavailable; manual peers remain usable");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                });
 
                 // Request-response — the core Synapse protocol.
                 let request_response = request_response::Behaviour::with_codec(
@@ -93,10 +110,10 @@ impl SynapseNode {
                     [(super::super::SynapseProtocol, ProtocolSupport::Full)],
                     request_response::Config::default()
                         .with_request_timeout(DEFAULT_REQUEST_TIMEOUT)
-                        .with_max_concurrent_streams(128), // Increased for pipelining support
+                        .with_max_concurrent_streams(8),
                 );
 
-                Ok(SynapseBehaviour {
+                SynapseBehaviour {
                     identify,
                     relay,
                     relay_server,
@@ -106,7 +123,8 @@ impl SynapseNode {
                     ping,
                     mdns,
                     request_response,
-                })
+                    connection_limits: crate::network::connectivity::connection_limits(),
+                }
             })
             .map_err(|error| NetworkError::Transport(error.to_string()))?
             .with_swarm_config(|cfg| {
@@ -126,7 +144,44 @@ impl SynapseNode {
         let (status_tx, _status_rx) =
             tokio::sync::watch::channel(super::NodeStatusSnapshot::default());
 
+        let revocations = crate::identity::RevocationList::load(
+            &identity.key_path().with_extension("revocations.json"),
+        )
+        .map_err(|error| NetworkError::Transport(error.to_string()))?;
+        let memory_limit_bytes = local_capability
+            .as_ref()
+            .and_then(|cap| cap.available_ram_mb)
+            .unwrap_or(0)
+            .saturating_mul(1024 * 1024)
+            / 2;
         Ok(Self {
+            identity,
+            revocations,
+            pending_coordinator_challenges: Default::default(),
+            model_files: None,
+            model_config: None,
+            generation_lease: None,
+            shard_readiness: None,
+            worker_assignment: None,
+            route_epoch: 0,
+            net_config,
+            pending_requests: Default::default(),
+            traffic_quota: Default::default(),
+            worker_controller: Default::default(),
+            worker_control_handle: None,
+            worker_control_rx: None,
+            local_step_pending: false,
+            admission: crate::inference::admission::CapacityPool::new(memory_limit_bytes, 1).ok(),
+            memory_limit_bytes,
+            coordinator_only: false,
+            memory_profile: None,
+            active_memory_estimate: None,
+            ready_registry: Default::default(),
+            max_route_stages: 4,
+            route_decision: None,
+            peer_rtts: Default::default(),
+            local_decode_observation: None,
+            local_step_compute_micros: 0,
             role,
             model,
             swarm,
@@ -140,6 +195,7 @@ impl SynapseNode {
             exchange_complete: false,
             pipeline: None,
             tokenizer: None,
+            token_decode_state: Default::default(),
             split_point: 0,
             total_layers: 0,
             token_ids: Vec::new(),
@@ -210,112 +266,203 @@ impl SynapseNode {
         tx
     }
 
-    /// Load the model weights and tokenizer. Must be called before `run()`.
+    /// Resolve and verify a model, retaining metadata until a complete route
+    /// assigns a concrete range. This never loads a hidden full host model.
     pub async fn load_model(&mut self) -> Result<(), NetworkError> {
-        let files = download_model(&self.model.id)
-            .await
-            .map_err(|error| NetworkError::Inference(error.to_string()))?;
-
-        if let Some(expected_sha256) = &self.model.sha256 {
-            verify_file_sha256(&files.weights, expected_sha256).map_err(|error| {
-                NetworkError::Inference(format!("model weight verification failed: {error}"))
-            })?;
+        let selected_path = std::path::Path::new(&self.model.id);
+        let files = if selected_path.is_dir() {
+            crate::inference::model_loader::ModelFiles::from_directory(selected_path)
+        } else {
+            crate::inference::model_loader::download_model_revision(&self.model).await
         }
+        .map_err(|error| NetworkError::Inference(error.to_string()))?;
+        self.install_model_metadata(files)
+    }
 
-        let is_gguf = files.weights.extension().is_some_and(|ext| ext == "gguf");
-
-        // GGUF files carry all model metadata in their header; safetensors
-        // models use the HF `config.json`. Only the layer count is needed
-        // here to compute the static shard plan.
-        let config = if is_gguf {
-            None
-        } else {
-            Some(
-                ToyLlamaConfig::from_file(&files.config)
-                    .map_err(|error| NetworkError::Inference(error.to_string()))?,
-            )
-        };
-        let total = match &config {
-            Some(config) => config.num_hidden_layers,
-            None => gguf_layer_count(&files.weights)
-                .map_err(|error| NetworkError::Inference(error.to_string()))?,
-        };
-        // The master loads the full layer span. Generation replans shards
-        // dynamically (capability-weighted) as workers join and leave, so a
-        // fixed placeholder split here would leave the master holding fewer
-        // layers than a later route plan assigns it. A full-span load is
-        // valid for any plan; workers slice their own range on join.
-        let split = match &self.role {
-            SynapseRole::Master { .. } => total,
-            SynapseRole::Worker { .. } | SynapseRole::RelayServer => total,
-        };
-
-        let device = crate::inference::get_best_device()
+    pub fn load_model_from_directory(
+        &mut self,
+        directory: &std::path::Path,
+    ) -> Result<(), NetworkError> {
+        let files = crate::inference::model_loader::ModelFiles::from_directory(directory)
             .map_err(|error| NetworkError::Inference(error.to_string()))?;
+        self.install_model_metadata(files)
+    }
 
-        // Slice the model by role: the master holds embed + all layers +
-        // the LM head (full span, see note above); workers hold the upper
-        // layers. RelayServer never loads a model (empty range).
-        let layer_range = match &self.role {
-            SynapseRole::Master { .. } => 0..split,
-            SynapseRole::Worker { .. } => split..total,
-            SynapseRole::RelayServer => 0..0,
-        };
-
-        let model: std::sync::Arc<dyn ShardedModel> = if is_gguf {
-            std::sync::Arc::new(
-                ToyLlamaGGUF::load_range(&files.weights, layer_range, &device)
-                    .map_err(|error| NetworkError::Inference(error.to_string()))?,
-            )
+    fn install_model_metadata(
+        &mut self,
+        files: crate::inference::model_loader::ModelFiles,
+    ) -> Result<(), NetworkError> {
+        let config = ToyLlamaConfig::from_file(&files.config)
+            .map_err(|error| NetworkError::Inference(error.to_string()))?;
+        let is_gguf = files
+            .weights
+            .extension()
+            .is_some_and(|extension| extension == "gguf");
+        let total = if is_gguf {
+            crate::inference::pipeline::validate_gguf_config(&files.weights, &config)
+                .map_err(|error| NetworkError::Inference(error.to_string()))?;
+            gguf_layer_count(&files.weights)
+                .map_err(|error| NetworkError::Inference(error.to_string()))?
         } else {
-            std::sync::Arc::new(
-                ToyLlama::load_range(
-                    config.as_ref().expect("safetensors config loaded above"),
-                    &files.weights,
-                    layer_range,
-                )
-                .map_err(|error| NetworkError::Inference(error.to_string()))?,
-            )
+            config.num_hidden_layers
         };
-
         let tokenizer = SimpleTokenizer::from_file(&files.tokenizer)
             .map_err(|error| NetworkError::Inference(error.to_string()))?;
-
-        self.pipeline = Some(model);
-        self.tokenizer = Some(std::sync::Arc::new(tokenizer));
-        self.split_point = split;
-        self.total_layers = total;
-
-        info!(
-            total_layers = total,
-            split_point = split,
-            "model and tokenizer loaded, shard plan computed"
+        let digest = files
+            .manifest
+            .digest()
+            .map_err(|error| NetworkError::Inference(error.to_string()))?;
+        self.model = ModelIdentity {
+            id: files.manifest.model_id.clone(),
+            revision: Some(files.manifest.revision.clone()),
+            sha256: Some(digest),
+        };
+        self.memory_profile = Some(
+            crate::inference::memory::ModelMemoryProfile::from_verified_files(&config, &files)
+                .map_err(|error| NetworkError::Inference(error.to_string()))?,
         );
-
-        // ─── Compute real compute score (Phase 1) ─────────────────
-        // Run the micro-benchmark once and cache the result so the
-        // worker advertises its real throughput, not cpu_threads*100.
-        let measured = crate::inference::run_micro_benchmark(&device);
-        let probe = crate::hardware::HardwareProbe::detect();
-        let ram_free_mb = super::helpers::detect_available_ram_mb().unwrap_or(0);
-        let score = blend_compute_score(measured, ram_free_mb, &probe);
-        self.measured_compute_score = Some(score);
-        info!(
-            measured,
-            ram_free_mb,
-            blended_score = score,
-            backend = %probe.backend.as_str(),
-            gpu = probe.has_accelerator,
-            "compute score set from real benchmark"
-        );
-
-        // Also update the local capability snapshot so the master's
-        // own peer view shows the measured score, not cpu_threads*100.
-        if let Some(snapshot) = self.local_capability.as_mut() {
-            snapshot.compute_score = Some(score);
-            snapshot.available_ram_mb = Some(ram_free_mb);
+        self.pipeline = None;
+        self.local_decode_observation = None;
+        for entry in self.worker_registry.entries.values_mut() {
+            entry.observed_decode = None;
         }
+        self.tokenizer = Some(std::sync::Arc::new(tokenizer));
+        self.total_layers = total;
+        self.model_config = Some(config);
+        self.model_files = Some(files);
+        let device = crate::inference::get_best_device()
+            .map_err(|error| NetworkError::Inference(error.to_string()))?;
+        let score = crate::inference::run_micro_benchmark(&device);
+        if score == 0 {
+            return Err(NetworkError::Inference(
+                "device throughput probe failed or timed out".into(),
+            ));
+        }
+        self.measured_compute_score = Some(score);
+        if let Some(capability) = self.local_capability.as_mut() {
+            capability.compute_score = Some(score);
+            capability.available_ram_mb = Some(self.memory_limit_bytes.div_ceil(1024 * 1024));
+            capability.available_memory_bytes = Some(self.memory_limit_bytes);
+        }
+        info!(total_layers=total, model_digest=?self.model.sha256, "model artifacts verified; awaiting shard assignment");
+        Ok(())
+    }
 
+    /// Set an explicit inference budget before run; zero/unknown memory fails
+    /// closed. The budget includes weights, cache and activation scratch.
+    pub fn set_memory_limit_bytes(&mut self, bytes: u64) -> Result<(), NetworkError> {
+        if bytes == 0 {
+            return Err(NetworkError::Inference(
+                "memory budget must be positive".into(),
+            ));
+        }
+        if self.generation_active || self.worker_assignment.is_some() {
+            return Err(NetworkError::Inference(
+                "cannot change budget during active work".into(),
+            ));
+        }
+        self.admission = Some(
+            crate::inference::admission::CapacityPool::new(bytes, 1)
+                .map_err(|error| NetworkError::Inference(error.to_string()))?,
+        );
+        self.memory_limit_bytes = bytes;
+        if let Some(capability) = self.local_capability.as_mut() {
+            capability.available_ram_mb = Some(bytes.div_ceil(1024 * 1024));
+            capability.available_memory_bytes = Some(bytes);
+        }
+        Ok(())
+    }
+
+    pub fn set_coordinator_only(&mut self, enabled: bool) -> Result<(), NetworkError> {
+        if self.generation_active || !matches!(self.role, SynapseRole::Master { .. }) {
+            return Err(NetworkError::Inference(
+                "coordinator-only mode is a pre-run host setting".into(),
+            ));
+        }
+        self.coordinator_only = enabled;
+        Ok(())
+    }
+
+    pub(super) fn load_assigned_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        context_tokens: usize,
+    ) -> anyhow::Result<()> {
+        let files = self
+            .model_files
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("model metadata not loaded"))?;
+        let config = self
+            .model_config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("model config not loaded"))?;
+        anyhow::ensure!(
+            range.start <= range.end && range.end <= self.total_layers,
+            "invalid model range"
+        );
+        let roles = if matches!(self.role, SynapseRole::Master { .. }) {
+            crate::inference::pipeline::TensorRoles::COORDINATOR
+        } else {
+            crate::inference::pipeline::TensorRoles::WORKER
+        };
+        let estimate = self
+            .memory_profile
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memory profile unavailable"))?
+            .estimate(range.len(), context_tokens, roles)?;
+        anyhow::ensure!(
+            estimate.total_bytes <= self.memory_limit_bytes,
+            "model/context memory exceeds policy before weight allocation"
+        );
+        self.pipeline = None;
+        self.active_memory_estimate = None;
+        let model: std::sync::Arc<dyn ShardedModel> = if files
+            .weights
+            .extension()
+            .is_some_and(|extension| extension == "gguf")
+        {
+            let device = crate::inference::get_best_device()?;
+            std::sync::Arc::new(ToyLlamaGGUF::load_range_with_roles(
+                &files.weights,
+                range.clone(),
+                &device,
+                roles,
+            )?)
+        } else {
+            std::sync::Arc::new(ToyLlama::load_range_with_roles(
+                config,
+                &files.weights,
+                range.clone(),
+                roles,
+            )?)
+        };
+        anyhow::ensure!(
+            model.layer_offset() == range.start && model.owned_layers() == range.len(),
+            "resident layer range differs from assignment"
+        );
+        anyhow::ensure!(
+            model.resident_weight_bytes() <= estimate.weights_bytes,
+            "resident weights exceed memory cap"
+        );
+        info!(
+            layer_start = range.start,
+            layer_end = range.end,
+            resident_weight_bytes = model.resident_weight_bytes(),
+            "assigned shard resident"
+        );
+        self.active_memory_estimate = Some(estimate);
+        self.pipeline = Some(model);
+        Ok(())
+    }
+
+    /// Bound the planner's remote stages (the coordinator IO is additional).
+    pub fn set_max_route_stages(&mut self, limit: usize) -> Result<(), NetworkError> {
+        if !(1..=8).contains(&limit) || self.generation_active {
+            return Err(NetworkError::Inference(
+                "stage limit must be 1..=8 and set before generation".into(),
+            ));
+        }
+        self.max_route_stages = limit;
         Ok(())
     }
 
@@ -326,53 +473,29 @@ impl SynapseNode {
     pub async fn run(mut self) -> Result<(), NetworkError> {
         info!(peer_id = %self.local_peer_id(), "Synapse swarm started");
 
-        // Load bootstrap + relay peers from config/*.toml (no hardcoded panics).
-        let net_config = NetConfig::load_default();
-        for addr in &net_config.bootstrap {
-            if let Some(peer_id) = extract_peer_id(addr) {
-                info!(%peer_id, %addr, "adding DHT bootstrap peer");
-                self.swarm
-                    .behaviour_mut()
-                    .kad
-                    .add_address(&peer_id, addr.clone());
+        let net_config = self.net_config.clone();
+        if net_config.discovery.allow_dht_discovery {
+            for addr in &net_config.bootstrap {
+                if let Some(peer_id) = extract_peer_id(addr)
+                    && let Some(kad) = self.swarm.behaviour_mut().kad.as_mut()
+                {
+                    kad.add_address(&peer_id, addr.clone());
+                }
+            }
+            if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut()
+                && let Err(error) = kad.bootstrap()
+            {
+                warn!(%error, "DHT bootstrap unavailable");
             }
         }
-
-        if let Err(e) = self.swarm.behaviour_mut().kad.bootstrap() {
-            warn!(
-                "DHT bootstrap failed: {} (no bootstrap peers configured?)",
-                e
-            );
-        }
-
-        // Dial relays and (for NAT'd masters) reserve a circuit so remote peers
-        // can reach us through the relay. The relay server itself skips this.
         if !matches!(self.role, SynapseRole::RelayServer) {
-            // Geographic relay selection: measure latency and prefer fastest.
-            let relay_infos = measure_relay_latencies(&mut self.swarm, &net_config.relays);
-
-            // Masters listen on circuit address via the best relay.
+            let relays = queue_relay_connections(&mut self.swarm, &net_config.relays);
             if matches!(self.role, SynapseRole::Master { .. }) {
-                if let Some(best_relay) = select_best_relay(&relay_infos) {
-                    let circuit: Multiaddr = best_relay
-                        .addr
-                        .clone()
-                        .with(libp2p::multiaddr::Protocol::P2pCircuit);
-                    match self.swarm.listen_on(circuit.clone()) {
-                        Ok(_) => {
-                            info!(
-                               circuit = %circuit,
-                                 region = ?best_relay.region,
-                                latency_ms = ?best_relay.measured_latency_ms,
-                            "listening on best relay circuit"
-                               );
-                        }
-                        Err(error) => {
-                            warn!(%circuit, %error, "failed to listen on circuit");
-                        }
+                for relay in crate::network::connectivity::relay_candidates(&relays, 2) {
+                    let circuit = relay.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                    if let Err(error) = self.swarm.listen_on(circuit.clone()) {
+                        warn!(%circuit, %error, "relay reservation could not start");
                     }
-                } else {
-                    warn!("no relay available for circuit listening");
                 }
             }
         }
@@ -381,12 +504,9 @@ impl SynapseNode {
 
         match &self.role {
             // Masters advertise that they serve this model so workers can find them.
-            SynapseRole::Master { .. } => {
-                if let Err(e) = self
-                    .swarm
-                    .behaviour_mut()
-                    .kad
-                    .start_providing(model_key.clone())
+            SynapseRole::Master { .. } if net_config.discovery.allow_dht_discovery => {
+                if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut()
+                    && let Err(e) = kad.start_providing(model_key.clone())
                 {
                     warn!("DHT start_providing failed: {}", e);
                 }
@@ -397,7 +517,16 @@ impl SynapseNode {
                 ..
             } => {
                 // Check peer cache first before DHT query.
-                let cached_providers = self.peer_cache.get_providers(&self.model.id);
+                let cached_providers: Vec<_> = self
+                    .peer_cache
+                    .get_providers(&self.model.id)
+                    .into_iter()
+                    .filter(|(peer, _)| {
+                        net_config
+                            .discovery
+                            .allows(peer, crate::netconfig::DiscoverySource::Cache)
+                    })
+                    .collect();
                 if !cached_providers.is_empty() {
                     info!(
                         count = cached_providers.len(),
@@ -419,7 +548,11 @@ impl SynapseNode {
                         "no cached providers, searching DHT for masters serving model {}",
                         self.model.id
                     );
-                    self.swarm.behaviour_mut().kad.get_providers(model_key);
+                    if net_config.discovery.allow_dht_discovery
+                        && let Some(kad) = self.swarm.behaviour_mut().kad.as_mut()
+                    {
+                        kad.get_providers(model_key);
+                    }
                 }
             }
             _ => {}
@@ -488,6 +621,13 @@ impl SynapseNode {
                     // publish a fresh snapshot so the GUI updates promptly.
                     self.publish_status();
                 }
+                Some(request) = crate::network::worker::recv_control(&mut self.worker_control_rx) => {
+                    if self.apply_worker_control(request) { return Ok(()); }
+                }
+                _ = std::future::ready(()), if self.local_step_pending => {
+                    self.local_step_pending = false;
+                    self.send_next_activation();
+                }
                 // Listen for prompts from the CLI REPL (master only)
                 Some(prompt) = recv_prompt(&mut self.prompt_rx) => {
                     self.handle_new_prompt(prompt);
@@ -498,6 +638,7 @@ impl SynapseNode {
                 }
                 // Periodic timeout check for self-healing (Phase 9)
                 _ = timeout_interval.tick() => {
+                    self.transport_tick();
                     self.check_worker_timeouts();
                     // Periodic refresh: catches redial countdowns and keeps
                     // the GUI's peer panel live even when idle.

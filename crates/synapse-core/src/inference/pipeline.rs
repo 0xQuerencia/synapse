@@ -23,6 +23,35 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::Deserialize;
 use tracing::{info, trace, warn};
 
+fn tensor_bytes(tensor: &Tensor) -> u64 {
+    (tensor.elem_count() as u64).saturating_mul(tensor.dtype().size_in_bytes() as u64)
+}
+
+fn quantized_bytes(matrix: &QMatMul) -> u64 {
+    match matrix {
+        QMatMul::QTensor(tensor) => tensor.storage_size_in_bytes() as u64,
+        QMatMul::Tensor(tensor) | QMatMul::TensorF16(tensor) => tensor_bytes(tensor),
+    }
+}
+
+/// Non-transformer tensor roles are assigned explicitly. A worker holds only
+/// its transformer slice; the coordinator owns token embedding and output head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TensorRoles {
+    pub input: bool,
+    pub output: bool,
+}
+impl TensorRoles {
+    pub const COORDINATOR: Self = Self {
+        input: true,
+        output: true,
+    };
+    pub const WORKER: Self = Self {
+        input: false,
+        output: false,
+    };
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 /// Configuration parsed from the model's `config.json`.
@@ -68,7 +97,60 @@ impl ToyLlamaConfig {
     /// Load config from a `config.json` file.
     pub fn from_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path).context("failed to read config.json")?;
-        let config: Self = serde_json::from_str(&content).context("failed to parse config.json")?;
+        let metadata: serde_json::Value = serde_json::from_str(&content)?;
+        anyhow::ensure!(
+            metadata.get("model_type").and_then(|value| value.as_str()) == Some("llama"),
+            "unsupported model architecture: this backend requires model_type=llama"
+        );
+        anyhow::ensure!(
+            metadata
+                .get("hidden_act")
+                .is_none_or(|v| v.as_str() == Some("silu")),
+            "unsupported Llama activation; this backend requires silu"
+        );
+        anyhow::ensure!(
+            metadata
+                .get("rope_interleaved")
+                .is_none_or(|v| v.as_bool() == Some(false)),
+            "interleaved or malformed RoPE is unsupported"
+        );
+        anyhow::ensure!(
+            metadata
+                .get("pretraining_tp")
+                .is_none_or(|v| v.as_u64() == Some(1)),
+            "tensor-parallel checkpoint transforms are unsupported"
+        );
+        anyhow::ensure!(
+            metadata
+                .get("quantization_config")
+                .is_none_or(|v| v.is_null()),
+            "quantized safetensors configuration is unsupported; select a validated GGUF artifact"
+        );
+        for unsupported in ["attention_bias", "mlp_bias"] {
+            anyhow::ensure!(
+                metadata
+                    .get(unsupported)
+                    .is_none_or(|value| value.as_bool() == Some(false)),
+                "unsupported Llama option: {unsupported}"
+            );
+        }
+        anyhow::ensure!(
+            metadata
+                .get("rope_scaling")
+                .is_none_or(|value| value.is_null()),
+            "scaled RoPE is not supported by this backend"
+        );
+        let mut config: Self =
+            serde_json::from_str(&content).context("failed to parse config.json")?;
+        // Llama defaults to ordinary multi-head attention when the KV-head
+        // count is omitted; defaulting to one would invent grouped-query math.
+        if !metadata
+            .as_object()
+            .is_some_and(|object| object.contains_key("num_key_value_heads"))
+        {
+            config.num_key_value_heads = config.num_attention_heads;
+        }
+        config.validate()?;
         info!(
             hidden_size = config.hidden_size,
             num_layers = config.num_hidden_layers,
@@ -79,6 +161,55 @@ impl ToyLlamaConfig {
             "loaded model config"
         );
         Ok(config)
+    }
+
+    /// Validate before division, allocation or mmap. Unsupported architecture
+    /// features fail explicitly instead of silently producing wrong logits.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.hidden_size > 0
+                && self.hidden_size <= 65_536
+                && self.intermediate_size > 0
+                && self.intermediate_size <= 262_144
+                && self.num_hidden_layers > 0
+                && self.num_hidden_layers <= 1024
+                && self.vocab_size > 0
+                && self.vocab_size <= 1_000_000,
+            "model dimensions outside supported bounds"
+        );
+        anyhow::ensure!(
+            self.num_attention_heads > 0
+                && self.num_key_value_heads > 0
+                && self.hidden_size.is_multiple_of(self.num_attention_heads)
+                && self
+                    .num_attention_heads
+                    .is_multiple_of(self.num_key_value_heads),
+            "incompatible attention head dimensions"
+        );
+        anyhow::ensure!(
+            self.head_dim().is_multiple_of(2),
+            "RoPE requires an even head dimension"
+        );
+        anyhow::ensure!(
+            self.rms_norm_eps.is_finite()
+                && self.rms_norm_eps > 0.0
+                && self.rope_theta.is_finite()
+                && self.rope_theta > 0.0,
+            "invalid normalization or rotary parameters"
+        );
+        anyhow::ensure!(self.max_position_embeddings > 0, "empty context window");
+        anyhow::ensure!(
+            matches!(
+                self.torch_dtype.as_str(),
+                "float32" | "float16" | "half" | "bfloat16"
+            ),
+            "unsupported model weight dtype"
+        );
+        Ok(())
+    }
+
+    pub fn context_limit(&self) -> usize {
+        self.max_position_embeddings.min(4096)
     }
 
     fn head_dim(&self) -> usize {
@@ -117,6 +248,19 @@ pub fn get_best_device() -> Result<Device> {
     Ok(Device::Cpu)
 }
 
+/// Candle CPU matmul executes float32; half-precision checkpoint storage is
+/// converted explicitly. Accelerator backends retain the declared dtype.
+pub fn execution_dtype(config: &ToyLlamaConfig, device: &Device) -> DType {
+    if device.is_cpu() {
+        return DType::F32;
+    }
+    match config.torch_dtype.as_str() {
+        "bfloat16" => DType::BF16,
+        "float16" | "half" => DType::F16,
+        _ => DType::F32,
+    }
+}
+
 fn micro_benchmark_score(elapsed_ms: f64) -> u64 {
     let safe_elapsed_ms = elapsed_ms.max(0.001);
     (10_000.0 / safe_elapsed_ms).max(1.0).round() as u64
@@ -144,7 +288,7 @@ pub fn run_micro_benchmark(device: &Device) -> u64 {
         Ok(tensor) => tensor,
         Err(error) => {
             warn!(%error, "failed to build lhs tensor for micro-benchmark");
-            return 1;
+            return 0;
         }
     };
     let rhs = match Tensor::new(rhs_data.as_slice(), device)
@@ -153,32 +297,37 @@ pub fn run_micro_benchmark(device: &Device) -> u64 {
         Ok(tensor) => tensor,
         Err(error) => {
             warn!(%error, "failed to build rhs tensor for micro-benchmark");
-            return 1;
+            return 0;
         }
     };
 
     if let Err(error) = device.synchronize() {
         warn!(%error, "failed to synchronize device before micro-benchmark");
-        return 1;
+        return 0;
     }
 
+    let benchmark_started = Instant::now();
     let mut samples_ms = Vec::with_capacity(BENCHMARK_RUNS);
     for run in 0..(WARMUP_RUNS + BENCHMARK_RUNS) {
+        if benchmark_started.elapsed() > std::time::Duration::from_secs(2) {
+            warn!("device probe exceeded its measurement budget");
+            return 0;
+        }
         let started = Instant::now();
         let matmul = match lhs.broadcast_matmul(&rhs) {
             Ok(output) => output,
             Err(error) => {
                 warn!(%error, "micro-benchmark matrix multiplication failed");
-                return 1;
+                return 0;
             }
         };
         if let Err(error) = matmul.sum_all().and_then(|sum| sum.to_scalar::<f32>()) {
             warn!(%error, "micro-benchmark reduction failed");
-            return 1;
+            return 0;
         }
         if let Err(error) = device.synchronize() {
             warn!(%error, "failed to synchronize device during micro-benchmark");
-            return 1;
+            return 0;
         }
 
         if run >= WARMUP_RUNS {
@@ -188,7 +337,7 @@ pub fn run_micro_benchmark(device: &Device) -> u64 {
 
     samples_ms.sort_by(|a, b| a.total_cmp(b));
     let median_ms = samples_ms[samples_ms.len() / 2];
-    micro_benchmark_score(median_ms)
+    micro_benchmark_score(median_ms).min(crate::protocol::MAX_COMPUTE_SCORE)
 }
 
 // ─── Building blocks ─────────────────────────────────────────────────────────
@@ -201,12 +350,14 @@ struct RmsNorm {
 
 impl RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let dtype = x.dtype();
+        let x = x.to_dtype(DType::F32)?;
         let x_sq = x.sqr()?;
         let mean = x_sq.mean_keepdim(candle_core::D::Minus1)?;
         let rms = (mean + self.eps)?.sqrt()?;
         let normed = x.broadcast_div(&rms)?;
-        let out = normed.broadcast_mul(&self.weight)?;
-        Ok(out)
+        let out = normed.broadcast_mul(&self.weight.to_dtype(DType::F32)?)?;
+        Ok(out.to_dtype(dtype)?)
     }
 }
 
@@ -527,7 +678,7 @@ fn apply_causal_mask(attn: &Tensor, seq_len: usize, past_len: usize) -> Result<T
     let key_len = attn.dim(3)?;
     let mut mask = Vec::with_capacity(seq_len * key_len);
     for i in 0..seq_len {
-        mask.extend(std::iter::repeat(0.0_f32).take(key_len.min(past_len)));
+        mask.extend(std::iter::repeat_n(0.0_f32, key_len.min(past_len)));
         mask.extend((past_len..key_len).map(|j| {
             if j <= past_len + i {
                 0.0_f32
@@ -808,10 +959,12 @@ impl LlamaLayer {
 
 /// The Llama model for sharded inference (supports SmolLM2 and tiny-random).
 pub struct ToyLlama {
-    embed_tokens: Tensor,
+    embed_tokens: Option<Tensor>,
+    device: Device,
+    dtype: DType,
     layers: Vec<LlamaLayer>,
-    norm: RmsNorm,
-    lm_head: Tensor,
+    norm: Option<RmsNorm>,
+    lm_head: Option<Tensor>,
     rope: RotaryEmbedding,
     /// Global index of the first owned transformer block (0 for full loads).
     layer_offset: usize,
@@ -819,6 +972,39 @@ pub struct ToyLlama {
 }
 
 impl ToyLlama {
+    /// Tensor storage actually owned by this backend, excluding KV/scratch and
+    /// allocator overhead. Process RSS is measured separately by benchmarks.
+    pub fn resident_weight_bytes(&self) -> u64 {
+        let mut bytes = self
+            .embed_tokens
+            .iter()
+            .chain(self.lm_head.iter())
+            .map(tensor_bytes)
+            .sum::<u64>()
+            + self
+                .norm
+                .as_ref()
+                .map_or(0, |norm| tensor_bytes(&norm.weight))
+            + tensor_bytes(&self.rope.cos)
+            + tensor_bytes(&self.rope.sin);
+        for layer in &self.layers {
+            bytes += [
+                &layer.input_layernorm.weight,
+                &layer.post_attention_layernorm.weight,
+                &layer.self_attn.q_proj,
+                &layer.self_attn.k_proj,
+                &layer.self_attn.v_proj,
+                &layer.self_attn.o_proj,
+                &layer.gate_proj,
+                &layer.up_proj,
+                &layer.down_proj,
+            ]
+            .into_iter()
+            .map(tensor_bytes)
+            .sum::<u64>();
+        }
+        bytes
+    }
     /// Load the full model from safetensors weights and config.
     pub fn load(config: &ToyLlamaConfig, weights_path: &Path) -> Result<Self> {
         Self::load_range(config, weights_path, 0..config.num_hidden_layers)
@@ -838,6 +1024,20 @@ impl ToyLlama {
         weights_path: &Path,
         range: Range<usize>,
     ) -> Result<Self> {
+        Self::load_range_with_roles(config, weights_path, range, TensorRoles::COORDINATOR)
+    }
+
+    pub fn load_range_with_roles(
+        config: &ToyLlamaConfig,
+        weights_path: &Path,
+        range: Range<usize>,
+        roles: TensorRoles,
+    ) -> Result<Self> {
+        config.validate()?;
+        anyhow::ensure!(
+            range.start <= range.end && range.end <= config.num_hidden_layers,
+            "requested layer range exceeds model depth"
+        );
         info!(
             ?weights_path,
             ?range,
@@ -845,20 +1045,22 @@ impl ToyLlama {
         );
 
         let device = get_best_device().context("failed to select inference device")?;
-        let dtype = match config.torch_dtype.as_str() {
-            "bfloat16" => DType::BF16,
-            "float16" | "half" => DType::F16,
-            _ => DType::F32,
-        };
-        let shards = shard_files(weights_path)?;
+        let dtype = execution_dtype(config, &device);
+        let shards =
+            shard_files_for_assignment(weights_path, &range, roles, config.tie_word_embeddings)?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&shards, dtype, &device)? };
 
-        let embed_tokens = vb
-            .get(
-                (config.vocab_size, config.hidden_size),
-                "model.embed_tokens.weight",
+        let embed_tokens = if roles.input {
+            Some(
+                vb.get(
+                    (config.vocab_size, config.hidden_size),
+                    "model.embed_tokens.weight",
+                )
+                .context("failed to load embedding")?,
             )
-            .context("failed to load embed_tokens")?;
+        } else {
+            None
+        };
 
         let mut layers = Vec::with_capacity(range.end.saturating_sub(range.start));
         for i in range.clone() {
@@ -970,19 +1172,31 @@ impl ToyLlama {
             });
         }
 
-        let norm_w = vb
-            .get(config.hidden_size, "model.norm.weight")
-            .context("failed to load final norm")?;
-
-        // Handle tied word embeddings: SmolLM2 doesn't have a separate lm_head
-        let lm_head = if config.tie_word_embeddings {
-            info!("using tied embeddings for lm_head");
-            embed_tokens.t()?.contiguous()?
+        let norm = if roles.output {
+            Some(RmsNorm {
+                weight: vb.get(config.hidden_size, "model.norm.weight")?,
+                eps: config.rms_norm_eps,
+            })
         } else {
-            vb.get((config.vocab_size, config.hidden_size), "lm_head.weight")
-                .context("failed to load lm_head")?
-                .t()?
-                .contiguous()?
+            None
+        };
+        let lm_head = if roles.output {
+            Some(if config.tie_word_embeddings {
+                let embedding = match &embed_tokens {
+                    Some(embedding) => embedding.clone(),
+                    None => vb.get(
+                        (config.vocab_size, config.hidden_size),
+                        "model.embed_tokens.weight",
+                    )?,
+                };
+                embedding.t()?.contiguous()?
+            } else {
+                vb.get((config.vocab_size, config.hidden_size), "lm_head.weight")?
+                    .t()?
+                    .contiguous()?
+            })
+        } else {
+            None
         };
 
         let rope = RotaryEmbedding::new(
@@ -1003,10 +1217,9 @@ impl ToyLlama {
         Ok(Self {
             embed_tokens,
             layers,
-            norm: RmsNorm {
-                weight: norm_w,
-                eps: config.rms_norm_eps,
-            },
+            norm,
+            device,
+            dtype,
             lm_head,
             rope,
             layer_offset: range.start,
@@ -1015,7 +1228,7 @@ impl ToyLlama {
     }
 
     fn model_device(&self) -> &Device {
-        self.embed_tokens.device()
+        &self.device
     }
 
     fn to_model_device(&self, tensor: &Tensor, tensor_name: &str) -> Result<Tensor> {
@@ -1041,7 +1254,11 @@ impl ToyLlama {
             token_ids.clone()
         };
 
-        let flat_hidden = self.embed_tokens.embedding(&flat_ids)?;
+        let flat_hidden = self
+            .embed_tokens
+            .as_ref()
+            .context("assignment has no input embedding role")?
+            .embedding(&flat_ids)?;
 
         let hidden = if dims.len() > 1 {
             let batch = dims[0];
@@ -1248,8 +1465,16 @@ impl ToyLlama {
     /// Output shape: [batch, seq_len, vocab_size].
     pub fn head(&self, hidden: &Tensor) -> Result<Tensor> {
         let hidden = self.to_model_device(hidden, "lm_head hidden state")?;
-        let normed = self.norm.forward(&hidden)?;
-        let logits = normed.broadcast_matmul(&self.lm_head)?;
+        let normed = self
+            .norm
+            .as_ref()
+            .context("assignment has no output head role")?
+            .forward(&hidden)?;
+        let logits = normed.broadcast_matmul(
+            self.lm_head
+                .as_ref()
+                .context("assignment has no output head role")?,
+        )?;
         info!(shape = ?logits.dims(), "lm_head complete");
         Ok(logits)
     }
@@ -1269,9 +1494,18 @@ impl ToyLlama {
     pub fn head_last_token(&self, hidden: &Tensor) -> Result<Tensor> {
         let hidden = self.to_model_device(hidden, "lm_head hidden state")?;
         let seq_len = hidden.dim(1)?;
+        anyhow::ensure!(seq_len > 0, "cannot compute a head for an empty sequence");
         let last_hidden = hidden.narrow(1, seq_len - 1, 1)?;
-        let normed = self.norm.forward(&last_hidden)?;
-        let logits = normed.broadcast_matmul(&self.lm_head)?;
+        let normed = self
+            .norm
+            .as_ref()
+            .context("assignment has no output head role")?
+            .forward(&last_hidden)?;
+        let logits = normed.broadcast_matmul(
+            self.lm_head
+                .as_ref()
+                .context("assignment has no output head role")?,
+        )?;
         trace!(shape = ?logits.dims(), "lm_head (last-token) complete");
         Ok(logits)
     }
@@ -1307,7 +1541,11 @@ impl ToyLlama {
 
     /// Greedy argmax sampling from `[1, seq_len, vocab_size]` logits.
     pub fn sample_argmax(logits: &Tensor) -> Result<u32> {
-        let seq_len = logits.dim(1)?;
+        let (batch, seq_len, vocab) = logits.dims3()?;
+        anyhow::ensure!(
+            batch == 1 && seq_len > 0 && vocab > 0,
+            "greedy sampling requires nonempty [1, sequence, vocabulary] logits"
+        );
         let last_logits = logits.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
         let token_id = last_logits
             .argmax(candle_core::D::Minus1)?
@@ -1323,6 +1561,10 @@ impl ToyLlama {
         let (batch_size, seq_len, _vocab) = logits
             .dims3()
             .context("sample_argmax_batched expects [batch, seq_len, vocab] logits")?;
+        anyhow::ensure!(
+            batch_size > 0 && seq_len > 0 && _vocab > 0,
+            "empty sampling input"
+        );
         let last_logits = logits.narrow(1, seq_len - 1, 1)?.squeeze(1)?; // [batch, vocab]
         let argmax_ids = last_logits.argmax(candle_core::D::Minus1)?; // [batch]
         let mut tokens = Vec::with_capacity(batch_size);
@@ -1345,6 +1587,12 @@ impl ToyLlama {
         if ids.is_empty() {
             bail!("generation requires at least one prompt token");
         }
+        anyhow::ensure!(
+            ids.len()
+                .checked_add(max_new_tokens)
+                .is_some_and(|n| n <= self.config.context_limit()),
+            "prompt and output exceed supported context limit"
+        );
         if max_new_tokens == 0 {
             return Ok(ids);
         }
@@ -1464,43 +1712,82 @@ impl ToyLlama {
 pub fn shard_files(weights_path: &Path) -> Result<Vec<PathBuf>> {
     let index_path = weights_path.with_file_name("model.safetensors.index.json");
     if !index_path.exists() {
+        anyhow::ensure!(
+            weights_path
+                .extension()
+                .is_some_and(|ext| ext == "safetensors"),
+            "expected a safetensors checkpoint or index"
+        );
+        anyhow::ensure!(weights_path.is_file(), "missing weights file");
         return Ok(vec![weights_path.to_path_buf()]);
     }
-    let content = std::fs::read_to_string(&index_path)
-        .with_context(|| format!("failed to read shard index {}", index_path.display()))?;
-    let index: serde_json::Value = serde_json::from_str(&content)
-        .with_context(|| format!("shard index {} is not valid JSON", index_path.display()))?;
-    let weight_map = index
-        .get("weight_map")
-        .and_then(serde_json::Value::as_object)
-        .context("shard index is missing its weight_map")?;
-    let dir = weights_path.parent().unwrap_or_else(|| Path::new("."));
-    let mut shards: Vec<PathBuf> = weight_map
-        .values()
-        .filter_map(serde_json::Value::as_str)
+    let directory = weights_path.parent().unwrap_or_else(|| Path::new("."));
+    super::model_loader::read_safetensors_index(&index_path)?
+        .into_iter()
         .map(|name| {
-            if name.contains('/')
-                || name.contains('\\')
-                || name == ".."
-                || name.starts_with("../")
-                || name.contains("..")
-            {
-                bail!("shard index lists an unsafe path: {name}");
-            }
-            Ok(dir.join(name))
+            let path = directory.join(name);
+            anyhow::ensure!(
+                path.is_file(),
+                "missing checkpoint shard {}",
+                path.display()
+            );
+            Ok(path)
         })
-        .collect::<Result<Vec<_>>>()?;
-    if shards.is_empty() {
-        bail!("shard index contains no shard files");
+        .collect()
+}
+
+/// Select only checkpoint files containing assigned tensors. A single-file
+/// checkpoint is mapped while loading but unassigned tensors are never read.
+pub fn shard_files_for_assignment(
+    weights_path: &Path,
+    range: &Range<usize>,
+    roles: TensorRoles,
+    tied_embeddings: bool,
+) -> Result<Vec<PathBuf>> {
+    let index_path = weights_path.with_file_name("model.safetensors.index.json");
+    if !index_path.exists() {
+        return shard_files(weights_path);
     }
-    shards.sort();
-    shards.dedup();
-    info!(
-        shard_count = shards.len(),
-        ?dir,
-        "resolved multi-shard checkpoint"
+    // Validate every filename before considering only the selected tensors.
+    super::model_loader::read_safetensors_index(&index_path)?;
+    let index: serde_json::Value = serde_json::from_slice(&std::fs::read(&index_path)?)?;
+    let map = index
+        .get("weight_map")
+        .and_then(|value| value.as_object())
+        .context("missing weight_map")?;
+    let mut filenames = std::collections::BTreeSet::new();
+    for (tensor, filename) in map {
+        let layer_selected = tensor
+            .strip_prefix("model.layers.")
+            .and_then(|suffix| suffix.split('.').next())
+            .and_then(|number| number.parse::<usize>().ok())
+            .is_some_and(|layer| range.contains(&layer));
+        let input_selected = (roles.input || (roles.output && tied_embeddings))
+            && tensor == "model.embed_tokens.weight";
+        let output_selected =
+            roles.output && matches!(tensor.as_str(), "model.norm.weight" | "lm_head.weight");
+        if layer_selected || input_selected || output_selected {
+            filenames.insert(
+                filename
+                    .as_str()
+                    .context("non-string checkpoint filename")?
+                    .to_owned(),
+            );
+        }
+    }
+    anyhow::ensure!(
+        !filenames.is_empty(),
+        "no tensors found for requested assignment"
     );
-    Ok(shards)
+    let directory = weights_path.parent().unwrap_or_else(|| Path::new("."));
+    filenames
+        .into_iter()
+        .map(|name| {
+            let path = directory.join(name);
+            anyhow::ensure!(path.is_file(), "missing selected checkpoint shard");
+            Ok(path)
+        })
+        .collect()
 }
 
 // ─── ShardedModel trait ─────────────────────────────────────────────────────
@@ -1552,9 +1839,17 @@ pub trait ShardedModel: Send + Sync {
     fn owned_layers(&self) -> usize;
     /// Device the weights live on.
     fn model_device(&self) -> &Device;
+    fn model_dtype(&self) -> DType;
+    fn resident_weight_bytes(&self) -> u64;
 }
 
 impl ShardedModel for ToyLlama {
+    fn model_dtype(&self) -> DType {
+        self.dtype
+    }
+    fn resident_weight_bytes(&self) -> u64 {
+        self.resident_weight_bytes()
+    }
     fn name(&self) -> &'static str {
         "llama-safetensors"
     }
@@ -1907,10 +2202,12 @@ impl GGUFLlamaLayer {
 /// matmuls (Q4_K_M, Q8_0, ...) stay compressed in RAM and dequantize on the
 /// fly. KV cache activations are plain f32 tensors.
 pub struct ToyLlamaGGUF {
-    embed_tokens: Tensor,
+    embed_tokens: Option<Tensor>,
+    device: Device,
+    shared_head_embedding: bool,
     layers: Vec<GGUFLlamaLayer>,
-    norm: RmsNorm,
-    lm_head: QMatMul,
+    norm: Option<RmsNorm>,
+    lm_head: Option<QMatMul>,
     rope: RotaryEmbedding,
     /// Global index of the first owned transformer block (0 for full loads).
     layer_offset: usize,
@@ -1918,49 +2215,192 @@ pub struct ToyLlamaGGUF {
 }
 
 fn gguf_u64(content: &gguf_file::Content, key: &str) -> Result<u64> {
-    content
-        .metadata
-        .get(key)
-        .with_context(|| format!("GGUF metadata missing {key}"))?
-        .to_u64()
-        .with_context(|| format!("GGUF metadata {key} is not an integer"))
+    match content.metadata.get(key) {
+        Some(gguf_file::Value::U8(v)) => Ok(*v as u64),
+        Some(gguf_file::Value::U16(v)) => Ok(*v as u64),
+        Some(gguf_file::Value::U32(v)) => Ok(*v as u64),
+        Some(gguf_file::Value::U64(v)) => Ok(*v),
+        _ => anyhow::bail!("missing or invalid unsigned GGUF metadata: {key}"),
+    }
+}
+fn gguf_u64_or(content: &gguf_file::Content, key: &str, default: u64) -> Result<u64> {
+    if content.metadata.contains_key(key) {
+        gguf_u64(content, key)
+    } else {
+        Ok(default)
+    }
+}
+fn gguf_f64_or(content: &gguf_file::Content, key: &str, default: f64) -> Result<f64> {
+    match content.metadata.get(key) {
+        None => Ok(default),
+        Some(gguf_file::Value::F32(value)) => Ok(*value as f64),
+        Some(gguf_file::Value::F64(value)) => Ok(*value),
+        _ => anyhow::bail!("invalid floating-point GGUF metadata: {key}"),
+    }
+}
+fn gguf_config(content: &gguf_file::Content) -> Result<ToyLlamaConfig> {
+    let hidden = gguf_u64(content, "llama.embedding_length")? as usize;
+    let heads = gguf_u64(content, "llama.attention.head_count")? as usize;
+    anyhow::ensure!(
+        hidden > 0 && heads > 0 && hidden.is_multiple_of(heads),
+        "invalid GGUF attention dimensions"
+    );
+    if let Some(value) = content.metadata.get("llama.rope.scaling.type") {
+        anyhow::ensure!(
+            value.to_string().is_ok_and(|kind| kind == "none"),
+            "scaled GGUF RoPE is unsupported"
+        );
+    }
+    anyhow::ensure!(
+        gguf_f64_or(content, "llama.rope.scale_linear", 1.0)? == 1.0,
+        "linear GGUF RoPE scaling is unsupported"
+    );
+    anyhow::ensure!(
+        gguf_u64_or(
+            content,
+            "llama.rope.dimension_count",
+            (hidden / heads) as u64
+        )? as usize
+            == hidden / heads,
+        "partial GGUF RoPE is unsupported"
+    );
+    let inferred_vocab = content
+        .tensor_infos
+        .get("token_embd.weight")
+        .and_then(|t| t.shape.dims().first())
+        .copied()
+        .unwrap_or(0);
+    let config = ToyLlamaConfig {
+        hidden_size: hidden,
+        intermediate_size: gguf_u64_or(content, "llama.feed_forward_length", (4 * hidden) as u64)?
+            as usize,
+        num_hidden_layers: gguf_u64(content, "llama.block_count")? as usize,
+        vocab_size: gguf_u64_or(content, "llama.vocab_size", inferred_vocab as u64)? as usize,
+        rms_norm_eps: gguf_f64_or(content, "llama.attention.layer_norm_rms_epsilon", 1e-5)?,
+        num_attention_heads: heads,
+        num_key_value_heads: gguf_u64_or(content, "llama.attention.head_count_kv", heads as u64)?
+            as usize,
+        tie_word_embeddings: !content.tensor_infos.contains_key("output.weight"),
+        max_position_embeddings: gguf_u64_or(content, "llama.context_length", 4096)? as usize,
+        rope_theta: gguf_f64_or(content, "llama.rope.freq_base", 10000.0)?,
+        torch_dtype: "float32".into(),
+    };
+    config.validate()?;
+    anyhow::ensure!(
+        !content
+            .tensor_infos
+            .keys()
+            .any(|key| key.ends_with(".bias")),
+        "GGUF biases are unsupported"
+    );
+    let require = |name: &str, dims: &[usize]| -> Result<()> {
+        let tensor = content
+            .tensor_infos
+            .get(name)
+            .with_context(|| format!("missing GGUF tensor {name}"))?;
+        anyhow::ensure!(
+            tensor.shape.dims() == dims,
+            "GGUF shape mismatch for {name}"
+        );
+        Ok(())
+    };
+    require("token_embd.weight", &[config.vocab_size, hidden])?;
+    require("output_norm.weight", &[hidden])?;
+    if !config.tie_word_embeddings {
+        require("output.weight", &[config.vocab_size, hidden])?;
+    }
+    let kv = config.num_key_value_heads * config.head_dim();
+    for layer in 0..config.num_hidden_layers {
+        let prefix = format!("blk.{layer}");
+        for suffix in ["attn_norm.weight", "ffn_norm.weight"] {
+            require(&format!("{prefix}.{suffix}"), &[hidden])?;
+        }
+        for (suffix, dims) in [
+            ("attn_q.weight", [hidden, hidden]),
+            ("attn_k.weight", [kv, hidden]),
+            ("attn_v.weight", [kv, hidden]),
+            ("attn_output.weight", [hidden, hidden]),
+            ("ffn_gate.weight", [config.intermediate_size, hidden]),
+            ("ffn_up.weight", [config.intermediate_size, hidden]),
+            ("ffn_down.weight", [hidden, config.intermediate_size]),
+        ] {
+            require(&format!("{prefix}.{suffix}"), &dims)?;
+        }
+    }
+    Ok(config)
 }
 
-/// Read the layer count (`llama.block_count`) from a GGUF file header.
-///
-/// The node loader uses this to compute the static shard plan before
-/// constructing a `ToyLlamaGGUF` slice, since quantized files carry all
-/// model metadata in the header rather than in an HF `config.json`.
+/// Resolve and validate a GGUF model's architecture and tensor dimensions.
 pub fn gguf_layer_count(path: &Path) -> Result<usize> {
-    let mut file =
-        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let content = gguf_file::Content::read(&mut file).context("failed to parse GGUF header")?;
-    gguf_u64(&content, "llama.block_count").map(|n| n as usize)
+    let mut file = File::open(path)?;
+    let content = super::gguf_validation::read_checked(&mut file)?;
+    Ok(gguf_config(&content)?.num_hidden_layers)
 }
 
-fn gguf_u64_or(content: &gguf_file::Content, key: &str, default: u64) -> u64 {
-    content
-        .metadata
-        .get(key)
-        .and_then(|v| v.to_u64().ok())
-        .unwrap_or(default)
-}
-
-fn gguf_f64_or(content: &gguf_file::Content, key: &str, default: f64) -> f64 {
-    content
-        .metadata
-        .get(key)
-        .and_then(|v| v.to_f64().ok())
-        .unwrap_or(default)
+/// Reject sidecars which understate or contradict actual GGUF dimensions.
+pub fn validate_gguf_config(path: &Path, config: &ToyLlamaConfig) -> Result<()> {
+    config.validate()?;
+    let mut file = File::open(path)?;
+    let content = super::gguf_validation::read_checked(&mut file)?;
+    let actual = gguf_config(&content)?;
+    anyhow::ensure!(
+        config.hidden_size == actual.hidden_size
+            && config.intermediate_size == actual.intermediate_size
+            && config.num_hidden_layers == actual.num_hidden_layers
+            && config.vocab_size == actual.vocab_size
+            && config.num_attention_heads == actual.num_attention_heads
+            && config.num_key_value_heads == actual.num_key_value_heads
+            && config.max_position_embeddings == actual.max_position_embeddings,
+        "GGUF sidecar dimensions mismatch"
+    );
+    anyhow::ensure!(
+        (config.rope_theta - actual.rope_theta).abs() <= config.rope_theta.abs() * 1e-6
+            && (config.rms_norm_eps - actual.rms_norm_eps).abs()
+                <= config.rms_norm_eps.abs() * 1e-6,
+        "GGUF sidecar numerical metadata mismatch"
+    );
+    Ok(())
 }
 
 impl ToyLlamaGGUF {
+    pub fn resident_weight_bytes(&self) -> u64 {
+        let mut bytes = self.embed_tokens.iter().map(tensor_bytes).sum::<u64>()
+            + self
+                .norm
+                .as_ref()
+                .map_or(0, |norm| tensor_bytes(&norm.weight))
+            + tensor_bytes(&self.rope.cos)
+            + tensor_bytes(&self.rope.sin)
+            + if self.shared_head_embedding {
+                0
+            } else {
+                self.lm_head.as_ref().map_or(0, quantized_bytes)
+            };
+        for layer in &self.layers {
+            bytes += tensor_bytes(&layer.input_layernorm.weight)
+                + tensor_bytes(&layer.post_attention_layernorm.weight);
+            bytes += [
+                &layer.attn_q,
+                &layer.attn_k,
+                &layer.attn_v,
+                &layer.attn_output,
+                &layer.ffn_gate,
+                &layer.ffn_up,
+                &layer.ffn_down,
+            ]
+            .into_iter()
+            .map(quantized_bytes)
+            .sum::<u64>();
+        }
+        bytes
+    }
     /// Load the full quantized model.
     pub fn load(path: &Path) -> Result<Self> {
         let device = get_best_device().context("failed to select inference device")?;
         let mut file =
             File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        let content = gguf_file::Content::read(&mut file).context("failed to parse GGUF header")?;
+        let content = super::gguf_validation::read_checked(&mut file)
+            .context("failed to parse GGUF header")?;
         let n_layers = gguf_u64(&content, "llama.block_count")? as usize;
         drop(file);
         Self::load_range(path, 0..n_layers, &device)
@@ -1969,66 +2409,47 @@ impl ToyLlamaGGUF {
     /// Slice-only construction of a quantized GGUF llama: loads the embed,
     /// final norm, LM head and only the transformer blocks in `range`.
     pub fn load_range(path: &Path, range: Range<usize>, device: &Device) -> Result<Self> {
+        Self::load_range_with_roles(path, range, device, TensorRoles::COORDINATOR)
+    }
+
+    pub fn load_range_with_roles(
+        path: &Path,
+        range: Range<usize>,
+        device: &Device,
+        roles: TensorRoles,
+    ) -> Result<Self> {
         info!(?path, ?range, "loading quantized GGUF llama weights");
         let mut file =
             File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        let content = gguf_file::Content::read(&mut file).context("failed to parse GGUF header")?;
+        let content = super::gguf_validation::read_checked(&mut file)
+            .context("failed to parse GGUF header")?;
 
-        let hidden = gguf_u64(&content, "llama.embedding_length")? as usize;
-        let n_layers = gguf_u64(&content, "llama.block_count")? as usize;
-        let n_heads = gguf_u64(&content, "llama.attention.head_count")? as usize;
-        let vocab = gguf_u64(&content, "llama.vocab_size")? as usize;
-        if range.end > n_layers {
-            bail!(
-                "layer range {}..{} exceeds GGUF block_count {}",
-                range.start,
-                range.end,
-                n_layers
+        let config = gguf_config(&content)?;
+        let (hidden, n_layers, n_heads, n_kv_heads, vocab, eps) = (
+            config.hidden_size,
+            config.num_hidden_layers,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.vocab_size,
+            config.rms_norm_eps,
+        );
+        anyhow::ensure!(
+            range.start <= range.end && range.end <= n_layers,
+            "GGUF range exceeds model depth"
+        );
+        let head_dim = config.head_dim();
+        let embed_tokens = if roles.input {
+            let embedding = content
+                .tensor(&mut file, "token_embd.weight", device)?
+                .dequantize(device)?;
+            anyhow::ensure!(
+                embedding.dims() == [vocab, hidden],
+                "embedding dimensions mismatch"
             );
-        }
-        let head_dim = hidden / n_heads;
-        let rope_dim =
-            gguf_u64_or(&content, "llama.rope.dimension_count", head_dim as u64) as usize;
-        if rope_dim != head_dim {
-            bail!(
-                "unsupported partial rotary dimension {rope_dim} (head_dim={head_dim}); \
-                 only full head-dim RoPE is supported"
-            );
-        }
-        let n_kv_heads =
-            gguf_u64_or(&content, "llama.attention.head_count_kv", n_heads as u64) as usize;
-        let eps = gguf_f64_or(&content, "llama.attention.layer_norm_rms_epsilon", 1e-5);
-        let intermediate =
-            gguf_u64_or(&content, "llama.feed_forward_length", (4 * hidden) as u64) as usize;
-        let max_pos = gguf_u64_or(&content, "llama.context_length", 4096) as usize;
-        let rope_theta = gguf_f64_or(&content, "llama.rope.freq_base", 10_000.0);
-        if !hidden.is_multiple_of(n_heads) {
-            bail!("hidden_size {hidden} not divisible by head_count {n_heads}");
-        }
-
-        let config = ToyLlamaConfig {
-            hidden_size: hidden,
-            intermediate_size: intermediate,
-            num_hidden_layers: n_layers,
-            vocab_size: vocab,
-            rms_norm_eps: eps,
-            num_attention_heads: n_heads,
-            num_key_value_heads: n_kv_heads,
-            tie_word_embeddings: false,
-            max_position_embeddings: max_pos,
-            rope_theta,
-            torch_dtype: "float32".to_owned(),
+            Some(embedding)
+        } else {
+            None
         };
-
-        let embed_tokens = content
-            .tensor(&mut file, "token_embd.weight", device)?
-            .dequantize(device)?;
-        if embed_tokens.dims() != [vocab, hidden] {
-            bail!(
-                "token_embd.weight shape {:?} != [{vocab}, {hidden}]",
-                embed_tokens.dims()
-            );
-        }
 
         let mut layers = Vec::with_capacity(range.end.saturating_sub(range.start));
         for i in range.clone() {
@@ -2096,21 +2517,36 @@ impl ToyLlamaGGUF {
             });
         }
 
-        let norm = RmsNorm {
-            weight: content
-                .tensor(&mut file, "output_norm.weight", device)?
-                .dequantize(device)?,
-            eps,
+        let norm = if roles.output {
+            Some(RmsNorm {
+                weight: content
+                    .tensor(&mut file, "output_norm.weight", device)?
+                    .dequantize(device)?,
+                eps,
+            })
+        } else {
+            None
+        };
+        let shared_head_embedding =
+            roles.input && roles.output && !content.tensor_infos.contains_key("output.weight");
+        let lm_head = if roles.output {
+            Some(if content.tensor_infos.contains_key("output.weight") {
+                QMatMul::from_qtensor(content.tensor(&mut file, "output.weight", device)?)?
+            } else {
+                let embedding = match &embed_tokens {
+                    Some(embedding) => embedding.clone(),
+                    None => content
+                        .tensor(&mut file, "token_embd.weight", device)?
+                        .dequantize(device)?,
+                };
+                QMatMul::Tensor(embedding)
+            })
+        } else {
+            None
         };
 
-        // `output.weight` may be absent when the LM head is tied to the
-        // embeddings; fall back to the dequantized embed matrix.
-        let lm_head = match content.tensor(&mut file, "output.weight", device) {
-            Ok(qt) => QMatMul::from_qtensor(qt)?,
-            Err(_) => QMatMul::Tensor(embed_tokens.clone()),
-        };
-
-        let rope = RotaryEmbedding::new(head_dim, max_pos.min(4096), rope_theta, device)?;
+        let rope =
+            RotaryEmbedding::new(head_dim, config.context_limit(), config.rope_theta, device)?;
 
         info!(
             hidden,
@@ -2118,6 +2554,8 @@ impl ToyLlamaGGUF {
         );
         Ok(ToyLlamaGGUF {
             embed_tokens,
+            device: device.clone(),
+            shared_head_embedding,
             layers,
             norm,
             lm_head,
@@ -2128,7 +2566,7 @@ impl ToyLlamaGGUF {
     }
 
     fn model_device(&self) -> &Device {
-        self.embed_tokens.device()
+        &self.device
     }
 
     fn to_model_device(&self, tensor: &Tensor, tensor_name: &str) -> Result<Tensor> {
@@ -2171,7 +2609,11 @@ impl ToyLlamaGGUF {
         } else {
             token_ids.clone()
         };
-        let flat_hidden = self.embed_tokens.embedding(&flat_ids)?;
+        let flat_hidden = self
+            .embed_tokens
+            .as_ref()
+            .context("assignment has no input embedding role")?
+            .embedding(&flat_ids)?;
         let hidden = if dims.len() > 1 {
             let batch = dims[0];
             let seq_len = dims[1];
@@ -2224,8 +2666,16 @@ impl ToyLlamaGGUF {
 
     pub fn head(&self, hidden: &Tensor) -> Result<Tensor> {
         let hidden = self.to_model_device(hidden, "lm_head hidden state")?;
-        let normed = self.norm.forward(&hidden)?;
-        let logits = self.lm_head.forward(&normed)?;
+        let normed = self
+            .norm
+            .as_ref()
+            .context("assignment has no output head role")?
+            .forward(&hidden)?;
+        let logits = self
+            .lm_head
+            .as_ref()
+            .context("assignment has no output head role")?
+            .forward(&normed)?;
         trace!(shape = ?logits.dims(), "GGUF lm_head complete");
         Ok(logits)
     }
@@ -2234,8 +2684,16 @@ impl ToyLlamaGGUF {
         let hidden = self.to_model_device(hidden, "lm_head hidden state")?;
         let seq_len = hidden.dim(1)?;
         let last_hidden = hidden.narrow(1, seq_len - 1, 1)?;
-        let normed = self.norm.forward(&last_hidden)?;
-        let logits = self.lm_head.forward(&normed)?;
+        let normed = self
+            .norm
+            .as_ref()
+            .context("assignment has no output head role")?
+            .forward(&last_hidden)?;
+        let logits = self
+            .lm_head
+            .as_ref()
+            .context("assignment has no output head role")?
+            .forward(&normed)?;
         trace!(shape = ?logits.dims(), "GGUF lm_head (last-token) complete");
         Ok(logits)
     }
@@ -2334,6 +2792,12 @@ impl ToyLlamaGGUF {
 }
 
 impl ShardedModel for ToyLlamaGGUF {
+    fn model_dtype(&self) -> DType {
+        DType::F32
+    }
+    fn resident_weight_bytes(&self) -> u64 {
+        self.resident_weight_bytes()
+    }
     fn name(&self) -> &'static str {
         "llama-gguf"
     }
@@ -2406,13 +2870,52 @@ impl ShardedModel for ToyLlamaGGUF {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::download_model;
+    use crate::inference::model_loader::test_model_files;
+
+    #[test]
+    fn invalid_config_fails_before_tensor_allocation() {
+        let valid = serde_json::json!({"model_type":"llama", "hidden_size":16, "intermediate_size":32,
+            "num_hidden_layers":2, "vocab_size":64, "rms_norm_eps":0.00001,
+            "num_attention_heads":4, "num_key_value_heads":2});
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        std::fs::write(&path, serde_json::to_vec(&valid).unwrap()).unwrap();
+        let config = ToyLlamaConfig::from_file(&path).unwrap();
+        assert!(
+            ToyLlama::load_range(&config, Path::new("missing.safetensors"), 1..3)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("range")
+        );
+        for (field, value) in [
+            ("model_type", serde_json::json!("qwen2")),
+            ("num_attention_heads", serde_json::json!(0)),
+            ("num_key_value_heads", serde_json::json!(3)),
+            ("rms_norm_eps", serde_json::json!(-1)),
+            ("rope_scaling", serde_json::json!({"type":"linear"})),
+            ("torch_dtype", serde_json::json!("int8")),
+            ("attention_bias", serde_json::json!(true)),
+        ] {
+            let mut bad = valid.clone();
+            bad[field] = value;
+            std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+            assert!(
+                ToyLlamaConfig::from_file(&path).is_err(),
+                "accepted {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn greedy_sampling_rejects_empty_sequences() {
+        let empty = Tensor::zeros((1, 0, 4), DType::F32, &Device::Cpu).unwrap();
+        assert!(ToyLlama::sample_argmax(&empty).is_err());
+    }
 
     #[tokio::test]
     async fn full_forward_pass() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
 
@@ -2427,14 +2930,12 @@ mod tests {
             .forward_full(&token_ids)
             .expect("forward pass should succeed");
 
-        assert_eq!(logits.dims(), &[1, 3, 32000]);
+        assert_eq!(logits.dims(), &[1, 3, config.vocab_size]);
     }
 
     #[tokio::test]
     async fn sharded_forward_matches_full() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
 
@@ -2471,9 +2972,7 @@ mod tests {
 
     #[tokio::test]
     async fn kv_cache_lifecycle_roundtrip() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
         let model = ToyLlama::load(&config, &files.weights).expect("model should load");
@@ -2520,9 +3019,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefill_then_decode_matches_full_last_token() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
         let model = ToyLlama::load(&config, &files.weights).expect("model should load");
@@ -2587,9 +3084,7 @@ mod tests {
 
     #[tokio::test]
     async fn decode_path_rejects_multi_token_hidden() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
         let model = ToyLlama::load(&config, &files.weights).expect("model should load");
@@ -2614,9 +3109,7 @@ mod tests {
 
     #[tokio::test]
     async fn sharded_prefill_decode_ranges_match_full_last_token() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
         let model = ToyLlama::load(&config, &files.weights).expect("model should load");
@@ -2709,9 +3202,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_kv_cache_range_only_resets_target_layers() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
         let model = ToyLlama::load(&config, &files.weights).expect("model should load");
@@ -2760,9 +3251,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_decode_rejects_multi_token_input_ids() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
         let model = ToyLlama::load(&config, &files.weights).expect("model should load");
@@ -2814,5 +3303,70 @@ mod tests {
 
         let device = get_best_device().expect("device selection should succeed");
         assert!(device.is_cpu(), "CPU-only environments must return CPU");
+    }
+}
+
+#[cfg(all(test, not(any(feature = "cuda", feature = "metal"))))]
+mod cpu_half_storage_regression {
+    use super::*;
+    #[test]
+    fn bf16_checkpoint_executes_on_cpu_with_accounted_f32_weights() {
+        let files = crate::inference::model_loader::test_model_files().unwrap();
+        let mut config = ToyLlamaConfig::from_file(&files.config).unwrap();
+        config.torch_dtype = "bfloat16".into();
+        let weights = candle_core::safetensors::load(&files.weights, &Device::Cpu).unwrap();
+        let weights: std::collections::HashMap<_, _> = weights
+            .into_iter()
+            .map(|(name, tensor)| (name, tensor.to_dtype(DType::BF16).unwrap()))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        candle_core::safetensors::save(&weights, &path).unwrap();
+        let model = ToyLlama::load(&config, &path).unwrap();
+        assert_eq!(model.model_dtype(), DType::F32);
+        let input = Tensor::new(&[[1u32, 2, 3]], &Device::Cpu).unwrap();
+        let logits = model.forward_prefill(&input).unwrap();
+        assert_eq!(ToyLlama::sample_argmax(&logits).unwrap(), 45);
+        let estimate = crate::inference::memory::ModelMemoryProfile::new(&config, false)
+            .unwrap()
+            .estimate(config.num_hidden_layers, 11, TensorRoles::COORDINATOR)
+            .unwrap();
+        assert_eq!(model.resident_weight_bytes(), estimate.weights_bytes);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_semantics_tests {
+    use super::*;
+    #[test]
+    fn unsupported_semantics_fail_before_loading_any_tensor() {
+        let files = crate::inference::model_loader::test_model_files().unwrap();
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(files.config).unwrap()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        for (key, value) in [
+            ("hidden_act", serde_json::json!("gelu")),
+            ("attention_bias", serde_json::json!("false")),
+            ("rope_interleaved", serde_json::json!(true)),
+            ("pretraining_tp", serde_json::json!(2)),
+            (
+                "quantization_config",
+                serde_json::json!({"quant_method":"awq"}),
+            ),
+        ] {
+            let mut bad = original.clone();
+            bad[key] = value;
+            std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+            assert!(ToyLlamaConfig::from_file(&path).is_err(), "accepted{key}");
+        }
+        let mut omitted = original;
+        omitted
+            .as_object_mut()
+            .unwrap()
+            .remove("num_key_value_heads");
+        std::fs::write(&path, serde_json::to_vec(&omitted).unwrap()).unwrap();
+        let config = ToyLlamaConfig::from_file(&path).unwrap();
+        assert_eq!(config.num_key_value_heads, config.num_attention_heads);
     }
 }

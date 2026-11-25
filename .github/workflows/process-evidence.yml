@@ -1,0 +1,60 @@
+name: Offline process evidence
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: processes-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  loopback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned harness dependency and Rust toolchain
+        run: |
+          python3 -m pip install --disable-pip-version-check -r scripts/test-requirements.txt
+          rustup toolchain install 1.94.0 --profile minimal
+      - name: Build the actual applications
+        run: cargo build --workspace --locked
+      - name: Verify one and two workers over both encrypted transports
+        run: |
+          for transport in quic tcp; do
+            python3 scripts/local_cluster.py --binary target/debug/synapse \
+              --workers 1 --transport "$transport" --host-memory-bytes 52000 \
+              --worker-memory-bytes 45000 --output "artifacts/two-process-$transport"
+            python3 scripts/local_cluster.py --binary target/debug/synapse \
+              --workers 2 --coordinator-only --transport "$transport" \
+              --host-memory-bytes 16000 --worker-memory-bytes 45000 \
+              --output "artifacts/three-process-$transport"
+          done
+      - name: Verify bounded delay, throughput and explicit worker loss
+        run: python3 scripts/wan_matrix.py --binary target/debug/synapse --output artifacts/transport-matrix
+      - name: Verify actual GUI authentication, API and worker controls
+        run: |
+          python3 scripts/gui_smoke.py --binary target/debug/synapse-gui \
+            --require-websocket --source-revision "$GITHUB_SHA" --out artifacts/gui-smoke
+      - name: Preserve synthetic redacted evidence, including failed runs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: loopback-process-evidence
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14

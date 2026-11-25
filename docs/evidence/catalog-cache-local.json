@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "package": "PR-51",
+  "status": "locally_tested",
+  "source_revision": "aca33d6774fc16487cd48b5f195027d50ebc9194",
+  "dirty_worktree": true,
+  "environment": "Linux-6.18.57-x86_64-with-glibc2.41; original synthetic catalog fixture; each step uses the compiled local example",
+  "topology": "none",
+  "commands": [
+    {
+      "argv": [
+        "/workspace/scratch/502d906b01b6/cargo-target/debug/examples/catalog",
+        "fixture",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture"
+      ],
+      "exit_code": 0,
+      "artifact": "docs/evidence/catalog-cache-cli-output.json"
+    },
+    {
+      "argv": [
+        "/workspace/scratch/502d906b01b6/cargo-target/debug/examples/catalog",
+        "inspect",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/record.json",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/trust.json",
+        "local"
+      ],
+      "exit_code": 0,
+      "artifact": "docs/evidence/catalog-cache-cli-output.json"
+    },
+    {
+      "argv": [
+        "/workspace/scratch/502d906b01b6/cargo-target/debug/examples/catalog",
+        "import",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/source",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/record.json",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/trust.json",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/cache",
+        "1048576",
+        "local"
+      ],
+      "exit_code": 0,
+      "artifact": "docs/evidence/catalog-cache-cli-output.json"
+    },
+    {
+      "argv": [
+        "/workspace/scratch/502d906b01b6/cargo-target/debug/examples/catalog",
+        "verify",
+        "71f436fd2068447ac8824a1c4e199e40703e680f883182204841e3c13abab569",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/trust.json",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/cache",
+        "1048576",
+        "local"
+      ],
+      "exit_code": 0,
+      "artifact": "docs/evidence/catalog-cache-cli-output.json"
+    },
+    {
+      "argv": [
+        "/workspace/scratch/502d906b01b6/cargo-target/debug/examples/catalog",
+        "verify",
+        "71f436fd2068447ac8824a1c4e199e40703e680f883182204841e3c13abab569",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/trust.json",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/cache",
+        "1048576",
+        "host"
+      ],
+      "exit_code": 1,
+      "artifact": "docs/evidence/catalog-cache-cli-output.json"
+    },
+    {
+      "argv": [
+        "/workspace/scratch/502d906b01b6/cargo-target/debug/examples/catalog",
+        "prune",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/cache",
+        "1048576",
+        "0"
+      ],
+      "exit_code": 0,
+      "artifact": "docs/evidence/catalog-cache-cli-output.json"
+    }
+  ],
+  "limitations": [
+    "Pre-commit working tree based on the recorded revision. No physical-device, WAN, inference-model compatibility, production trust or independent acceptance claim.",
+    "Temporary paths were deleted after this executed local smoke test; fixture private key was not retained.",
+    "The host-purpose verification was intentionally rejected with a nonzero exit status."
+  ],
+  "reviewer": null,
+  "release_artifact": null
+}

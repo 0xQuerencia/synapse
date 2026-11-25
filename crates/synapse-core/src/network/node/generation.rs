@@ -6,20 +6,21 @@ use tracing::{info, warn};
 use super::{
     ActivationPass, BatchPromptRequest, ChatEvent, GenerationRoutePlan, InFlightActivationHop,
     InFlightRequest, MAX_BATCH_SIZE, SpeculativeRound, StopReason, SynapseNode, SynapseRole,
-    WorkerCapabilitySnapshot, WorkerRouteHop,
+    WorkerRouteHop,
 };
 use crate::inference::{ToyLlama, payload_to_tensor, tensor_to_payload};
-use crate::network::node::speculation::MAX_DRAFT_LEN;
-use crate::{
-    StaticShardAssignment, WeightedShardParticipant, plan_static_shards, plan_weighted_shards,
-};
+use crate::network::node::speculation::draft_budget;
+#[cfg(test)]
+use crate::{WeightedShardParticipant, plan_weighted_shards};
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RouteParticipant {
     Master,
     Worker(PeerId),
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct RouteWorkerCandidate {
     peer_id: PeerId,
@@ -53,88 +54,48 @@ fn activation_tokens_for_position(
     Ok((pass, tokens))
 }
 
-fn activation_trace_id(sequence_position: usize, hop_index: usize) -> String {
-    format!("gen-step-{sequence_position}-hop-{hop_index}")
-}
-
+#[cfg(test)]
 fn build_generation_route(
     total_layers: usize,
     master_capability: Option<crate::NodeCapability>,
     workers_in_order: &[RouteWorkerCandidate],
 ) -> Result<GenerationRoutePlan, String> {
-    let mut participants = Vec::with_capacity(workers_in_order.len() + 1);
-    participants.push(RouteParticipant::Master);
-    participants.extend(
-        workers_in_order
-            .iter()
-            .map(|worker| RouteParticipant::Worker(worker.peer_id)),
-    );
-
-    // ─── Phase 3: capability-aware planner ─────────────────────────
-    // If every worker has a structured `WorkerCapability` (i.e. the
-    // worker has sent at least one `CapabilityPing` heartbeat),
-    // use the new planner. Otherwise fall back to the legacy
-    // capability-scalar path so a pre-Phase-2 worker still works.
-    let all_workers_have_wire = workers_in_order.iter().all(|w| w.wire_capability.is_some());
-    let _all_workers_have_legacy = workers_in_order.iter().all(|w| w.capability.is_some());
-
-    let assignments = if all_workers_have_wire && !workers_in_order.is_empty() {
-        // Master owns a fixed lower prefix; workers split the rest
-        // proportionally based on `per_layer_throughput`.
-        let workers_only: Vec<(RouteParticipant, crate::WorkerCapability)> = workers_in_order
-            .iter()
-            .map(|w| {
-                (
-                    RouteParticipant::Worker(w.peer_id),
-                    w.wire_capability.clone().expect("checked above"),
-                )
+    let master = master_capability.ok_or("master memory capacity is unknown")?;
+    let mut seen = HashSet::new();
+    let mut participants = vec![WeightedShardParticipant {
+        participant: RouteParticipant::Master,
+        capability: master,
+    }];
+    for worker in workers_in_order {
+        if !seen.insert(worker.peer_id) {
+            return Err("duplicate worker in route candidates".to_owned());
+        }
+        let capability = worker
+            .wire_capability
+            .as_ref()
+            .map(|wire| crate::NodeCapability {
+                compute_score: wire.compute_score,
+                available_ram_mb: wire.available_ram_mb,
             })
-            .collect();
-        let worker_assignments = crate::plan_weighted_shards_capable(total_layers, &workers_only)
-            .map_err(|e| format!("capability-aware planner failed: {e}"))?;
-        // Shift worker ranges up by the master's prefix so the
-        // master and workers don't overlap.
-        let master_split = total_layers / (workers_in_order.len() + 1);
-        let mut all: Vec<StaticShardAssignment<RouteParticipant>> = Vec::new();
-        if master_split > 0 {
-            all.push(StaticShardAssignment {
-                participant: RouteParticipant::Master,
-                layer_range: 0..master_split,
-            });
-        }
-        let mut cumulative = master_split;
-        for mut a in worker_assignments {
-            let len = a.layer_range.len();
-            a.layer_range = cumulative..cumulative + len;
-            cumulative += len;
-            all.push(a);
-        }
-        all
-    } else {
-        let weighted_inputs = master_capability.and_then(|master_capability| {
-            let mut weighted = Vec::with_capacity(workers_in_order.len() + 1);
-            weighted.push(WeightedShardParticipant {
-                participant: RouteParticipant::Master,
-                capability: master_capability,
-            });
-            for worker in workers_in_order {
-                let capability = worker.capability?;
-                weighted.push(WeightedShardParticipant {
-                    participant: RouteParticipant::Worker(worker.peer_id),
-                    capability,
-                });
-            }
-            Some(weighted)
+            .or(worker.capability)
+            .ok_or("worker memory capacity is unknown")?;
+        participants.push(WeightedShardParticipant {
+            participant: RouteParticipant::Worker(worker.peer_id),
+            capability,
         });
-
-        if let Some(weighted_inputs) = weighted_inputs {
-            plan_weighted_shards(total_layers, &weighted_inputs)
-                .map_err(|error| format!("failed to build weighted generation route: {error}"))?
-        } else {
-            plan_static_shards(total_layers, &participants)
-                .map_err(|error| format!("failed to build static generation route: {error}"))?
-        }
-    };
+    }
+    // One plan covers the full model, including the coordinator. Never shift
+    // a complete worker plan by a second independently calculated prefix.
+    let assignments = plan_weighted_shards(total_layers, &participants)
+        .map_err(|error| format!("no feasible generation route: {error}"))?;
+    crate::shard::validate_exact_coverage(
+        total_layers,
+        &assignments
+            .iter()
+            .map(|assignment| assignment.layer_range.clone())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| error.to_string())?;
 
     let mut master_layer_range = None;
     let mut worker_hops = Vec::new();
@@ -151,9 +112,7 @@ fn build_generation_route(
         }
     }
 
-    let master_layer_range = master_layer_range.ok_or_else(|| {
-        "invalid generation route: master shard was not assigned any layers".to_owned()
-    })?;
+    let master_layer_range = master_layer_range.unwrap_or(0..0);
 
     Ok(GenerationRoutePlan {
         master_layer_range,
@@ -172,6 +131,119 @@ fn ensure_worker_available(
 }
 
 impl SynapseNode {
+    fn plan_model_route(&mut self) -> anyhow::Result<GenerationRoutePlan> {
+        use crate::inference::{
+            pipeline::TensorRoles,
+            routing::{RouteCandidate, select_route},
+        };
+        let profile = self
+            .memory_profile
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memory profile unavailable"))?;
+        let context = self
+            .token_ids
+            .len()
+            .checked_add(self.current_max_tokens())
+            .ok_or_else(|| anyhow::anyhow!("context overflow"))?;
+        let local_capacity =
+            profile.layer_capacity(self.memory_limit_bytes, context, TensorRoles::COORDINATOR)?;
+        let coordinator = RouteCandidate {
+            id: self.local_peer_id().to_string(),
+            max_layers: if self.coordinator_only {
+                0
+            } else {
+                local_capacity
+            },
+            measured_compute_score: self
+                .measured_compute_score
+                .ok_or_else(|| anyhow::anyhow!("local throughput unmeasured"))?,
+            measured_rtt_micros: None,
+            observed_decode: self.local_decode_observation.clone(),
+        };
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        for peer in &self.worker_peers {
+            anyhow::ensure!(seen.insert(*peer), "duplicate route candidate");
+            if !self.authenticated_workers.contains(peer) || self.revocations.contains(peer) {
+                continue;
+            }
+            let cap = self
+                .worker_registry
+                .capability_for(peer)
+                .ok_or_else(|| anyhow::anyhow!("worker capability unknown"))?;
+            let bytes = cap
+                .available_memory_bytes
+                .ok_or_else(|| anyhow::anyhow!("worker memory unknown"))?;
+            let max_layers = profile
+                .layer_capacity(bytes, context, TensorRoles::WORKER)
+                .unwrap_or(0);
+            let measured_compute_score = cap.compute_score.unwrap_or(0);
+            if max_layers == 0 || measured_compute_score == 0 {
+                continue;
+            }
+            candidates.push(RouteCandidate {
+                id: peer.to_string(),
+                max_layers,
+                measured_compute_score,
+                measured_rtt_micros: self
+                    .peer_rtts
+                    .get(peer)
+                    .filter(|(_, at)| at.elapsed().as_secs() <= 300)
+                    .map(|(rtt, _)| rtt.as_micros().min(u64::MAX as u128) as u64),
+                observed_decode: self
+                    .worker_registry
+                    .entries
+                    .get(peer)
+                    .and_then(|entry| entry.observed_decode.clone()),
+            });
+        }
+        // Capacity first preserves feasible coverage within the explicit eight
+        // candidate bound; IDs make ties independent of connection arrival.
+        candidates.sort_by(|a, b| {
+            b.max_layers
+                .cmp(&a.max_layers)
+                .then(b.measured_compute_score.cmp(&a.measured_compute_score))
+                .then(a.id.cmp(&b.id))
+        });
+        let available = candidates.len();
+        candidates.truncate(8);
+        let mut selected = select_route(
+            self.total_layers,
+            &coordinator,
+            &candidates,
+            self.max_route_stages,
+            context,
+            super::assignments::unix_now(),
+        )?;
+        if available > 8 {
+            selected.decision.explanation.push_str(&format!(
+                " Search bounded to eight of {available} capable members."
+            ));
+        }
+        info!(mode=%selected.decision.mode,remote_stages=selected.decision.selected_remote_stages,
+            predicted_decode_micros=?selected.decision.predicted_decode_micros,"selected feasible measured topology route");
+        self.route_decision = Some(selected.decision);
+        let mut route = GenerationRoutePlan {
+            master_layer_range: 0..0,
+            worker_hops: Vec::new(),
+        };
+        for stage in selected.stages {
+            if stage.id == coordinator.id {
+                route.master_layer_range = stage.layer_range;
+            } else {
+                route.worker_hops.push(WorkerRouteHop {
+                    peer_id: stage.id.parse()?,
+                    layer_range: stage.layer_range,
+                });
+            }
+        }
+        Ok(route)
+    }
+
+    fn generation_context_limit(&self) -> usize {
+        self.token_ids.len() + self.current_max_tokens() - self.tokens_generated
+    }
+
     /// Called when a new prompt arrives from the CLI REPL channel.
     pub(super) fn handle_new_prompt(&mut self, prompt: String) {
         let tokenizer = match &self.tokenizer {
@@ -201,22 +273,23 @@ impl SynapseNode {
 
     /// Shared generation setup used by both single-prompt and batch paths.
     fn begin_generation_from_ids(&mut self, ids: Vec<u32>) {
+        self.token_decode_state.reset();
         self.generation_active = true;
 
-        let pipeline = match &self.pipeline {
-            Some(pipeline) => Arc::clone(pipeline),
-            None => {
-                self.fail_generation("model not loaded");
-                return;
-            }
-        };
-
-        if let Err(error) = pipeline.clear_kv_cache() {
-            self.fail_generation(format!(
-                "failed to reset master cache for new prompt: {error}"
-            ));
+        let context_limit = self
+            .model_config
+            .as_ref()
+            .map_or(0, |config| config.context_limit());
+        if ids.is_empty()
+            || ids
+                .len()
+                .checked_add(self.current_max_tokens())
+                .is_none_or(|len| len > context_limit)
+        {
+            self.fail_generation("empty prompt or prompt/output exceeds model context limit");
             return;
         }
+        self.release_generation_assignments();
 
         // Reset draft cache for new conversation turn
         self.draft_cache.clear();
@@ -233,51 +306,23 @@ impl SynapseNode {
         self.pending_cache_reset_peers.clear();
         self.in_flight_activation_hop = None;
 
-        let workers_for_generation: Vec<_> = self
-            .worker_peers
-            .iter()
-            .copied()
-            .filter(|peer| self.authenticated_workers.contains(peer))
-            .map(|peer_id| RouteWorkerCandidate {
-                peer_id,
-                capability: self
-                    .worker_registry
-                    .capability_for(&peer_id)
-                    .as_ref()
-                    .and_then(WorkerCapabilitySnapshot::planner_capability),
-                wire_capability: self.worker_registry.wire_capability(&peer_id),
-            })
-            .collect();
-        let route_plan = match build_generation_route(
-            self.total_layers,
-            self.local_capability
-                .as_ref()
-                .and_then(WorkerCapabilitySnapshot::planner_capability),
-            &workers_for_generation,
-        ) {
+        let route_plan = match self.plan_model_route() {
             Ok(plan) => plan,
             Err(error) => {
-                self.fail_generation(error);
+                self.fail_generation(error.to_string());
                 return;
             }
         };
         self.split_point = route_plan.master_layer_range.end;
+        self.speculative_enabled = route_plan.worker_hops.is_empty();
         self.generation_route_plan = Some(route_plan.clone());
 
-        let cache_reset_peers: Vec<_> = route_plan
-            .worker_hops
-            .iter()
-            .map(|hop| hop.peer_id)
-            .collect();
-        if cache_reset_peers.is_empty() {
-            info!("no workers available for this generation; using local-only execution");
-            self.send_next_activation();
-        } else {
-            self.send_clear_cache_requests(&cache_reset_peers);
+        if let Err(error) = self.begin_route_preparation(&route_plan) {
+            self.fail_generation(format!("failed to prepare complete route: {error}"));
         }
     }
 
-    fn send_clear_cache_requests(&mut self, peers: &[PeerId]) {
+    pub(super) fn send_clear_cache_requests(&mut self, peers: &[PeerId]) {
         if peers.is_empty() {
             self.awaiting_clear_cache_ack = false;
             self.pending_cache_reset_trace_id = None;
@@ -286,11 +331,11 @@ impl SynapseNode {
         }
 
         self.cache_reset_nonce = self.cache_reset_nonce.wrapping_add(1);
-        let trace_id = format!(
-            "cache-reset-{}-{}",
-            self.cache_reset_nonce,
-            self.token_ids.len()
-        );
+        let Some(key) = &self.generation_lease else {
+            self.fail_generation("missing session lease");
+            return;
+        };
+        let trace_id = format!("{}c{}", key.trace_prefix(), self.cache_reset_nonce);
 
         self.awaiting_clear_cache_ack = true;
         self.pending_cache_reset_trace_id = Some(trace_id.clone());
@@ -298,17 +343,23 @@ impl SynapseNode {
 
         for peer in peers {
             info!(%peer, trace_id, "master requesting worker cache reset");
-            self.swarm.behaviour_mut().request_response.send_request(
-                peer,
+            if let Err(error) = self.send_tracked_request(
+                *peer,
                 super::super::RequestMessage::ClearCache(crate::ClearCache {
                     trace_id: trace_id.clone(),
                 }),
-            );
+            ) {
+                self.fail_generation(error.to_string());
+                return;
+            }
         }
     }
 
     /// Run master layers on current token_ids and route ActivationRequest hops via workers.
-    fn send_next_activation(&mut self) {
+    pub(super) fn send_next_activation(&mut self) {
+        if self.shard_readiness.is_some() {
+            return;
+        }
         if self.awaiting_clear_cache_ack {
             info!(
                 pending_peers = self.pending_cache_reset_peers.len(),
@@ -345,6 +396,8 @@ impl SynapseNode {
         // compute each worker's share of total step latency once it
         // completes (see `publish_step_telemetry`).
         self.step_started_at = Some(Instant::now());
+        let local_started = Instant::now();
+        self.local_step_compute_micros = 0;
         self.step_hop_durations_ms.clear();
 
         // Decide what this step feeds through the route:
@@ -433,6 +486,12 @@ impl SynapseNode {
             }
         };
 
+        if let Err(error) = pipeline.model_device().synchronize() {
+            self.fail_generation(format!("device synchronization failed: {error}"));
+            return;
+        }
+        self.local_step_compute_micros =
+            local_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         // Every KV cache along the route now holds these positions too —
         // track the count so speculative rollbacks know the base length.
         self.kv_cache_len += activation_tokens.len();
@@ -447,16 +506,9 @@ impl SynapseNode {
             return;
         }
 
-        // Phase 5: activations cross the wire in bf16 — halves the bytes
-        // per hop. Compute itself stays f32 on both ends (weights are
-        // f32); only the inter-node hidden-state transfer is downcast.
-        let wire_hidden = match after_master.to_dtype(candle_core::DType::BF16) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                self.fail_generation(format!("failed to cast hidden state to bf16: {error}"));
-                return;
-            }
-        };
+        // Preserve dtype exactly. Lossy activation compression is not a
+        // correctness-preserving default and needs separate quality evidence.
+        let wire_hidden = after_master;
 
         // Serialize for network transfer (only needed when a worker hop exists).
         let payload = match tensor_to_payload(&wire_hidden) {
@@ -486,7 +538,11 @@ impl SynapseNode {
             return None;
         }
 
-        let draft_tokens = self.draft_cache.draft(&self.token_ids, MAX_DRAFT_LEN);
+        let budget = draft_budget(
+            self.current_max_tokens()
+                .saturating_sub(self.tokens_generated),
+        );
+        let draft_tokens = self.draft_cache.draft(&self.token_ids, budget);
         if draft_tokens.is_empty() {
             return None;
         }
@@ -530,7 +586,20 @@ impl SynapseNode {
         // Phase 6: record that this hop consumes a pooled connection.
         self.connection_pool.mark_connection_used(&hop.peer_id);
 
-        let trace_id = activation_trace_id(sequence_position, hop_index);
+        let Some(key) = &self.generation_lease else {
+            self.fail_generation("missing session lease");
+            return;
+        };
+        if !self.ready_registry.contains(
+            hop.peer_id,
+            key,
+            &hop.layer_range,
+            super::assignments::unix_now(),
+        ) {
+            self.fail_generation("assigned range is no longer signed, ready and unexpired");
+            return;
+        }
+        let trace_id = format!("{}g{}h{}", key.trace_prefix(), sequence_position, hop_index);
         match activation_pass {
             ActivationPass::Prefill => {
                 info!(
@@ -588,10 +657,12 @@ impl SynapseNode {
             pass: activation_pass,
         });
 
-        self.swarm.behaviour_mut().request_response.send_request(
-            &hop.peer_id,
+        if let Err(error) = self.send_tracked_request(
+            hop.peer_id,
             super::super::RequestMessage::ActivationRequest(request),
-        );
+        ) {
+            self.fail_generation(error.to_string());
+        }
     }
 
     /// Phase 4: publish live per-peer telemetry (layers handled, measured
@@ -642,8 +713,6 @@ impl SynapseNode {
         peer: Option<PeerId>,
         worker_output: candle_core::Tensor,
     ) {
-        self.publish_step_telemetry();
-
         // Phase 10: speculative rounds verify a whole draft block instead
         // of sampling one token.
         if let Some(round) = self.spec_round.take() {
@@ -665,6 +734,7 @@ impl SynapseNode {
             }
         };
 
+        let head_started = Instant::now();
         let logits = match pipeline.head_last_token(&worker_output) {
             Ok(logits) => logits,
             Err(error) => {
@@ -681,6 +751,20 @@ impl SynapseNode {
             }
         };
 
+        if self.tokens_generated > 0 {
+            let head_micros = head_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            self.local_decode_observation = Some(crate::inference::routing::DecodeObservation {
+                layers: pipeline.owned_layers(),
+                context_limit: self.generation_context_limit(),
+                elapsed_micros: self
+                    .local_step_compute_micros
+                    .saturating_add(head_micros)
+                    .max(1),
+                sampled_at_unix: super::assignments::unix_now(),
+            });
+        }
+        self.publish_step_telemetry();
+
         let tokenizer = match &self.tokenizer {
             Some(tokenizer) => Arc::clone(tokenizer),
             None => {
@@ -689,14 +773,9 @@ impl SynapseNode {
             }
         };
 
-        let decoded = match tokenizer.decode(&[next_token], true) {
-            Ok(text) => text,
-            Err(error) => {
-                warn!(peer = ?peer, %error, token_id = next_token, "token decode failed");
-                format!("<tok:{next_token}>")
-            }
-        };
-        self.emit(ChatEvent::Token(decoded));
+        if !self.emit_accepted_token(&tokenizer, next_token) {
+            return;
+        }
 
         // Feed the N-gram draft cache for speculative decoding.
         if self.speculative_enabled && self.token_ids.len() >= 2 {
@@ -708,19 +787,18 @@ impl SynapseNode {
         self.tokens_generated += 1;
         self.in_flight_activation_hop = None;
 
-        let eos = tokenizer.eos_token_id();
         let max_tokens = self.current_max_tokens();
-        let should_stop = self.tokens_generated >= max_tokens || eos == Some(next_token);
+        let should_stop = self.tokens_generated >= max_tokens || tokenizer.is_eos(next_token);
 
         if should_stop {
-            let reason = if eos == Some(next_token) {
+            let reason = if tokenizer.is_eos(next_token) {
                 StopReason::Eos
             } else {
                 StopReason::MaxTokens
             };
             self.finish_generation(reason);
         } else {
-            self.send_next_activation();
+            self.local_step_pending = self.generation_active;
         }
     }
 
@@ -815,7 +893,6 @@ impl SynapseNode {
             .chain(std::iter::once(correction))
             .collect();
 
-        let eos = tokenizer.eos_token_id();
         let max_tokens = self.current_max_tokens();
         let mut stop_reason: Option<StopReason> = None;
 
@@ -830,19 +907,14 @@ impl SynapseNode {
                 self.draft_cache.observe(&self.token_ids, token);
             }
 
-            let decoded = match tokenizer.decode(&[token], true) {
-                Ok(text) => text,
-                Err(error) => {
-                    warn!(peer = ?peer, %error, token_id = token, "token decode failed");
-                    format!("<tok:{token}>")
-                }
-            };
-            self.emit(ChatEvent::Token(decoded));
+            if !self.emit_accepted_token(&tokenizer, token) {
+                return;
+            }
 
             self.token_ids.push(token);
             self.tokens_generated += 1;
 
-            if eos == Some(token) {
+            if tokenizer.is_eos(token) {
                 stop_reason = Some(StopReason::Eos);
             } else if self.tokens_generated >= max_tokens {
                 stop_reason = Some(StopReason::MaxTokens);
@@ -866,11 +938,42 @@ impl SynapseNode {
             return;
         }
 
-        self.send_next_activation();
+        self.local_step_pending = self.generation_active;
+    }
+
+    /// All accepted tokens, including speculative drafts and special tokens,
+    /// advance the same decoder. Text is emitted only when a chunk is ready;
+    /// exact token events remain independent of UTF-8 chunk boundaries.
+    fn emit_accepted_token(
+        &mut self,
+        tokenizer: &crate::inference::SimpleTokenizer,
+        token_id: u32,
+    ) -> bool {
+        let decoded = match self.token_decode_state.push(tokenizer, token_id) {
+            Ok(text) => text,
+            Err(error) => {
+                self.fail_generation(format!("token decode failed: {error}"));
+                return false;
+            }
+        };
+        self.emit(ChatEvent::TokenGenerated {
+            token_id,
+            position: self.tokens_generated,
+        });
+        if self.generation_active
+            && let Some(text) = decoded
+        {
+            self.emit(ChatEvent::Token(text));
+        }
+        self.generation_active
     }
 
     /// Shared end-of-turn bookkeeping for all generation paths.
     fn finish_generation(&mut self, reason: StopReason) {
+        // Match the API backend's upstream DecodeStream contract: only completed
+        // chunks are text. An unfinished terminal byte suffix is discarded.
+        self.token_decode_state.reset();
+        self.release_generation_assignments();
         self.emit(ChatEvent::GenerationDone {
             tokens_generated: self.tokens_generated,
             reason,
@@ -891,7 +994,7 @@ impl SynapseNode {
 
     /// Max tokens for the active turn: batch override when set, otherwise
     /// the role default.
-    fn current_max_tokens(&self) -> usize {
+    pub(super) fn current_max_tokens(&self) -> usize {
         self.batch_active_max_tokens.unwrap_or(match &self.role {
             SynapseRole::Master { max_tokens, .. } => *max_tokens,
             _ => 50,
@@ -914,12 +1017,16 @@ impl SynapseNode {
             self.awaiting_truncate_ack = false;
             self.pending_truncate_trace_id = None;
             self.pending_truncate_peers.clear();
-            self.send_next_activation();
+            self.local_step_pending = self.generation_active;
             return;
         }
 
         self.truncate_nonce = self.truncate_nonce.wrapping_add(1);
-        let trace_id = format!("kv-truncate-{}-{}", self.truncate_nonce, target_seq_len);
+        let Some(key) = &self.generation_lease else {
+            self.fail_generation("missing session lease");
+            return;
+        };
+        let trace_id = format!("{}t{}", key.trace_prefix(), self.truncate_nonce);
 
         self.awaiting_truncate_ack = true;
         self.pending_truncate_trace_id = Some(trace_id.clone());
@@ -932,13 +1039,16 @@ impl SynapseNode {
                 target_seq_len,
                 "master requesting worker KV truncation"
             );
-            self.swarm.behaviour_mut().request_response.send_request(
-                &peer,
+            if let Err(error) = self.send_tracked_request(
+                peer,
                 super::super::RequestMessage::KvTruncate(crate::KvTruncate {
                     trace_id: trace_id.clone(),
                     target_seq_len,
                 }),
-            );
+            ) {
+                self.fail_generation(error.to_string());
+                return;
+            }
         }
     }
 
@@ -956,6 +1066,14 @@ impl SynapseNode {
         request: crate::ActivationRequest,
         channel: request_response::ResponseChannel<super::super::ResponseMessage>,
     ) {
+        if !self.authorize_worker_trace(peer, &request.trace_id) {
+            self.reject(
+                channel,
+                "operation requires the active authenticated session lease",
+            );
+            return;
+        }
+
         if !matches!(self.role, SynapseRole::Worker { .. }) {
             warn!(%peer, "master received ActivationRequest; rejecting");
             self.reject(channel, "ActivationRequest is handled by workers");
@@ -998,7 +1116,11 @@ impl SynapseNode {
         // Phase 5: the wire carries bf16; upcast to f32 before running
         // layers — weights are f32 and candle matmul requires matching
         // dtypes on both operands.
-        let hidden = match hidden.to_dtype(candle_core::DType::F32) {
+        let hidden = match hidden.to_dtype(
+            self.pipeline
+                .as_ref()
+                .map_or(candle_core::DType::F32, |pipeline| pipeline.model_dtype()),
+        ) {
             Ok(tensor) => tensor,
             Err(error) => {
                 warn!(%peer, %error, "failed to upcast hidden state to f32");
@@ -1018,14 +1140,28 @@ impl SynapseNode {
         };
 
         let (layer_start, layer_end) = request.layer_range;
-        if layer_end > self.total_layers {
-            warn!(
-                %peer,
-                requested_range = ?request.layer_range,
-                available_layers = self.total_layers,
-                "requested layer range exceeds loaded model"
+        let Some(active) = &self.worker_assignment else {
+            self.reject(channel, "no active assignment");
+            return;
+        };
+        if (layer_start..layer_end) != active.assignment.layer_range()
+            || request.hidden_state.shape.first() != Some(&1)
+            || activation_seq_len == 0
+            || activation_seq_len > active.assignment.context_tokens as usize
+        {
+            self.reject(
+                channel,
+                "activation shape or range differs from leased assignment",
             );
-            self.reject(channel, "requested layer range exceeds model depth");
+            return;
+        }
+
+        if let Err(error) = active.cursor.validate_step(
+            request.sequence_position,
+            activation_seq_len,
+            active.assignment.context_tokens as usize,
+        ) {
+            self.reject(channel, &error.to_string());
             return;
         }
 
@@ -1054,16 +1190,7 @@ impl SynapseNode {
             }
         };
 
-        // Phase 5: downcast back to bf16 before sending onward — to the
-        // next worker hop, or back to the master for lm_head.
-        let wire_output = match output.to_dtype(candle_core::DType::BF16) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                warn!(%peer, %error, "failed to downcast output to bf16");
-                self.reject(channel, "tensor dtype conversion failed");
-                return;
-            }
-        };
+        let wire_output = output;
 
         // Serialize the output tensor.
         let payload = match tensor_to_payload(&wire_output) {
@@ -1102,6 +1229,9 @@ impl SynapseNode {
             }
         }
 
+        if let Some(active) = self.worker_assignment.as_mut() {
+            active.cursor.commit_step(activation_seq_len);
+        }
         let response = crate::ActivationResponse {
             trace_id: request.trace_id,
             logits: payload,
@@ -1120,6 +1250,14 @@ impl SynapseNode {
         request: crate::ClearCache,
         channel: request_response::ResponseChannel<super::super::ResponseMessage>,
     ) {
+        if !self.authorize_worker_trace(peer, &request.trace_id) {
+            self.reject(
+                channel,
+                "operation requires the active authenticated session lease",
+            );
+            return;
+        }
+
         if !matches!(self.role, SynapseRole::Worker { .. }) {
             warn!(%peer, "master received ClearCache request; rejecting");
             self.reject(channel, "ClearCache is handled by workers");
@@ -1129,6 +1267,27 @@ impl SynapseNode {
         if let Err(error) = request.validate() {
             warn!(%peer, %error, "ClearCache validation failed");
             self.reject(channel, "invalid ClearCache request");
+            return;
+        }
+
+        let reset = match self
+            .worker_assignment
+            .as_mut()
+            .expect("authorized active lease")
+            .cursor
+            .reset(&request.trace_id)
+        {
+            Ok(reset) => reset,
+            Err(error) => {
+                self.reject(channel, &error.to_string());
+                return;
+            }
+        };
+        if !reset {
+            self.send_response(
+                channel,
+                super::super::ResponseMessage::ClearCacheAck(request),
+            );
             return;
         }
 
@@ -1167,42 +1326,13 @@ impl SynapseNode {
         request: crate::KvTruncate,
         channel: request_response::ResponseChannel<super::super::ResponseMessage>,
     ) {
-        if !matches!(self.role, SynapseRole::Worker { .. }) {
-            warn!(%peer, "master received KvTruncate request; rejecting");
-            self.reject(channel, "KvTruncate is handled by workers");
+        if !self.authorize_worker_trace(peer, &request.trace_id) {
+            self.reject(channel, "unauthorized cache rollback");
             return;
         }
-
-        if let Err(error) = request.validate() {
-            warn!(%peer, %error, "KvTruncate validation failed");
-            self.reject(channel, "invalid KvTruncate request");
-            return;
-        }
-
-        let pipeline = match &self.pipeline {
-            Some(pipeline) => Arc::clone(pipeline),
-            None => {
-                warn!(%peer, "model not loaded yet");
-                self.reject(channel, "model not loaded");
-                return;
-            }
-        };
-
-        if let Err(error) = pipeline.truncate_kv_cache(request.target_seq_len) {
-            warn!(%peer, %error, "worker failed to truncate KV cache");
-            self.reject(channel, "failed to truncate KV cache");
-            return;
-        }
-
-        info!(
-            %peer,
-            trace_id = %request.trace_id,
-            target_seq_len = request.target_seq_len,
-            "worker truncated KV cache and acknowledged request"
-        );
-        self.send_response(
+        self.reject(
             channel,
-            super::super::ResponseMessage::KvTruncateAck(request),
+            "distributed speculative rollback is not enabled for protocol v1 sessions",
         );
     }
 
@@ -1213,6 +1343,10 @@ impl SynapseNode {
         peer: PeerId,
         channel: request_response::ResponseChannel<super::super::ResponseMessage>,
     ) {
+        if !self.authenticated_workers.contains(&peer) || self.revocations.contains(&peer) {
+            self.reject(channel, "unauthorized health probe");
+            return;
+        }
         info!(%peer, "received HealthPing, responding with HealthPong");
         let health = crate::Health {
             loaded_shard: None,
@@ -1233,44 +1367,79 @@ impl SynapseNode {
                 info!(%peer, accepted, "master acked capability ping");
             }
             super::super::ResponseMessage::ChallengeIssued(challenge) => {
-                info!(%peer, "received challenge from master, signing and sending response");
-
-                let identity =
-                    crate::NodeIdentity::load_or_create().expect("identity must exist for worker");
-
-                let signing_payload = challenge.signing_payload();
-                let signature = match identity.sign(&signing_payload) {
-                    Ok(sig) => sig,
-                    Err(e) => {
-                        warn!(%e, "failed to sign challenge");
-                        return;
-                    }
-                };
-
+                if !self.greeted_peers.contains(&peer) || self.revocations.contains(&peer) {
+                    return;
+                }
                 let SynapseRole::Worker { pairing_code, .. } = &self.role else {
                     return;
                 };
-
-                let pairing_code_hash = crate::hash_pairing_code(pairing_code);
-
-                let response = crate::ChallengeResponse {
-                    pairing_code_hash,
-                    nonce: challenge.nonce,
-                    signature,
-                    public_key: identity.public_key_bytes(),
+                let response = match crate::pairing::respond_to_challenge(
+                    &self.identity,
+                    &challenge,
+                    pairing_code,
+                    peer,
+                    super::assignments::unix_now(),
+                ) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        warn!(%peer,%error,"invalid coordinator challenge");
+                        return;
+                    }
                 };
-
-                self.swarm.behaviour_mut().request_response.send_request(
-                    &peer,
+                self.pending_coordinator_challenges.insert(peer, challenge);
+                if let Err(error) = self.send_tracked_request(
+                    peer,
                     super::super::RequestMessage::ChallengeResponse(response),
-                );
+                ) {
+                    warn!(%peer, %error, "pairing response not sent");
+                    self.pending_coordinator_challenges.remove(&peer);
+                }
             }
+            super::super::ResponseMessage::PairingAccepted(proof) => {
+                let Some(challenge) = self.pending_coordinator_challenges.remove(&peer) else {
+                    return;
+                };
+                let SynapseRole::Worker { pairing_code, .. } = &self.role else {
+                    return;
+                };
+                if self.revocations.contains(&peer)
+                    || crate::pairing::verify_coordinator_proof(
+                        &challenge,
+                        &proof,
+                        pairing_code,
+                        peer,
+                        self.local_peer_id(),
+                        super::assignments::unix_now(),
+                    )
+                    .is_err()
+                {
+                    warn!(%peer,"coordinator did not prove possession of pairing secret");
+                    let _ = self.swarm.disconnect_peer_id(peer);
+                    return;
+                }
+                self.authenticated_workers.insert(peer);
+                self.reset_redial_backoff();
+                info!(%peer,"coordinator mutually authenticated");
+                let mut capability =
+                    crate::WorkerCapability::from_probe(&crate::hardware::HardwareProbe::detect());
+                capability.compute_score = self.measured_compute_score.unwrap_or(1);
+                capability.available_ram_mb = self.memory_limit_bytes.div_ceil(1024 * 1024);
+                if let Err(error) = self.send_tracked_request(
+                    peer,
+                    super::super::RequestMessage::CapabilityPing(capability),
+                ) {
+                    warn!(%peer, %error, "capability confirmation not sent");
+                }
+            }
+            super::super::ResponseMessage::ShardReady(ready) => {
+                self.handle_shard_ready(peer, ready)
+            }
+            super::super::ResponseMessage::ShardReleased(_) => {}
             super::super::ResponseMessage::WeightTransfer(_transfer) => {
                 // Not implemented in this phase yet
             }
             super::super::ResponseMessage::Authenticated => {
-                info!(%peer, "worker authenticated by master");
-                self.reset_redial_backoff();
+                warn!(%peer,"obsolete unauthenticated acceptance rejected");
             }
             super::super::ResponseMessage::ActivationResponse(response) => {
                 if let Err(error) = response.validate() {
@@ -1338,6 +1507,19 @@ impl SynapseNode {
                 // Phase 1 Task 1.5: Record latency for adaptive timeout calculation
                 if let Some(dispatch_time) = in_flight.dispatch_time {
                     let latency = dispatch_time.elapsed();
+                    if in_flight.pass == ActivationPass::Decode {
+                        let context_limit = self.generation_context_limit();
+                        if let Some(entry) = self.worker_registry.entries.get_mut(&peer) {
+                            entry.observed_decode =
+                                Some(crate::inference::routing::DecodeObservation {
+                                    layers: current_hop.layer_range.len(),
+                                    context_limit,
+                                    elapsed_micros: latency.as_micros().min(u64::MAX as u128).max(1)
+                                        as u64,
+                                    sampled_at_unix: super::assignments::unix_now(),
+                                });
+                        }
+                    }
                     // Update per-worker latency window (last 20 samples)
                     self.worker_latencies
                         .entry(peer)
@@ -1366,11 +1548,11 @@ impl SynapseNode {
                     .map(|d| d.elapsed().as_secs_f32())
                     .unwrap_or(0.0);
                 if latency_secs > 0.0 && in_flight.sequence_position > 0 {
-                    let throughput = in_flight.sequence_position as f32 / latency_secs;
+                    let throughput = 1.0_f32 / latency_secs;
                     let recalibrated = self
                         .batch_profiles
                         .entry(peer)
-                        .or_insert_with(|| super::batch_tuning::BatchCalibration::new(peer))
+                        .or_insert_with(super::batch_tuning::BatchCalibration::new)
                         .record_sample(throughput);
                     if recalibrated {
                         info!(%peer, throughput, "batch calibration updated");
@@ -1399,9 +1581,14 @@ impl SynapseNode {
                     // before lm_head (the local-only path skips this entirely).
                     // Phase 5: the wire carries bf16; upcast to f32 before
                     // lm_head, which is tied to the f32 embedding weights.
-                    let worker_output = match payload_to_tensor(&response.logits)
-                        .and_then(|t| t.to_dtype(candle_core::DType::F32).map_err(Into::into))
-                    {
+                    let worker_output = match payload_to_tensor(&response.logits).and_then(|t| {
+                        t.to_dtype(
+                            self.pipeline
+                                .as_ref()
+                                .map_or(candle_core::DType::F32, |pipeline| pipeline.model_dtype()),
+                        )
+                        .map_err(Into::into)
+                    }) {
                         Ok(tensor) => tensor,
                         Err(error) => {
                             self.fail_generation(format!(
@@ -1475,7 +1662,7 @@ impl SynapseNode {
                 if self.healing_in_progress {
                     self.complete_healing();
                 } else {
-                    self.send_next_activation();
+                    self.local_step_pending = self.generation_active;
                 }
             }
             super::super::ResponseMessage::KvTruncateAck(ack) => {
@@ -1537,7 +1724,7 @@ impl SynapseNode {
                     target_seq_len = ack.target_seq_len,
                     "KV truncation acknowledged — resuming generation"
                 );
-                self.send_next_activation();
+                self.local_step_pending = self.generation_active;
             }
             super::super::ResponseMessage::HealthPong(health) => {
                 info!(%peer, latency_ms = ?health.latency_ms, "connection pre-warmed with HealthPong");
@@ -1658,6 +1845,7 @@ impl SynapseNode {
     /// adaptive timeout (or `WORKER_HOP_TIMEOUT` fallback), we assume the
     /// worker is dead and initiate self-healing to reroute through remaining workers.
     pub(super) fn check_worker_timeouts(&mut self) {
+        self.expire_assignments();
         if !self.generation_active || self.healing_in_progress {
             return;
         }
@@ -1697,99 +1885,10 @@ impl SynapseNode {
     /// saves current generation state, clears caches on the new route, and
     /// prepares for a fast prefill replay once acks arrive.
     pub(super) fn initiate_healing(&mut self, dead_peer: PeerId) {
-        if self.healing_in_progress {
-            warn!("healing already in progress, ignoring duplicate request");
-            return;
-        }
-
-        info!(%dead_peer, "removing dead peer and recomputing route");
-
-        // Remove the dead peer from all tracking.
         self.authenticated_workers.remove(&dead_peer);
-        self.worker_peers.retain(|p| *p != dead_peer);
+        self.worker_peers.retain(|peer| *peer != dead_peer);
         self.worker_registry.mark_disconnected(dead_peer);
-        self.pending_cache_reset_peers.remove(&dead_peer);
-        self.pending_truncate_peers.remove(&dead_peer);
-        self.in_flight_activation_hop = None;
-        self.spec_round = None;
-        self.awaiting_truncate_ack = false;
-        self.pending_truncate_trace_id = None;
-
-        // Save current generation state for replay.
-        self.healing_in_progress = true;
-        self.healing_saved_tokens = Some(self.token_ids.clone());
-        self.healing_saved_step = self.tokens_generated;
-
-        // Recompute route with remaining workers.
-        let workers_for_generation: Vec<_> = self
-            .worker_peers
-            .iter()
-            .copied()
-            .filter(|peer| self.authenticated_workers.contains(peer))
-            .map(|peer_id| RouteWorkerCandidate {
-                peer_id,
-                capability: self
-                    .worker_registry
-                    .capability_for(&peer_id)
-                    .as_ref()
-                    .and_then(WorkerCapabilitySnapshot::planner_capability),
-                wire_capability: self.worker_registry.wire_capability(&peer_id),
-            })
-            .collect();
-
-        let route_plan = match build_generation_route(
-            self.total_layers,
-            self.local_capability
-                .as_ref()
-                .and_then(WorkerCapabilitySnapshot::planner_capability),
-            &workers_for_generation,
-        ) {
-            Ok(plan) => plan,
-            Err(error) => {
-                warn!(%error, "self-healing route recomputation failed — falling back to fail");
-                self.healing_in_progress = false;
-                self.healing_saved_tokens = None;
-                self.fail_generation(format!("self-healing failed: {error}"));
-                return;
-            }
-        };
-
-        info!(
-            master_layers = ?route_plan.master_layer_range,
-            worker_count = route_plan.worker_hops.len(),
-            "self-healing: new route computed"
-        );
-
-        self.split_point = route_plan.master_layer_range.end;
-        self.generation_route_plan = Some(route_plan.clone());
-
-        // Clear caches on new route workers, then replay.
-        let cache_reset_peers: Vec<_> = route_plan
-            .worker_hops
-            .iter()
-            .map(|hop| hop.peer_id)
-            .collect();
-
-        // Clear master cache too for replay.
-        if let Some(pipeline) = &self.pipeline
-            && let Err(error) = pipeline.clear_kv_cache()
-        {
-            warn!(%error, "failed to clear master cache during healing");
-            self.healing_in_progress = false;
-            self.healing_saved_tokens = None;
-            self.fail_generation(format!("healing cache clear failed: {error}"));
-            return;
-        }
-
-        if cache_reset_peers.is_empty() {
-            // No workers in new route — complete healing immediately.
-            self.complete_healing();
-        } else {
-            self.send_clear_cache_requests(&cache_reset_peers);
-            // The ClearCacheAck handler will call complete_healing via
-            // send_next_activation, but we override it here: once all acks
-            // arrive during healing, we do a fast prefill replay instead.
-        }
+        self.fail_generation(format!("required worker {dead_peer} unavailable; session released without unsafe full-model fallback"));
     }
 
     /// Complete the self-healing process by replaying the prefill pass.
@@ -1803,7 +1902,7 @@ impl SynapseNode {
             None => {
                 warn!("healing complete but no saved tokens — resuming normal generation");
                 self.healing_in_progress = false;
-                self.send_next_activation();
+                self.local_step_pending = self.generation_active;
                 return;
             }
         };
@@ -1822,7 +1921,7 @@ impl SynapseNode {
 
         // Resume normal generation — the first send_next_activation call
         // will do a prefill (tokens_generated == 0), rebuilding KV caches.
-        self.send_next_activation();
+        self.local_step_pending = self.generation_active;
     }
 }
 
@@ -1915,28 +2014,47 @@ mod tests {
         let workers = vec![
             RouteWorkerCandidate {
                 peer_id: worker_a,
-                capability: None,
+                capability: Some(NodeCapability {
+                    compute_score: 1,
+                    available_ram_mb: 4096,
+                }),
                 wire_capability: None,
             },
             RouteWorkerCandidate {
                 peer_id: worker_b,
-                capability: None,
+                capability: Some(NodeCapability {
+                    compute_score: 1,
+                    available_ram_mb: 4096,
+                }),
                 wire_capability: None,
             },
             RouteWorkerCandidate {
                 peer_id: worker_c,
-                capability: None,
+                capability: Some(NodeCapability {
+                    compute_score: 1,
+                    available_ram_mb: 4096,
+                }),
                 wire_capability: None,
             },
             RouteWorkerCandidate {
                 peer_id: worker_d,
-                capability: None,
+                capability: Some(NodeCapability {
+                    compute_score: 1,
+                    available_ram_mb: 4096,
+                }),
                 wire_capability: None,
             },
         ];
 
-        let route_plan =
-            build_generation_route(17, None, &workers).expect("route planning should succeed");
+        let route_plan = build_generation_route(
+            17,
+            Some(NodeCapability {
+                compute_score: 1,
+                available_ram_mb: 4096,
+            }),
+            &workers,
+        )
+        .expect("route planning should succeed");
 
         let routed_workers: Vec<_> = route_plan
             .worker_hops
@@ -1963,16 +2081,25 @@ mod tests {
         let worker_b = PeerId::random();
         let route_plan = build_generation_route(
             8,
-            None,
+            Some(NodeCapability {
+                compute_score: 1,
+                available_ram_mb: 4096,
+            }),
             &[
                 RouteWorkerCandidate {
                     peer_id: worker_a,
-                    capability: None,
+                    capability: Some(NodeCapability {
+                        compute_score: 1,
+                        available_ram_mb: 4096,
+                    }),
                     wire_capability: None,
                 },
                 RouteWorkerCandidate {
                     peer_id: worker_b,
-                    capability: None,
+                    capability: Some(NodeCapability {
+                        compute_score: 1,
+                        available_ram_mb: 4096,
+                    }),
                     wire_capability: None,
                 },
             ],
@@ -2067,37 +2194,90 @@ mod tests {
     }
 
     #[test]
-    fn route_planner_falls_back_to_static_when_capabilities_missing() {
-        let worker_a = PeerId::random();
-        let worker_b = PeerId::random();
+    fn route_planner_rejects_unknown_memory_and_infeasible_routes() {
+        let worker = RouteWorkerCandidate {
+            peer_id: PeerId::random(),
+            capability: None,
+            wire_capability: None,
+        };
+        assert!(build_generation_route(8, None, &[]).is_err());
+        assert!(
+            build_generation_route(
+                8,
+                Some(NodeCapability {
+                    compute_score: 1,
+                    available_ram_mb: 4096
+                }),
+                &[worker]
+            )
+            .is_err()
+        );
+        assert!(
+            build_generation_route(
+                8,
+                Some(NodeCapability {
+                    compute_score: 1,
+                    available_ram_mb: 50
+                }),
+                &[]
+            )
+            .is_err()
+        );
+    }
 
-        let route_plan = build_generation_route(
-            8,
+    #[test]
+    fn wire_capability_never_shifts_workers_beyond_model_end() {
+        let capability = crate::WorkerCapability {
+            compute_score: 1,
+            available_ram_mb: 4096,
+            hardware: crate::HardwareSummary {
+                has_gpu: false,
+                backend: crate::ComputeBackend::Cpu,
+                estimated_fp16_tflops: None,
+                vram_total_bytes: None,
+                vram_free_bytes: None,
+                cpu_threads: 1,
+            },
+        };
+        let worker = RouteWorkerCandidate {
+            peer_id: PeerId::random(),
+            capability: None,
+            wire_capability: Some(capability),
+        };
+        let route = build_generation_route(
+            12,
             Some(NodeCapability {
-                compute_score: 10,
-                available_ram_mb: 4_096,
+                compute_score: 1,
+                available_ram_mb: 4096,
             }),
-            &[
-                RouteWorkerCandidate {
-                    peer_id: worker_a,
-                    capability: None,
-                    wire_capability: None,
-                },
-                RouteWorkerCandidate {
-                    peer_id: worker_b,
-                    capability: Some(NodeCapability {
-                        compute_score: 1,
-                        available_ram_mb: 4_096,
-                    }),
-                    wire_capability: None,
-                },
-            ],
+            &[worker],
         )
-        .expect("fallback route planning should work");
+        .unwrap();
+        assert_eq!(route.master_layer_range, 0..6);
+        assert_eq!(route.worker_hops[0].layer_range, 6..12);
+    }
 
-        assert_eq!(route_plan.master_layer_range, 0..3);
-        assert_eq!(route_plan.worker_hops[0].layer_range, 3..6);
-        assert_eq!(route_plan.worker_hops[1].layer_range, 6..8);
+    #[test]
+    fn coordinator_can_own_no_transformer_layers() {
+        let worker = RouteWorkerCandidate {
+            peer_id: PeerId::random(),
+            capability: Some(NodeCapability {
+                compute_score: 1,
+                available_ram_mb: 4096,
+            }),
+            wire_capability: None,
+        };
+        let route = build_generation_route(
+            12,
+            Some(NodeCapability {
+                compute_score: 1,
+                available_ram_mb: 0,
+            }),
+            &[worker],
+        )
+        .unwrap();
+        assert_eq!(route.master_layer_range, 0..0);
+        assert_eq!(route.worker_hops[0].layer_range, 0..12);
     }
 
     #[test]
@@ -2106,16 +2286,25 @@ mod tests {
         let worker_b = PeerId::random();
         let route_plan = build_generation_route(
             8,
-            None,
+            Some(NodeCapability {
+                compute_score: 1,
+                available_ram_mb: 4096,
+            }),
             &[
                 RouteWorkerCandidate {
                     peer_id: worker_a,
-                    capability: None,
+                    capability: Some(NodeCapability {
+                        compute_score: 1,
+                        available_ram_mb: 4096,
+                    }),
                     wire_capability: None,
                 },
                 RouteWorkerCandidate {
                     peer_id: worker_b,
-                    capability: None,
+                    capability: Some(NodeCapability {
+                        compute_score: 1,
+                        available_ram_mb: 4096,
+                    }),
                     wire_capability: None,
                 },
             ],

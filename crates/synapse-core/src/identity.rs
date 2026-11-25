@@ -4,7 +4,8 @@
 //! This allows the same node to keep its PeerId across restarts, which is
 //! required for DHT stability and peer reputation.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use libp2p::PeerId;
@@ -15,6 +16,7 @@ use tracing::{info, warn};
 const SYNAPSE_DIR: &str = ".synapse";
 /// Filename for the persisted Ed25519 keypair.
 const IDENTITY_FILE: &str = "identity.key";
+const MAX_KEY_FILE_BYTES: u64 = 4096;
 
 /// Errors that can occur during identity operations.
 #[derive(Debug, thiserror::Error)]
@@ -25,6 +27,8 @@ pub enum IdentityError {
     InvalidKey(String),
     #[error("home directory not found")]
     NoHomeDir,
+    #[error("file has an unsafe type, owner, permissions, or size")]
+    UnsafeFile,
 }
 
 /// A persistent node identity backed by an Ed25519 keypair.
@@ -40,19 +44,43 @@ impl NodeIdentity {
     pub fn load_or_create() -> Result<Self, IdentityError> {
         let key_path = default_key_path_with_override()?;
 
-        if key_path.exists() {
-            Self::load_from_path(&key_path)
-        } else {
-            Self::create_at_path(&key_path)
+        Self::load_or_create_at(&key_path)
+    }
+
+    /// Use an explicit path without a process-global override. Creation is
+    /// exclusive: concurrent starters converge on the same persisted key.
+    pub fn load_or_create_at(path: &Path) -> Result<Self, IdentityError> {
+        match Self::load_from_path(path) {
+            Ok(identity) => Ok(identity),
+            Err(IdentityError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                match Self::create_at_path(path) {
+                    Err(IdentityError::Io(error))
+                        if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                    {
+                        Self::load_from_path(path)
+                    }
+                    result => result,
+                }
+            }
+            error => error,
         }
     }
 
     /// Load from a specific path.
     pub fn load_from_path(path: &Path) -> Result<Self, IdentityError> {
-        let bytes = fs::read(path).map_err(|e| {
+        let mut file = open_private_file(path).map_err(|e| {
             warn!(path = ?path, error = %e, "failed to read identity file");
             e
         })?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(MAX_KEY_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_KEY_FILE_BYTES {
+            return Err(IdentityError::InvalidKey(
+                "key file exceeds size limit".into(),
+            ));
+        }
 
         let keypair = Keypair::from_protobuf_encoding(&bytes)
             .map_err(|e| IdentityError::InvalidKey(e.to_string()))?;
@@ -71,7 +99,7 @@ impl NodeIdentity {
     fn create_at_path(path: &Path) -> Result<Self, IdentityError> {
         // Ensure parent directory exists.
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            create_private_dir(parent)?;
         }
 
         let keypair = Keypair::generate_ed25519();
@@ -81,7 +109,7 @@ impl NodeIdentity {
             .to_protobuf_encoding()
             .map_err(|e| IdentityError::InvalidKey(e.to_string()))?;
 
-        fs::write(path, &bytes)?;
+        publish_private_state_new(path, &bytes)?;
         info!(%peer_id, path = ?path, "generated and persisted new identity");
 
         Ok(Self {
@@ -140,6 +168,24 @@ impl NodeIdentity {
         }
     }
 
+    /// Bind an application signature to the identity authenticated by libp2p.
+    /// A valid signature from a different key is never accepted for `peer`.
+    pub fn verify_remote_peer(
+        peer: PeerId,
+        public_key_bytes: &[u8],
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<(), IdentityError> {
+        let public_key = libp2p::identity::PublicKey::try_decode_protobuf(public_key_bytes)
+            .map_err(|e| IdentityError::InvalidKey(e.to_string()))?;
+        if public_key.to_peer_id() != peer || !public_key.verify(data, signature) {
+            return Err(IdentityError::InvalidKey(
+                "identity proof did not match peer".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Display the identity as a human-readable string.
     pub fn display_short(&self) -> String {
         let peer_str = self.peer_id.to_string();
@@ -149,6 +195,298 @@ impl NodeIdentity {
         } else {
             peer_str
         }
+    }
+}
+
+fn create_private_dir(path: &Path) -> Result<(), std::io::Error> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn private_create_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+}
+
+fn open_private_file(path: &Path) -> Result<File, IdentityError> {
+    open_private_file_bounded(path, MAX_KEY_FILE_BYTES)
+}
+
+fn open_private_file_bounded(path: &Path, max_bytes: u64) -> Result<File, IdentityError> {
+    open_owned_file_bounded(path, max_bytes, 0o077)
+}
+
+fn open_owned_file_bounded(
+    path: &Path,
+    max_bytes: u64,
+    forbidden_mode: u32,
+) -> Result<File, IdentityError> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.file_type().is_file() || before.len() > max_bytes {
+        return Err(IdentityError::UnsafeFile);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(IdentityError::UnsafeFile);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & forbidden_mode != 0
+            // SAFETY: geteuid has no arguments or pointer preconditions.
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(IdentityError::UnsafeFile);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = forbidden_mode;
+    Ok(file)
+}
+
+/// Read an owned, regular private file without following its final symlink.
+/// The caller selects a trusted parent directory and an explicit byte limit.
+/// On Unix, group/other access and a different owner are rejected.
+pub fn read_private_state(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let file = open_private_file_bounded(path, max_bytes).map_err(|error| match error {
+        IdentityError::Io(error) => error,
+        error => std::io::Error::other(error),
+    })?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::other("private state exceeds size limit"));
+    }
+    Ok(bytes)
+}
+
+/// Read a bounded non-secret configuration file. Unlike secret state, it may
+/// be readable by other users, but must be owned, regular and not writable by
+/// other users on Unix. The final path component is never followed as a symlink.
+pub fn read_owned_config(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let file = open_owned_file_bounded(path, max_bytes, 0o022).map_err(|error| match error {
+        IdentityError::Io(error) => error,
+        error => std::io::Error::other(error),
+    })?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::other("configuration exceeds size limit"));
+    }
+    Ok(bytes)
+}
+
+/// Atomically publish a new private file without replacing an existing name.
+/// The caller selects the path and bounds `bytes`; existing parent directories
+/// must be trusted. Concurrent creators either publish or get AlreadyExists.
+pub fn publish_private_state_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use rand::RngCore;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    create_private_dir(parent)?;
+    let mut nonce = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let name: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let temporary = parent.join(format!(".synapse-key-{name}.tmp"));
+    let result = (|| {
+        let mut file = private_create_options().open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        // hard_link publishes a complete file atomically and fails if the
+        // destination already exists, including when it is a symlink.
+        fs::hard_link(&temporary, path)?;
+        #[cfg(unix)]
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
+}
+
+/// Atomically replace a small private state file in the same directory.
+/// Temp files use exclusive creation, mode 0600 and an unpredictable name.
+/// The caller must choose a trusted parent, bound `bytes`, and serialize
+/// read/modify/write operations when multiple writers share application state.
+pub fn write_private_state(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use rand::RngCore;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    create_private_dir(parent)?;
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && !metadata.file_type().is_file()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "state destination is not a regular file",
+        ));
+    }
+    let mut nonce = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let name: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let temporary = parent.join(format!(".synapse-{name}.tmp"));
+    let result = (|| {
+        let mut file = private_create_options().open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Require a real directory owned by this process's effective user. On Unix,
+/// another user must not be able to replace names inside it. Read/execute access
+/// is permitted; files created by the private-state helpers remain mode 0600.
+pub fn validate_owned_directory(path: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::other(
+            "configuration parent must be a real directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o022 != 0
+            // SAFETY: geteuid has no arguments or pointer preconditions.
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(std::io::Error::other(
+                "configuration parent must be owned and not writable by others",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Serialize read/modify/write of a state file across processes. The lock file
+/// remains in place; deleting it would let another process lock a new inode.
+/// OS locks release automatically after crashes or when this File is dropped.
+pub(crate) fn lock_private_state(path: &Path) -> std::io::Result<File> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    create_private_dir(parent)?;
+    let mut lock_name = path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(PathBuf::from(lock_name))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("state lock is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0
+            // SAFETY: geteuid has no arguments or pointer preconditions.
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(std::io::Error::other(
+                "state lock must be private and owned",
+            ));
+        }
+    }
+    file.try_lock().map_err(std::io::Error::other)?;
+    Ok(file)
+}
+
+/// Persisted deny list. Revocation is monotonic; a rotated device must enroll
+/// with a new PeerId. Restarts must not restore previously revoked access.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevocationList {
+    revoked: std::collections::BTreeSet<String>,
+}
+
+impl RevocationList {
+    pub fn load(path: &Path) -> Result<Self, IdentityError> {
+        let bytes = match read_private_state(path, 1024 * 1024) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if bytes.len() > 1024 * 1024 {
+            return Err(IdentityError::InvalidKey(
+                "revocation list exceeds size limit".into(),
+            ));
+        }
+        let list: Self = serde_json::from_slice(&bytes)
+            .map_err(|e| IdentityError::InvalidKey(format!("invalid revocation list: {e}")))?;
+        if list.revoked.len() > 10_000
+            || list
+                .revoked
+                .iter()
+                .any(|peer| peer.parse::<PeerId>().is_err())
+        {
+            return Err(IdentityError::InvalidKey(
+                "invalid revoked peer list".into(),
+            ));
+        }
+        Ok(list)
+    }
+
+    pub fn contains(&self, peer: &PeerId) -> bool {
+        self.revoked.contains(&peer.to_string())
+    }
+
+    /// Commit to disk before changing the live deny list.
+    pub fn revoke(&mut self, peer: PeerId, path: &Path) -> Result<(), IdentityError> {
+        let _lock = lock_private_state(path)?;
+        let mut next = Self::load(path)?;
+        next.revoked.extend(self.revoked.iter().cloned());
+        if next.revoked.len() > 10_000 || (next.revoked.len() == 10_000 && !next.contains(&peer)) {
+            return Err(IdentityError::InvalidKey("revocation list is full".into()));
+        }
+        next.revoked.insert(peer.to_string());
+        let bytes =
+            serde_json::to_vec(&next).map_err(|e| IdentityError::InvalidKey(e.to_string()))?;
+        write_private_state(path, &bytes)?;
+        *self = next;
+        Ok(())
     }
 }
 
@@ -276,5 +614,160 @@ mod tests {
         let identity = NodeIdentity::create_at_path(&path).unwrap();
         let display = identity.display_short();
         assert!(display.contains("..."));
+    }
+
+    #[test]
+    fn creation_never_overwrites_an_identity() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("device.key");
+        let original = NodeIdentity::create_at_path(&path).unwrap();
+        assert!(NodeIdentity::create_at_path(&path).is_err());
+        assert_eq!(
+            NodeIdentity::load_or_create_at(&path).unwrap().peer_id(),
+            original.peer_id()
+        );
+    }
+
+    #[test]
+    fn concurrent_creation_converges_on_one_complete_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("device.key");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    NodeIdentity::load_or_create_at(&path).unwrap().peer_id()
+                })
+            })
+            .collect();
+        let ids: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(ids.iter().all(|peer| *peer == ids[0]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_keys_reject_symlinks_and_insecure_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("device.key");
+        NodeIdentity::create_at_path(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let link = dir.path().join("alias.key");
+        symlink(&path, &link).unwrap();
+        assert!(matches!(
+            NodeIdentity::load_from_path(&link),
+            Err(IdentityError::UnsafeFile)
+        ));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            NodeIdentity::load_from_path(&path),
+            Err(IdentityError::UnsafeFile)
+        ));
+    }
+
+    #[test]
+    fn identity_proof_is_bound_to_transport_peer() {
+        let dir = TempDir::new().unwrap();
+        let identity = NodeIdentity::create_at_path(&dir.path().join("device.key")).unwrap();
+        let proof = identity.sign(b"proof").unwrap();
+        assert!(
+            NodeIdentity::verify_remote_peer(
+                identity.peer_id(),
+                &identity.public_key_bytes(),
+                b"proof",
+                &proof
+            )
+            .is_ok()
+        );
+        assert!(
+            NodeIdentity::verify_remote_peer(
+                PeerId::random(),
+                &identity.public_key_bytes(),
+                b"proof",
+                &proof
+            )
+            .is_err()
+        );
+        assert!(
+            NodeIdentity::verify_remote_peer(
+                identity.peer_id(),
+                &identity.public_key_bytes(),
+                b"other",
+                &proof
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn revoked_old_key_stays_revoked_after_restart_and_rotation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("revoked.json");
+        let old = NodeIdentity::create_at_path(&dir.path().join("old.key")).unwrap();
+        let new = NodeIdentity::create_at_path(&dir.path().join("new.key")).unwrap();
+        let mut list = RevocationList::default();
+        list.revoke(old.peer_id(), &path).unwrap();
+        list.revoke(old.peer_id(), &path).unwrap();
+        let loaded = RevocationList::load(&path).unwrap();
+        assert!(loaded.contains(&old.peer_id()));
+        assert!(!loaded.contains(&new.peer_id()));
+    }
+
+    #[test]
+    fn failed_revocation_write_does_not_change_memory() {
+        let dir = TempDir::new().unwrap();
+        let peer = PeerId::random();
+        let mut list = RevocationList::default();
+        assert!(list.revoke(peer, dir.path()).is_err());
+        assert!(!list.contains(&peer));
+    }
+
+    #[test]
+    fn independent_revokers_preserve_each_others_durable_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("revoked.json");
+        let mut first = RevocationList::default();
+        let mut second = RevocationList::default();
+        let a = PeerId::random();
+        let b = PeerId::random();
+        first.revoke(a, &path).unwrap();
+        second.revoke(b, &path).unwrap();
+        let loaded = RevocationList::load(&path).unwrap();
+        assert!(loaded.contains(&a) && loaded.contains(&b));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_security_state_does_not_follow_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("revoked.json");
+        RevocationList::default()
+            .revoke(PeerId::random(), &path)
+            .unwrap();
+        let link = dir.path().join("alias.json");
+        std::os::unix::fs::symlink(path, &link).unwrap();
+        assert!(RevocationList::load(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_state_lock_cannot_guard_a_security_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("revoked.json");
+        let lock = dir.path().join("revoked.json.lock");
+        fs::write(&lock, "").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap();
+        let mut revoked = RevocationList::default();
+        let peer = PeerId::random();
+        assert!(revoked.revoke(peer, &path).is_err());
+        assert!(!revoked.contains(&peer));
+        assert!(!path.exists());
     }
 }

@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "publishers": [
+    {
+      "peer_id": "12D3KooWRoV8R1ZwUQVM58npWUnVdLhKw6j2MVx9YmST2ZQ8LHVW",
+      "public_key": [
+        8,
+        1,
+        18,
+        32,
+        237,
+        129,
+        71,
+        142,
+        178,
+        38,
+        108,
+        191,
+        115,
+        58,
+        139,
+        213,
+        20,
+        50,
+        64,
+        100,
+        214,
+        2,
+        121,
+        239,
+        236,
+        224,
+        197,
+        84,
+        186,
+        48,
+        119,
+        124,
+        136,
+        159,
+        148,
+        253
+      ]
+    }
+  ],
+  "revoked_publishers": [],
+  "revoked_models": []
+}

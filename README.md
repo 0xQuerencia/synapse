@@ -1,51 +1,75 @@
-# synapse
+# Synapse
 
-Run one language model across many computers, as if they were one computer.
+**Your devices. One AI.**
 
-Synapse cuts a model into layers and hands the pieces out over a peer to peer network. Your laptop holds the bottom of the network, a desktop across the room holds the top, and tokens flow between them while you chat. No cluster to rent, no cloud bill, no weights leaving your machines.
+Synapse is an experimental Rust application for running compatible language models locally and across explicitly trusted computers. It has a Candle inference runtime, authenticated libp2p transport, a command line, a local device workspace, and a small compatible chat API.
 
-## how it works
+The current implementation tranche covers **34 planned work packages**: 01–21, 25–26, 33, 39–45, and 51–53. The code and local evidence include real independent processes exchanging tensors, exact transformer-layer placement, verified model artifacts, authenticated streaming, worker controls, and a signed model cache. **Separate physical-device memory savings and real WAN reliability remain unaccepted gates.** The original offline fixture tests numerical mechanics; it does not produce useful language or establish compatibility with arbitrary checkpoints.
 
-1. The master owns the embedding, the first chunk of layers, and the output head. It runs the show: pairing codes, routing, sampling.
-2. Workers take the rest of the layers. A token hops from the master through each worker and back, one hidden state at a time.
-3. An optional relay on a public machine lets people behind home routers find each other. It relays encrypted traffic and seeds discovery.
+Work-package labels such as `[PR-07]` identify planned scope. They are not GitHub pull-request numbers or acceptance stamps. This tranche has **zero published GitHub PRs, zero published release artifacts, and no production deployment**. Exact integrated revision, commands, results and remaining failures belong to the [final tranche evidence](docs/evidence/final-tranche.md).
 
-Peers find each other three ways. On one network, multicast DNS just works. Across the internet, a DHT keyed by model id locates masters serving the model you want. When both sides sit behind NAT, relay circuits plus hole punching connect them.
+## Start here
 
-## getting started
+- [Implementation, local evidence and acceptance status](docs/IMPLEMENTATION_STATUS.md)
+- [Developer quickstart](docs/quickstart.md)
+- [Master plan: architecture, 56 packages and exit gates](docs/MASTER_PLAN.md)
+- [Remaining gaps](docs/GAPS.md) and [machine-readable gates](docs/evidence/gates.json)
+- [Trust and privacy](SECURITY.md), [model approval/cache](docs/model-catalog.md), and [package installation](docs/release-installation.md)
+- [License and provenance record](docs/upstream-provenance.md)
 
+## Run the original offline fixture
+
+Initial validated development environment: Linux x86_64 CPU with the repository's pinned Rust toolchain. Build dependencies still need to be available; the fixture itself requires no model download.
+
+```sh
+cargo build --workspace --locked
+./target/debug/synapse doctor \
+  --model-dir crates/synapse-core/tests/fixtures/tiny-llama
+./target/debug/synapse infer \
+  --model-dir crates/synapse-core/tests/fixtures/tiny-llama \
+  --prompt "<s> </s> Hello" --max-tokens 8
 ```
-git clone <repo url>
-cd synapse
-cargo build
+
+Run actual coordinator/worker processes with separate test identities and retained evidence:
+
+```sh
+./scripts/demo_two_nodes.sh \
+  --binary target/debug/synapse \
+  --workers 1 --coordinator-only
 ```
 
-Rust is the only requirement. Candle does the math, libp2p does the networking, and everything is tuned for the cpu you build on, so a plain build is already quick.
+The harness checks token positions, exact layer coverage, worker execution and independent reference output. It removes test secrets and terminates only the processes it started. This is a same-host loopback experiment. The [quickstart](docs/quickstart.md) includes a forced three-process memory-budget experiment, local GUI authentication and the limits of these results.
 
-## running a session
+## What is available, and what remains gated
 
+| Surface | Current implementation | Remaining acceptance |
+| --- | --- | --- |
+| Local inference | Manifest verification, supported Llama fixture, bounded generation, explicit prompt/template handling | Useful model and hardware compatibility matrix; rights review |
+| Private cluster | Authenticated prepare/ready/release, partial tensor loading, exact ranges, admission, correlated transport and worker controls | Two physical devices, measured memory benefit and separate-network direct/relay inference |
+| Local HTTP and device workspace | Protected login, Host/Origin checks, real status, streaming and documented chat subset | Independent usability, broader platform qualification and external security review |
+| Model cache and native package tools | Explicit trusted publishers and rights, atomic verified cache, signed package checks, staged update/rollback/uninstall | Production key ownership, approved third-party models and fresh-machine release validation |
+| Public landing | Responsive static site with an interactive, clearly labeled local resource simulator | Publication is a separate action; no user, earnings or benchmark claims are fabricated |
+| Community compute and credits | Planned architecture only | Hosted membership, transactional accounting, verification, operator budget and pilot approval |
+| Open public swarm | Research only | Independent adversarial, privacy and economic review |
+
+Sharing model files and executing inference are distinct operations. A full-model host can be more practical than a chain of distant workers. A hash or signature does not establish model quality, sufficient memory, permission to redistribute, or a trustworthy computing peer.
+
+## Trust and resource controls
+
+Private participation is explicit. Pause, drain and stop must reflect acknowledgements from the actual worker. The runtime distinguishes model-shaped inference reservations from operating-system limits; Linux address-space limiting is a dedicated worker option, not a portable sandbox or a resident-memory guarantee.
+
+Transport encryption protects data in transit. Computing peers may see prompts or infer information from activations. Use trusted devices and appropriate data. Local/private inference makes no community billing calls and must not silently switch to unapproved external compute. Planned credits are noncash usage accounting, with no promised earnings, transfer value or guaranteed available capacity.
+
+The compatible local subset supports `GET /v1/models` and `POST /v1/chat/completions`, including bounded streaming and usage. Unsupported tools, modalities and sampling options fail explicitly. See the [API contract](docs/protocols/api.md); this is not a claim of complete compatibility with every chat client.
+
+## Development and release status
+
+```sh
+./scripts/verify_all.sh
+python3 schemas/check.py --source-root . --wire-root .
+python3 schemas/check_catalog.py --source-root .
 ```
-synapse host
-synapse join
-synapse demo
-```
 
-Host starts a master and prints a pairing code. Join connects a worker to that master with the code. Demo runs the whole thing on one machine with no network, which is the fastest way to check a build.
+The contract checks need the pinned Python dependency in `schemas/requirements.txt`; the catalog signature check also uses OpenSSL. Other concrete harnesses and their scope are listed in the quickstart. Local checks do not stand in for remote CI, an independent audit or physical tests. Preserve failed and blocked evidence when repeating a run.
 
-Each command takes options. The useful ones: the model option points at any small llama model on Hugging Face, join wants the code the host printed, and the prompt option skips typing. Pass the help flag for the full list.
-
-## the gui
-
-There is also a local web interface in the gui crate. Build it, run the binary it produces, and it prints a local url. You get the console, a live network map, per node hardware stats, and a connect by code panel. A contribute page exists too, for handing friends a pre filled join link.
-
-## config
-
-Relay and bootstrap addresses live in toml files under config. Entries must be full multiaddrs ending in the peer id. Placeholders are skipped at load.
-
-## security
-
-Every peer is untrusted by default. Wire payloads are validated, tensor shapes and dtypes are checked, channels are bounded, and pairing codes never show up in logs after auth. Remote model paths are never accepted for execution.
-
-## status
-
-Working today: sharded inference on LAN and internet, self healing routes when a worker drops, speculative decoding, continuous batching, live telemetry. Next: true batched forward passes and smarter multi worker scheduling.
+Read [contributing](CONTRIBUTING.md) before modifying the runtime. The root [LICENSE](LICENSE) contains MIT terms; workspace package metadata says Apache-2.0. That discrepancy remains unresolved. This work preserves the root license and does not decide ownership or relicense prior contributions. Resolve the [provenance questions](docs/upstream-provenance.md) before releasing packages or approving third-party distribution.

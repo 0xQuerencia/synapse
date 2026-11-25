@@ -1,0 +1,7 @@
+{
+  "total_layers": 8,
+  "layer_start": 2,
+  "layer_end": 6,
+  "dtype": "F32",
+  "max_sequence_len": 512
+}

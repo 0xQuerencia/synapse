@@ -1,0 +1,2 @@
+# Only the live GUI/WebSocket process harness needs this dependency.
+websockets==16.0

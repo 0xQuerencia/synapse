@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:synapse:schema:signed-availability-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "peer_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "key": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{16}$"
+        },
+        "route_epoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
+        "model_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$"
+        }
+      },
+      "required": [
+        "session_id",
+        "route_epoch",
+        "model_digest"
+      ]
+    },
+    "layer_start": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1023
+    },
+    "layer_end": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1024
+    },
+    "total_layers": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1024
+    },
+    "backend": {
+      "enum": [
+        "llama-safetensors",
+        "llama-gguf"
+      ]
+    },
+    "resident_weight_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "issued_at_unix": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "expires_at_unix": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "public_key": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 255
+      },
+      "minItems": 1,
+      "maxItems": 128
+    },
+    "signature": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 255
+      },
+      "minItems": 64,
+      "maxItems": 64
+    }
+  },
+  "required": [
+    "schema_version",
+    "peer_id",
+    "key",
+    "layer_start",
+    "layer_end",
+    "total_layers",
+    "backend",
+    "resident_weight_bytes",
+    "sequence",
+    "issued_at_unix",
+    "expires_at_unix",
+    "public_key",
+    "signature"
+  ]
+}

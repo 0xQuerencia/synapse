@@ -24,7 +24,7 @@ impl SynapseNode {
             let sum: Duration = latencies.iter().sum();
             let avg = sum / latencies.len() as u32;
             // 2× safety margin
-            return avg * 2;
+            return (avg * 2).clamp(Duration::from_secs(1), Duration::from_secs(30));
         }
 
         // Fall back to the in-flight worker's historical latency
@@ -38,7 +38,7 @@ impl SynapseNode {
             {
                 let sum: Duration = latencies.iter().sum();
                 let avg = sum / latencies.len() as u32;
-                return avg * 2;
+                return (avg * 2).clamp(Duration::from_secs(1), Duration::from_secs(30));
             }
         }
 

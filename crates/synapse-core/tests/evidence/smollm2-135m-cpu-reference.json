@@ -1,0 +1,62 @@
+{
+  "dtype": "F32",
+  "full_memory_context32": {
+    "kv_bytes": 1474560,
+    "load_scratch_bytes": 113248512,
+    "scratch_bytes": 4030464,
+    "total_bytes": 765603328,
+    "weights_bytes": 652354816
+  },
+  "greedy_matches": 8,
+  "host_half_memory_context32": {
+    "kv_bytes": 737280,
+    "load_scratch_bytes": 113248512,
+    "scratch_bytes": 4030464,
+    "total_bytes": 553197568,
+    "weights_bytes": 439949056
+  },
+  "manifest_sha256": "4e44657e25c6f41421f24b9e92756acaaf08834dad8d187494385b65e21543cb",
+  "max_abs_logit_error": 5.1975250244140625e-05,
+  "model_id": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "note": "This is a concrete sample and numerical comparison, not a general language-quality benchmark.",
+  "prompt_token_count": 22,
+  "reference": "candle-transformers 0.8.4 models::llama",
+  "reference_greedy_tokens_on_same_prefixes": [
+    504,
+    3575,
+    282,
+    4649,
+    314,
+    7042,
+    30,
+    2
+  ],
+  "resident_weight_bytes": 652354816,
+  "revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
+  "stored_dtype": "bfloat16",
+  "text": "The capital of France is Paris.",
+  "tokens": [
+    504,
+    3575,
+    282,
+    4649,
+    314,
+    7042,
+    30,
+    2
+  ],
+  "worker_half_memory_context32": {
+    "kv_bytes": 737280,
+    "load_scratch_bytes": 14160384,
+    "scratch_bytes": 2457600,
+    "total_bytes": 227614720,
+    "weights_bytes": 213454336
+  },
+  "comparison_decode_ms": 922.321372,
+  "prompt": "<|im_start|>user\nWhat is the capital of France? Answer in one short sentence.<|im_end|>\n<|im_start|>assistant\n",
+  "max_new_tokens_requested": 16,
+  "ended_on_configured_eos": true,
+  "reference_match_note": "All 8 tokens, including EOS 2, matched separate Candle Llama on identical prefixes. The run ended at EOS before the requested 16-token maximum.",
+  "memory_measurement_note": "resident_weight_bytes counts actual loaded tensors. Reservations add modeled KV, inference scratch and loading scratch; neither quantity is whole-process RSS. Timing includes both implementations and verification work.",
+  "source_note": "Weights were downloaded privately by the materialization example and are excluded from this repository. The immutable revision and complete manifest digest identify the exact artifacts."
+}

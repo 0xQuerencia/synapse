@@ -3,7 +3,9 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: &str = "synapse/0.3.0";
+pub const PROTOCOL_VERSION: &str = "synapse/0.4.0";
+pub const CHALLENGE_TTL_SECS: u64 = 60;
+pub const MAX_CLOCK_SKEW_SECS: u64 = 5;
 
 /// Maximum nonce length (bytes, hex-encoded).
 pub const MAX_NONCE_LEN: usize = 128;
@@ -89,6 +91,38 @@ pub struct WorkerCapability {
 }
 
 impl WorkerCapability {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        let invalid = |field| ProtocolError::InvalidField {
+            field,
+            reason: "capability outside supported bounds",
+        };
+        if self.compute_score == 0 || self.compute_score > MAX_COMPUTE_SCORE {
+            return Err(invalid("compute_score"));
+        }
+        if self.available_ram_mb == 0 || self.available_ram_mb > MAX_AVAILABLE_RAM_MB {
+            return Err(invalid("available_ram_mb"));
+        }
+        let hardware = &self.hardware;
+        if hardware.cpu_threads == 0 || hardware.cpu_threads > MAX_CPU_THREADS {
+            return Err(invalid("cpu_threads"));
+        }
+        if hardware.has_gpu == (hardware.backend == ComputeBackend::Cpu) {
+            return Err(invalid("backend"));
+        }
+        if hardware
+            .estimated_fp16_tflops
+            .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1_000_000.0)
+        {
+            return Err(invalid("estimated_fp16_tflops"));
+        }
+        if let (Some(free), Some(total)) = (hardware.vram_free_bytes, hardware.vram_total_bytes)
+            && (free > total || total > MAX_AVAILABLE_RAM_MB * 1024 * 1024)
+        {
+            return Err(invalid("vram"));
+        }
+        Ok(())
+    }
+
     /// Build from a `HardwareProbe`. Used at startup and on heartbeat.
     pub fn from_probe(probe: &crate::hardware::HardwareProbe) -> Self {
         let compute_score = if probe.has_accelerator {
@@ -167,6 +201,9 @@ impl NodeHello {
         require_protocol_version(&self.protocol_version)?;
         self.model.validate()?;
         validate_printable("platform", &self.platform, 1, MAX_PLATFORM_LEN)?;
+        if let Some(capability) = &self.capability {
+            capability.validate()?;
+        }
 
         if self.cpu_threads == 0 {
             return Err(ProtocolError::InvalidField {
@@ -385,14 +422,29 @@ impl TensorPayload {
     /// original (uncompressed) buffer; the caller validates length
     /// against `shape × dtype.bytes_per_element()`.
     pub fn decompress(&self) -> anyhow::Result<Vec<u8>> {
-        use anyhow::Context;
-        match self.compression {
-            CompressionCodec::None => Ok(self.data.clone()),
-            c => crate::inference::compression::decompress(&self.data, c).context("decompress"),
-        }
+        self.validate()?;
+        crate::inference::compression::decompress_exact(
+            &self.data,
+            self.compression,
+            self.original_size,
+        )
     }
 
     pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.compressed_size != self.data.len() {
+            return Err(ProtocolError::TensorByteLength {
+                expected: self.compressed_size,
+                actual: self.data.len(),
+            });
+        }
+        if let CompressionCodec::Zstd { level } = self.compression
+            && !(1..=22).contains(&level)
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "compression",
+                reason: "unsupported Zstd level",
+            });
+        }
         // We bound the *wire-visible* buffer (data, possibly compressed).
         if self.data.len() > MAX_TENSOR_BYTES {
             return Err(ProtocolError::TensorTooLarge {
@@ -437,6 +489,12 @@ impl TensorPayload {
                 field: "tensor byte count",
             },
         )?;
+        if expected != self.original_size {
+            return Err(ProtocolError::TensorByteLength {
+                expected,
+                actual: self.original_size,
+            });
+        }
 
         // For uncompressed payloads, the wire buffer must equal the
         // element buffer. For compressed payloads, the *original*
@@ -647,6 +705,17 @@ impl Challenge {
         Ok(())
     }
 
+    pub fn validate_at(&self, now: u64) -> Result<(), ProtocolError> {
+        self.validate()?;
+        if self.nonce.len() != 32
+            || self.timestamp > now.saturating_add(MAX_CLOCK_SKEW_SECS)
+            || now.saturating_sub(self.timestamp) >= CHALLENGE_TTL_SECS
+        {
+            return Err(ProtocolError::AuthenticationFailed);
+        }
+        Ok(())
+    }
+
     /// Generate a fresh challenge using OS randomness.
     pub fn generate() -> Self {
         use rand::RngCore;
@@ -668,7 +737,8 @@ impl Challenge {
 
 /// Worker → Master: response to authentication challenge.
 ///
-/// - `pairing_code_hash`: SHA-256 hex digest of the normalised pairing code.
+/// - `pairing_code_hash`: HMAC-SHA256 of a fresh challenge and both peer IDs;
+///   the historical field name is retained, but a static code hash is rejected.
 /// - `nonce`: echo of the challenge nonce (replay protection).
 /// - `signature`: Ed25519 signature over `Challenge::signing_payload()`.
 /// - `public_key`: protobuf-encoded public key (matches claimed `PeerId`).
@@ -740,7 +810,13 @@ pub struct WeightRequest {
 /// ship as `.gguf`. Any path separator or `..` traversal is always rejected —
 /// the filename must be a plain last-path-component.
 pub fn weight_filename_allowed(filename: &str) -> bool {
-    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+    if filename.is_empty()
+        || filename.len() > 255
+        || !filename
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        || filename.contains("..")
+    {
         return false;
     }
     matches!(
@@ -802,6 +878,17 @@ impl WeightTransfer {
             return Err(ProtocolError::TensorTooLarge {
                 actual: self.chunk.len(),
                 max: MAX_WEIGHT_CHUNK_BYTES,
+            });
+        }
+        if self
+            .offset
+            .checked_add(self.chunk.len() as u64)
+            .is_none_or(|end| end > self.total_bytes)
+            || (self.chunk.is_empty() && self.total_bytes != 0)
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "weight range",
+                reason: "chunk outside declared artifact",
             });
         }
         if let Some(sha256) = &self.sha256

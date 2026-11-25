@@ -48,6 +48,45 @@ pub fn decompress(input: &[u8], codec: CompressionCodec) -> Result<Vec<u8>> {
     }
 }
 
+/// Untrusted wire decoding with a validated exact output length. Check LZ4's
+/// embedded length before allocation; bound both Zstd window and output.
+pub fn decompress_exact(input: &[u8], codec: CompressionCodec, expected: usize) -> Result<Vec<u8>> {
+    use std::io::Read;
+    validate_codec(codec)?;
+    if expected > crate::protocol::MAX_TENSOR_BYTES
+        || input.len() > crate::protocol::MAX_TENSOR_BYTES
+    {
+        bail!("tensor decompression exceeds size limit");
+    }
+    let output = match codec {
+        CompressionCodec::None => input.to_vec(),
+        CompressionCodec::Lz4 => {
+            let length: [u8; 4] = input.get(..4).context("missing LZ4 size")?.try_into()?;
+            if u32::from_le_bytes(length) as usize != expected {
+                bail!("LZ4 length disagrees with tensor metadata");
+            }
+            lz4_flex::block::decompress_size_prepended(input).context("LZ4 decode failed")?
+        }
+        CompressionCodec::Zstd { .. } => {
+            let mut decoder =
+                zstd::stream::read::Decoder::new(input).context("invalid Zstd frame")?;
+            decoder
+                .window_log_max(26)
+                .context("Zstd window exceeds tensor limit")?;
+            let mut output = Vec::with_capacity(expected.min(1024 * 1024));
+            decoder
+                .take(expected as u64 + 1)
+                .read_to_end(&mut output)
+                .context("Zstd decode failed")?;
+            output
+        }
+    };
+    if output.len() != expected {
+        bail!("decompressed tensor length mismatch");
+    }
+    Ok(output)
+}
+
 /// Reject obviously-bogus zstd levels before we hand them to the
 /// compressor (which would silently clamp but log nothing).
 pub fn validate_codec(codec: CompressionCodec) -> Result<()> {
@@ -128,6 +167,29 @@ mod tests {
         assert!(
             ratio < 0.9,
             "lz4 should compress activations < 10%; got {ratio:.2}"
+        );
+    }
+
+    #[test]
+    fn bounded_decoder_rejects_embedded_lz4_size_before_allocating() {
+        let payload = u32::MAX.to_le_bytes();
+        assert!(decompress_exact(&payload, CompressionCodec::Lz4, 16).is_err());
+    }
+
+    #[test]
+    fn bounded_zstd_decoder_stops_at_declared_output_limit() {
+        let compressed =
+            compress(&vec![0; 1024 * 1024], CompressionCodec::Zstd { level: 3 }).unwrap();
+        assert!(decompress_exact(&compressed, CompressionCodec::Zstd { level: 3 }, 16).is_err());
+        assert_eq!(
+            decompress_exact(
+                &compressed,
+                CompressionCodec::Zstd { level: 3 },
+                1024 * 1024
+            )
+            .unwrap()
+            .len(),
+            1024 * 1024
         );
     }
 }

@@ -39,3 +39,7 @@
 /.github/copilot-instructions.md
 /docs/AI_CONTEXT.md
 /docs/skills/
+
+# Local measurements and private run artifacts
+/artifacts/
+__pycache__/

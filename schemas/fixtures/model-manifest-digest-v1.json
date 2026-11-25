@@ -1,0 +1,4 @@
+{
+  "canonical_utf8": "{\"schema_version\":1,\"model_id\":\"synapse-fixtures/tiny-llama\",\"revision\":\"fixture-v1\",\"weights\":\"model.safetensors\",\"artifacts\":[{\"filename\":\"config.json\",\"size_bytes\":2,\"sha256\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\"},{\"filename\":\"model.safetensors\",\"size_bytes\":19,\"sha256\":\"4371bc35746adc247ab993b826fa95764b0ba958310195f4f340a5d8ba676620\"},{\"filename\":\"tokenizer.json\",\"size_bytes\":2,\"sha256\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\"}]}",
+  "sha256": "4da257cc514dcef98d3ddfe02304b4c84daec715cc7a702bb741bc1d48cf8348"
+}

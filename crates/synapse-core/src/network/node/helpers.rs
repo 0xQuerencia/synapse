@@ -7,15 +7,22 @@ use crate::{ModelIdentity, NodeHello, NodeRole};
 
 impl SynapseNode {
     /// Send a ChatEvent to the CLI (no-op if channels aren't configured).
-    pub(super) fn emit(&self, event: ChatEvent) {
+    pub(super) fn emit(&mut self, event: ChatEvent) {
         if let Some(tx) = &self.event_tx
             && let Err(error) = tx.try_send(event)
         {
-            warn!(%error, "dropping chat event because channel is full or closed");
+            warn!(%error, "requester cannot accept output; cancelling generation");
+            self.event_tx = None;
+            self.generation_active = false;
+            self.token_decode_state.reset();
+            self.local_step_pending = false;
+            self.release_generation_assignments();
         }
     }
 
     pub(super) fn fail_generation(&mut self, message: impl Into<String>) {
+        self.token_decode_state.reset();
+        self.release_generation_assignments();
         let message = message.into();
         warn!(%message, "generation failed");
         self.emit(ChatEvent::Token(format!("[generation-error] {message}")));
@@ -44,10 +51,20 @@ impl SynapseNode {
     }
 
     pub(super) fn send_worker_hello(&mut self, peer: PeerId) {
-        let SynapseRole::Worker { pairing_code, .. } = &self.role else {
+        let SynapseRole::Worker { .. } = &self.role else {
             return;
         };
 
+        let explicitly_selected = matches!(&self.role, SynapseRole::Worker { manual_master: Some(addr), .. } if extract_peer_id(addr) == Some(peer));
+        if !explicitly_selected
+            && !self
+                .net_config
+                .discovery
+                .allowed_peers
+                .contains(&peer.to_string())
+        {
+            return;
+        }
         if !self.greeted_peers.insert(peer) {
             debug!(%peer, "worker already sent NodeHello to peer");
             return;
@@ -62,15 +79,23 @@ impl SynapseNode {
         if let Some(score) = self.measured_compute_score {
             hello.compute_score = Some(score);
         }
-        let hashed_code = crate::hash_pairing_code(pairing_code);
+        hello.available_ram_mb = Some(self.memory_limit_bytes.div_ceil(1024 * 1024));
+        hello.memory_bytes = Some(self.memory_limit_bytes);
+        if let Some(capability) = hello.capability.as_mut() {
+            capability.compute_score = hello.compute_score.unwrap_or(1);
+            capability.available_ram_mb = hello.available_ram_mb.unwrap_or(0);
+        }
         info!(%peer, "worker sending NodeHello");
-        self.swarm.behaviour_mut().request_response.send_request(
-            &peer,
+        if let Err(error) = self.send_tracked_request(
+            peer,
             super::super::RequestMessage::NodeHello {
                 hello,
-                pairing_code: hashed_code,
+                pairing_code: String::new(),
             },
-        );
+        ) {
+            warn!(%peer, %error, "failed to start pairing");
+            self.greeted_peers.remove(&peer);
+        }
     }
 
     pub(super) fn reject(
@@ -86,13 +111,13 @@ impl SynapseNode {
         channel: request_response::ResponseChannel<super::super::ResponseMessage>,
         response: super::super::ResponseMessage,
     ) {
-        if let Err(response) = self
+        if let Err(_response) = self
             .swarm
             .behaviour_mut()
             .request_response
             .send_response(channel, response)
         {
-            error!(?response, "failed to send response");
+            error!("response channel unavailable");
         }
     }
 
@@ -100,10 +125,11 @@ impl SynapseNode {
     /// Called immediately after authentication to eliminate cold-start latency.
     pub(super) fn send_health_ping(&mut self, peer: PeerId) {
         info!(%peer, "sending HealthPing to pre-warm connection");
-        self.swarm
-            .behaviour_mut()
-            .request_response
-            .send_request(&peer, super::super::RequestMessage::HealthPing);
+        if let Err(error) =
+            self.send_tracked_request(peer, super::super::RequestMessage::HealthPing)
+        {
+            warn!(%peer, %error, "health request not sent");
+        }
     }
 }
 
@@ -135,6 +161,7 @@ pub(super) fn local_worker_capability_snapshot() -> Option<WorkerCapabilitySnaps
     let snapshot = WorkerCapabilitySnapshot {
         compute_score,
         available_ram_mb,
+        available_memory_bytes: available_ram_mb.and_then(|mb| mb.checked_mul(1024 * 1024)),
     };
     if snapshot.compute_score.is_none() && snapshot.available_ram_mb.is_none() {
         return None;
@@ -154,19 +181,28 @@ fn node_hello(role: NodeRole, model: ModelIdentity) -> NodeHello {
 #[cfg(target_os = "linux")]
 pub(crate) fn detect_available_ram_mb() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let mut total_kib = None;
     let mut available_kib = None;
 
     for line in meminfo.lines() {
         if available_kib.is_none() && line.starts_with("MemAvailable:") {
             available_kib = parse_meminfo_kib(line);
-        } else if total_kib.is_none() && line.starts_with("MemTotal:") {
-            total_kib = parse_meminfo_kib(line);
         }
     }
 
-    let selected_kib = available_kib.or(total_kib)?;
-    let mib = selected_kib / 1024;
+    // Total memory is not usable headroom. Respect a cgroup's remaining
+    // memory where this process is containerized.
+    let selected_kib = available_kib?;
+    let host_bytes = selected_kib.checked_mul(1024)?;
+    let cgroup_headroom = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|limit| limit.trim().parse::<u64>().ok())
+        .and_then(|limit| {
+            std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+                .ok()
+                .and_then(|used| used.trim().parse::<u64>().ok())
+                .map(|used| limit.saturating_sub(used))
+        });
+    let mib = cgroup_headroom.map_or(host_bytes, |bytes| bytes.min(host_bytes)) / (1024 * 1024);
     (mib > 0).then_some(mib)
 }
 
@@ -226,44 +262,18 @@ pub(super) fn extract_peer_id(addr: &libp2p::Multiaddr) -> Option<PeerId> {
     None
 }
 
-/// Measure relay latencies and return RelayInfo vec with measurements.
-pub(super) fn measure_relay_latencies(
+/// Queue approved relay connections. Enqueue time is not network RTT.
+pub(super) fn queue_relay_connections(
     swarm: &mut libp2p::Swarm<super::SynapseBehaviour>,
     relays: &[libp2p::Multiaddr],
 ) -> Vec<crate::RelayInfo> {
-    let mut relay_infos: Vec<crate::RelayInfo> = relays
+    relays
         .iter()
-        .map(|addr| crate::RelayInfo::new(addr.clone()))
-        .collect();
-
-    for relay_info in &mut relay_infos {
-        let start = std::time::Instant::now();
-        info!(addr = %relay_info.addr, region = ?relay_info.region, "measuring relay latency");
-
-        match swarm.dial(relay_info.addr.clone()) {
-            Ok(_) => {
-                let latency_ms = start.elapsed().as_millis() as u64;
-                relay_info.measured_latency_ms = Some(latency_ms);
-                info!(
-                        addr = %relay_info.addr,
-                      region = ?relay_info.region,
-                latency_ms,
-                     "relay connection established"
-                      );
+        .map(|addr| {
+            if let Err(error) = swarm.dial(addr.clone()) {
+                warn!(%addr, %error, "failed to queue relay connection");
             }
-            Err(error) => {
-                warn!(addr = %relay_info.addr, %error, "failed to dial relay");
-            }
-        }
-    }
-
-    relay_infos
-}
-
-/// Select best relay (lowest latency) from measured relays.
-pub(super) fn select_best_relay(relay_infos: &[crate::RelayInfo]) -> Option<&crate::RelayInfo> {
-    relay_infos
-        .iter()
-        .filter(|r| r.measured_latency_ms.is_some())
-        .min_by_key(|r| r.measured_latency_ms.unwrap_or(u64::MAX))
+            crate::RelayInfo::new(addr.clone())
+        })
+        .collect()
 }

@@ -18,7 +18,7 @@ mod batch_tuning;
 mod speculation;
 
 use crate::{
-    ModelIdentity, NodeCapability, PairingRateLimiter,
+    ModelIdentity, PairingRateLimiter,
     inference::{ShardedModel, SimpleTokenizer},
 };
 
@@ -33,10 +33,12 @@ const WORKER_HOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the run loop checks for worker timeouts.
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
+mod assignments;
 mod generation;
 mod handlers;
 mod helpers;
 mod lifecycle;
+mod transport_control;
 pub(super) use speculation::NgramDraftCache;
 
 #[derive(Debug, Error)]
@@ -58,8 +60,11 @@ pub enum NetworkError {
 pub enum ChatEvent {
     /// Worker has authenticated and is ready for generation.
     WorkerConnected,
-    /// A single decoded token was generated.
+    /// A decoded text chunk. Multiple token IDs can form one UTF-8 character.
     Token(String),
+    /// Exact accepted token, including EOS/special tokens. Position is zero
+    /// based within generated output, independently of decoded text chunks.
+    TokenGenerated { token_id: u32, position: usize },
     /// One generation round is complete.
     GenerationDone {
         tokens_generated: usize,
@@ -83,9 +88,10 @@ pub struct SynapseBehaviour {
     pub relay_server: Toggle<relay::Behaviour>,
     pub dcutr: dcutr::Behaviour,
     pub autonat: autonat::Behaviour,
-    pub kad: kad::Behaviour<kad::store::MemoryStore>,
+    pub kad: Toggle<kad::Behaviour<kad::store::MemoryStore>>,
     pub ping: ping::Behaviour,
-    pub mdns: mdns::tokio::Behaviour,
+    pub mdns: Toggle<mdns::tokio::Behaviour>,
+    pub connection_limits: libp2p::connection_limits::Behaviour,
     pub request_response: request_response::Behaviour<super::ProtocolCodec>,
 }
 
@@ -115,6 +121,7 @@ enum WorkerConnectionState {
 struct WorkerCapabilitySnapshot {
     compute_score: Option<u64>,
     available_ram_mb: Option<u64>,
+    available_memory_bytes: Option<u64>,
 }
 
 impl WorkerCapabilitySnapshot {
@@ -128,18 +135,14 @@ impl WorkerCapabilitySnapshot {
         let snapshot = Self {
             compute_score: hello.compute_score,
             available_ram_mb,
+            available_memory_bytes: hello
+                .memory_bytes
+                .or_else(|| available_ram_mb.and_then(|mb| mb.checked_mul(1024 * 1024))),
         };
         if snapshot.compute_score.is_none() && snapshot.available_ram_mb.is_none() {
             return None;
         }
         Some(snapshot)
-    }
-
-    fn planner_capability(&self) -> Option<NodeCapability> {
-        Some(NodeCapability {
-            compute_score: self.compute_score?,
-            available_ram_mb: self.available_ram_mb?,
-        })
     }
 }
 
@@ -159,6 +162,7 @@ struct WorkerRegistryEntry {
     layers_assigned: Option<u32>,
     tokens_per_sec: Option<f32>,
     util_pct: Option<f32>,
+    observed_decode: Option<crate::inference::routing::DecodeObservation>,
 }
 
 #[derive(Default)]
@@ -167,6 +171,22 @@ struct WorkerRegistry {
 }
 
 impl WorkerRegistry {
+    fn update_capability(&mut self, peer_id: PeerId, capability: crate::WorkerCapability) {
+        if let Some(entry) = self.entries.get_mut(&peer_id)
+            && entry.state == WorkerConnectionState::Authenticated
+        {
+            entry.capability = Some(WorkerCapabilitySnapshot {
+                compute_score: Some(capability.compute_score),
+                available_ram_mb: Some(capability.available_ram_mb),
+                available_memory_bytes: entry
+                    .capability
+                    .as_ref()
+                    .and_then(|c| c.available_memory_bytes),
+            });
+            entry.wire_capability = Some(capability);
+            entry.last_seen_at = Instant::now();
+        }
+    }
     fn mark_connected(&mut self, peer_id: PeerId) {
         self.upsert(peer_id, WorkerConnectionState::Connected, None);
     }
@@ -198,23 +218,6 @@ impl WorkerRegistry {
             .and_then(|entry| entry.capability.clone())
     }
 
-    /// Structured (Phase 2) capability snapshot for the peer, if
-    /// the worker has sent a `CapabilityPing` heartbeat.
-    pub fn wire_capability(&self, peer_id: &PeerId) -> Option<crate::WorkerCapability> {
-        self.entries
-            .get(peer_id)
-            .and_then(|entry| entry.wire_capability.clone())
-    }
-
-    /// Update the structured capability for a peer. Used by the
-    /// `CapabilityPing` heartbeat path.
-    pub fn update_capability(&mut self, peer_id: PeerId, cap: crate::WorkerCapability) {
-        if let Some(entry) = self.entries.get_mut(&peer_id) {
-            entry.wire_capability = Some(cap);
-            entry.last_seen_at = Instant::now();
-        }
-    }
-
     /// Phase 4: record live per-device telemetry for a worker from the
     /// generation step that just completed. No-op if the peer isn't
     /// registered (e.g. it disconnected mid-step).
@@ -239,6 +242,19 @@ impl WorkerRegistry {
         capability: Option<WorkerCapabilitySnapshot>,
     ) {
         let now = Instant::now();
+        if !self.entries.contains_key(&peer_id) && self.entries.len() >= 64 {
+            let stale = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.state != WorkerConnectionState::Authenticated)
+                .min_by_key(|(_, entry)| entry.last_seen_at)
+                .map(|(peer, _)| *peer);
+            if let Some(stale) = stale {
+                self.entries.remove(&stale);
+            } else {
+                return;
+            }
+        }
         let entry = self
             .entries
             .entry(peer_id)
@@ -252,6 +268,7 @@ impl WorkerRegistry {
                 layers_assigned: None,
                 tokens_per_sec: None,
                 util_pct: None,
+                observed_decode: None,
             });
         entry.peer_id = peer_id;
         entry.state = state;
@@ -270,10 +287,10 @@ impl WorkerRegistry {
         }
     }
 
-    fn get_challenge(&self, peer_id: &PeerId) -> Option<crate::Challenge> {
+    fn take_challenge(&mut self, peer_id: &PeerId) -> Option<crate::Challenge> {
         self.entries
-            .get(peer_id)
-            .and_then(|e| e.pending_challenge.clone())
+            .get_mut(peer_id)
+            .and_then(|e| e.pending_challenge.take())
     }
 }
 
@@ -309,6 +326,15 @@ pub struct RouteHopView {
 /// Options); the `watch` channel only ever retains the latest value.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct NodeStatusSnapshot {
+    pub resident_weight_bytes: Option<u64>,
+    pub owned_layer_range: Option<Range<usize>>,
+    pub memory_budget_bytes: u64,
+    pub model_digest: Option<String>,
+    pub memory_estimate: Option<crate::inference::memory::MemoryEstimate>,
+    pub ready_ranges: Vec<crate::inference::registry::SignedAvailability>,
+    pub listen_addresses: Vec<String>,
+    pub worker_state: Option<crate::network::worker::WorkerSnapshot>,
+    pub route_decision: Option<crate::inference::routing::RouteDecision>,
     /// Every worker the registry knows about, with connection state.
     pub peers: Vec<PeerSummary>,
     /// Number of workers that have fully authenticated (challenge-response).
@@ -416,6 +442,33 @@ struct InFlightRequest {
 }
 
 pub struct SynapseNode {
+    identity: crate::NodeIdentity,
+    revocations: crate::identity::RevocationList,
+    pending_coordinator_challenges: HashMap<PeerId, crate::Challenge>,
+    model_files: Option<crate::inference::model_loader::ModelFiles>,
+    model_config: Option<crate::inference::ToyLlamaConfig>,
+    generation_lease: Option<crate::inference::assignment::LeaseKey>,
+    shard_readiness: Option<crate::inference::assignment::ReadinessBarrier>,
+    worker_assignment: Option<assignments::WorkerAssignment>,
+    route_epoch: u64,
+    net_config: crate::NetConfig,
+    pending_requests: crate::network::stream::PendingRequests<request_response::OutboundRequestId>,
+    traffic_quota: crate::network::quota::TrafficQuota,
+    worker_controller: crate::network::worker::WorkerController,
+    worker_control_handle: Option<crate::network::worker::WorkerControlHandle>,
+    worker_control_rx: Option<mpsc::Receiver<crate::network::worker::WorkerControlRequest>>,
+    local_step_pending: bool,
+    memory_limit_bytes: u64,
+    admission: Option<crate::inference::admission::CapacityPool>,
+    coordinator_only: bool,
+    memory_profile: Option<crate::inference::memory::ModelMemoryProfile>,
+    active_memory_estimate: Option<crate::inference::memory::MemoryEstimate>,
+    ready_registry: crate::inference::registry::ReadyRegistry,
+    max_route_stages: usize,
+    route_decision: Option<crate::inference::routing::RouteDecision>,
+    peer_rtts: HashMap<PeerId, (Duration, Instant)>,
+    local_decode_observation: Option<crate::inference::routing::DecodeObservation>,
+    local_step_compute_micros: u64,
     role: SynapseRole,
     model: ModelIdentity,
     swarm: Swarm<SynapseBehaviour>,
@@ -432,6 +485,8 @@ pub struct SynapseNode {
     pipeline: Option<Arc<dyn ShardedModel>>,
     /// Tokenizer for encoding/decoding text.
     tokenizer: Option<Arc<SimpleTokenizer>>,
+    /// Rolling UTF-8/text decoder state belonging only to the active turn.
+    token_decode_state: crate::inference::tokenizer::TokenDecodeState,
     /// Cached master range end for the active route plan.
     split_point: usize,
     total_layers: usize,
@@ -668,8 +723,31 @@ impl SynapseNode {
     /// Build a snapshot of the current networking state.
     fn build_status_snapshot(&self) -> NodeStatusSnapshot {
         NodeStatusSnapshot {
+            resident_weight_bytes: self
+                .pipeline
+                .as_ref()
+                .map(|model| model.resident_weight_bytes()),
+            owned_layer_range: self
+                .pipeline
+                .as_ref()
+                .map(|model| model.layer_offset()..model.layer_offset() + model.owned_layers()),
+            memory_budget_bytes: self.memory_limit_bytes,
+            route_decision: self.route_decision.clone(),
+            listen_addresses: self.swarm.listeners().map(ToString::to_string).collect(),
+            worker_state: matches!(self.role, SynapseRole::Worker { .. })
+                .then(|| self.worker_snapshot()),
+            memory_estimate: self.active_memory_estimate.clone(),
+            ready_ranges: self.ready_registry.ranges(
+                self.model.sha256.as_deref().unwrap_or(""),
+                assignments::unix_now(),
+            ),
+            model_digest: self.model.sha256.clone(),
             peers: self.peers(),
-            authenticated_count: self.authenticated_workers.len(),
+            authenticated_count: if matches!(self.role, SynapseRole::Master { .. }) {
+                self.worker_peers.len()
+            } else {
+                self.authenticated_workers.len()
+            },
             route_plan: self.route_plan(),
             redial: match self.role {
                 SynapseRole::Worker { .. } => Some(self.redial_status()),
@@ -724,6 +802,7 @@ mod tests {
             Some(WorkerCapabilitySnapshot {
                 compute_score: Some(1700),
                 available_ram_mb: Some(8192),
+                available_memory_bytes: None,
             }),
         );
         let authenticated = registry
@@ -736,6 +815,7 @@ mod tests {
             Some(WorkerCapabilitySnapshot {
                 compute_score: Some(1700),
                 available_ram_mb: Some(8192),
+                available_memory_bytes: None,
             })
         );
         assert!(authenticated.last_seen_at >= connected.last_seen_at);
@@ -745,6 +825,7 @@ mod tests {
             Some(WorkerCapabilitySnapshot {
                 compute_score: Some(1900),
                 available_ram_mb: Some(12288),
+                available_memory_bytes: None,
             }),
         );
         let refreshed = registry
@@ -755,6 +836,7 @@ mod tests {
             Some(WorkerCapabilitySnapshot {
                 compute_score: Some(1900),
                 available_ram_mb: Some(12288),
+                available_memory_bytes: None,
             })
         );
         assert!(refreshed.last_seen_at >= authenticated.last_seen_at);
@@ -770,6 +852,7 @@ mod tests {
             Some(WorkerCapabilitySnapshot {
                 compute_score: Some(900),
                 available_ram_mb: Some(4096),
+                available_memory_bytes: None,
             }),
         );
         registry.mark_disconnected(peer_id);
@@ -783,6 +866,7 @@ mod tests {
             Some(WorkerCapabilitySnapshot {
                 compute_score: Some(900),
                 available_ram_mb: Some(4096),
+                available_memory_bytes: None,
             })
         );
     }
@@ -812,5 +896,44 @@ mod tests {
         registry.update_telemetry(peer_id, 4, 25.0, 62.5);
 
         assert!(registry.get(&peer_id).is_none());
+    }
+}
+
+#[cfg(test)]
+mod registry_bounds_tests {
+    use super::*;
+    #[test]
+    fn disconnected_peer_churn_keeps_worker_history_bounded() {
+        let mut registry = WorkerRegistry::default();
+        for _ in 0..500 {
+            let peer = PeerId::random();
+            registry.mark_connected(peer);
+            registry.mark_disconnected(peer);
+        }
+        assert_eq!(registry.entries.len(), 64);
+    }
+    #[test]
+    fn exact_byte_budget_survives_legacy_heartbeat_rounding() {
+        let peer = PeerId::random();
+        let mut registry = WorkerRegistry::default();
+        registry.mark_authenticated(
+            peer,
+            Some(WorkerCapabilitySnapshot {
+                compute_score: Some(100),
+                available_ram_mb: Some(1),
+                available_memory_bytes: Some(45000),
+            }),
+        );
+        let mut cap =
+            crate::WorkerCapability::from_probe(&crate::hardware::HardwareProbe::detect());
+        cap.available_ram_mb = 999999;
+        registry.update_capability(peer, cap);
+        assert_eq!(
+            registry
+                .capability_for(&peer)
+                .unwrap()
+                .available_memory_bytes,
+            Some(45000)
+        );
     }
 }

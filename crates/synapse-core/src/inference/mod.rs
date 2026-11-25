@@ -1,9 +1,15 @@
+pub mod admission;
+pub mod assignment;
 pub mod cache;
 pub mod compression;
+pub mod gguf_validation;
 pub mod kv_cache;
+pub mod memory;
 pub mod model_loader;
 pub mod pipeline;
 pub mod prompt_format;
+pub mod registry;
+pub mod routing;
 pub mod tensor_wire;
 pub mod tokenizer;
 

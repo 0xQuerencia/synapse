@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "baseline": "56a288c1b949b6e11c912f1b6366a23bcf7e71e9",
+  "scope": "Synthetic-only additive source tranche; no gate acceptance or publication",
+  "gates": [
+    {"id":"G0","accepted":false,"remaining":"Restore original checkout, rerun Rust checks and remote CI; owner resolves license/rights"},
+    {"id":"G1","accepted":false,"remaining":"Two physical devices, real resident memory and route evidence for a larger model"},
+    {"id":"G2","accepted":false,"remaining":"Separate routers/ISPs, direct and relay paths, physical WAN measurements and independent security review"},
+    {"id":"G3","accepted":false,"remaining":"Live PostgreSQL, production identity, approved model rights, real LLM integration, independent reviewer, legal/ops approval and approved pilot"},
+    {"id":"G4","accepted":false,"remaining":"Native multi-stage receipt integration, accepted output metering, cross-worker replay, adversarial privacy/integrity and real WAN"},
+    {"id":"G5","accepted":false,"remaining":"Fresh-machine installation, signed release, cross-platform support, owner key/rights, accessibility and rollback drills"},
+    {"id":"G6","accepted":false,"remaining":"Independent public-swarm threat review and acceptable integrity/privacy/economics; permissionless mode remains disabled"}
+  ]
+}

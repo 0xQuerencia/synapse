@@ -5,6 +5,33 @@ use serde::{Deserialize, Serialize};
 
 pub const RAM_PER_LAYER_HEURISTIC_MB: u64 = 50;
 
+/// Validate the complete authoritative route before any shard is loaded.
+pub fn validate_exact_coverage(
+    total_layers: usize,
+    ranges: &[Range<usize>],
+) -> Result<(), ProtocolError> {
+    if total_layers == 0 || total_layers > 1_000_000 || ranges.is_empty() {
+        return Err(ProtocolError::InvalidShardPlan {
+            reason: "invalid model depth or empty route",
+        });
+    }
+    let mut cursor = 0;
+    for range in ranges {
+        if range.start != cursor || range.start >= range.end || range.end > total_layers {
+            return Err(ProtocolError::InvalidShardPlan {
+                reason: "route has a gap, overlap, empty range or out-of-bounds layer",
+            });
+        }
+        cursor = range.end;
+    }
+    if cursor != total_layers {
+        return Err(ProtocolError::InvalidShardPlan {
+            reason: "route does not cover the complete model",
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LayerRange {
     pub start: u32,
@@ -53,13 +80,13 @@ pub fn plan_static_shards<P: Clone>(
     total_layers: usize,
     participants: &[P],
 ) -> Result<Vec<StaticShardAssignment<P>>, ProtocolError> {
-    if total_layers == 0 {
+    if total_layers == 0 || total_layers > 1_000_000 {
         return Err(ProtocolError::InvalidShardPlan {
             reason: "total layer count must be greater than zero",
         });
     }
 
-    if participants.is_empty() {
+    if participants.is_empty() || participants.len() > 4096 {
         return Err(ProtocolError::InvalidShardPlan {
             reason: "at least one participant is required",
         });
@@ -109,13 +136,13 @@ pub fn plan_weighted_shards<P: Clone>(
     total_layers: usize,
     participants: &[WeightedShardParticipant<P>],
 ) -> Result<Vec<StaticShardAssignment<P>>, ProtocolError> {
-    if total_layers == 0 {
+    if total_layers == 0 || total_layers > 1_000_000 {
         return Err(ProtocolError::InvalidShardPlan {
             reason: "total layer count must be greater than zero",
         });
     }
 
-    if participants.is_empty() {
+    if participants.is_empty() || participants.len() > 4096 {
         return Err(ProtocolError::InvalidShardPlan {
             reason: "at least one participant is required",
         });
@@ -140,6 +167,11 @@ pub fn plan_weighted_shards<P: Clone>(
             let max_layers = (participant.capability.available_ram_mb / RAM_PER_LAYER_HEURISTIC_MB)
                 .try_into()
                 .unwrap_or(usize::MAX);
+            let max_layers = if participant.capability.compute_score == 0 {
+                0
+            } else {
+                max_layers
+            };
 
             WeightedNodeState {
                 participant: participant.participant.clone(),
@@ -312,6 +344,65 @@ pub fn worker_shard_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_validation_rejects_gaps_overlaps_and_overflow() {
+        for ranges in [
+            vec![0..2, 3..4],
+            vec![0..3, 2..4],
+            std::iter::once(0..5).collect(),
+            vec![0..0, 0..4],
+            std::iter::once(0..3).collect(),
+        ] {
+            assert!(validate_exact_coverage(4, &ranges).is_err());
+        }
+        validate_exact_coverage(4, &[0..1, 1..4]).unwrap();
+        assert!(validate_exact_coverage(0, &[]).is_err());
+    }
+
+    #[test]
+    fn weighted_routes_preserve_coverage_and_capacity_over_varied_inputs() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5a17);
+        for _ in 0..2000 {
+            let layers = rng.gen_range(1..=64);
+            let participants: Vec<_> = (0..rng.gen_range(1..=12))
+                .map(|id| WeightedShardParticipant {
+                    participant: id,
+                    capability: NodeCapability {
+                        compute_score: rng.gen_range(0..=50),
+                        available_ram_mb: rng.gen_range(0..=1000),
+                    },
+                })
+                .collect();
+            let capacity: usize = participants
+                .iter()
+                .filter(|p| p.capability.compute_score > 0)
+                .map(|p| (p.capability.available_ram_mb / RAM_PER_LAYER_HEURISTIC_MB) as usize)
+                .sum();
+            match plan_weighted_shards(layers, &participants) {
+                Ok(plan) => {
+                    validate_exact_coverage(
+                        layers,
+                        &plan
+                            .iter()
+                            .map(|p| p.layer_range.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                    for assignment in plan {
+                        let capacity = participants[assignment.participant].capability;
+                        assert!(
+                            assignment.layer_range.len() as u64 * RAM_PER_LAYER_HEURISTIC_MB
+                                <= capacity.available_ram_mb
+                        );
+                        assert!(capacity.compute_score > 0);
+                    }
+                }
+                Err(_) => assert!(capacity < layers),
+            }
+        }
+    }
 
     fn assert_full_contiguous_coverage(
         assignments: &[StaticShardAssignment<&str>],
@@ -835,5 +926,134 @@ mod capable_tests {
         // covers all layers exactly
         let total: usize = plan.iter().map(|a| a.layer_range.len()).sum();
         assert_eq!(total, 32);
+    }
+}
+
+/// Participant whose capacity was derived from this exact model, context and
+/// IO role. The planner never converts a generic MB value into layers.
+#[derive(Clone, Debug)]
+pub struct BoundedShardParticipant<P> {
+    pub participant: P,
+    pub compute_score: u64,
+    pub max_layers: usize,
+}
+
+pub fn plan_bounded_shards<P: Clone>(
+    total_layers: usize,
+    participants: &[BoundedShardParticipant<P>],
+) -> Result<Vec<StaticShardAssignment<P>>, ProtocolError> {
+    let invalid = || ProtocolError::InvalidShardPlan {
+        reason: "model/context capacity cannot cover route",
+    };
+    if total_layers == 0
+        || total_layers > 1024
+        || participants.is_empty()
+        || participants.len() > 64
+    {
+        return Err(invalid());
+    }
+    let capacity: usize = participants
+        .iter()
+        .filter(|p| p.compute_score > 0)
+        .map(|p| p.max_layers.min(total_layers))
+        .sum();
+    if capacity < total_layers {
+        return Err(invalid());
+    }
+    let mut assigned = vec![0usize; participants.len()];
+    for _ in 0..total_layers {
+        let next = participants
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| p.compute_score > 0 && assigned[*i] < p.max_layers)
+            .min_by(|(ai, a), (bi, b)| {
+                let left = (assigned[*ai] + 1) as u128 * b.compute_score as u128;
+                let right = (assigned[*bi] + 1) as u128 * a.compute_score as u128;
+                left.cmp(&right).then(ai.cmp(bi))
+            })
+            .map(|(i, _)| i)
+            .ok_or_else(invalid)?;
+        assigned[next] += 1;
+    }
+    let mut cursor = 0;
+    let result: Vec<_> = participants
+        .iter()
+        .zip(assigned)
+        .filter(|(_, n)| *n > 0)
+        .map(|(p, n)| {
+            let layer_range = cursor..cursor + n;
+            cursor += n;
+            StaticShardAssignment {
+                participant: p.participant.clone(),
+                layer_range,
+            }
+        })
+        .collect();
+    validate_exact_coverage(
+        total_layers,
+        &result
+            .iter()
+            .map(|a| a.layer_range.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(result)
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    #[test]
+    fn bounded_plans_cover_exactly_without_exceeding_any_model_budget() {
+        for seed in 1usize..2000 {
+            let total = seed % 50 + 1;
+            let participants: Vec<_> = (0..5)
+                .map(|i| BoundedShardParticipant {
+                    participant: i,
+                    compute_score: ((seed * (i + 1)) % 97 + 1) as u64,
+                    max_layers: (seed + i * 7) % 21,
+                })
+                .collect();
+            match plan_bounded_shards(total, &participants) {
+                Ok(plan) => {
+                    validate_exact_coverage(
+                        total,
+                        &plan
+                            .iter()
+                            .map(|a| a.layer_range.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                    for a in plan {
+                        assert!(a.layer_range.len() <= participants[a.participant].max_layers);
+                    }
+                }
+                Err(_) => assert!(participants.iter().map(|p| p.max_layers).sum::<usize>() < total),
+            }
+        }
+    }
+    #[test]
+    fn unknown_or_zero_compute_is_never_a_capacity_fallback() {
+        assert!(
+            plan_bounded_shards(
+                2,
+                &[BoundedShardParticipant {
+                    participant: 0,
+                    compute_score: 0,
+                    max_layers: 100
+                }]
+            )
+            .is_err()
+        );
+        assert!(
+            plan_bounded_shards(
+                2,
+                &[BoundedShardParticipant {
+                    participant: 0,
+                    compute_score: 1,
+                    max_layers: 1
+                }]
+            )
+            .is_err()
+        );
     }
 }

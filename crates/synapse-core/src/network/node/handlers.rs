@@ -24,6 +24,10 @@ impl SynapseNode {
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
+                if self.revocations.contains(&peer_id) {
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                    return Ok(());
+                }
                 let is_outgoing = endpoint.is_dialer();
                 info!(%peer_id, %is_outgoing, "connection established");
 
@@ -39,12 +43,32 @@ impl SynapseNode {
                     self.send_worker_hello(peer_id);
                 }
             }
-            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                cause,
+                num_established,
+                ..
+            } => {
+                if num_established > 0 {
+                    return Ok(());
+                }
                 info!(%peer_id, ?cause, "connection closed");
+                self.transport_peer_disconnected(peer_id);
+                self.ready_registry.remove_peer(peer_id);
+                self.peer_rtts.remove(&peer_id);
                 if matches!(self.role, SynapseRole::Worker { .. }) {
-                    let was_active_master = self.authenticated_workers.remove(&peer_id)
-                        || self.greeted_peers.remove(&peer_id);
+                    let was_authenticated = self.authenticated_workers.remove(&peer_id);
+                    let was_greeted = self.greeted_peers.remove(&peer_id);
+                    let was_active_master = was_authenticated || was_greeted;
                     self.dialed_peers.remove(&peer_id);
+                    self.pending_coordinator_challenges.remove(&peer_id);
+                    if self
+                        .worker_assignment
+                        .as_ref()
+                        .is_some_and(|active| active.owner == peer_id)
+                    {
+                        self.release_worker_assignment();
+                    }
 
                     if was_active_master {
                         info!(
@@ -66,6 +90,16 @@ impl SynapseNode {
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 warn!(?peer_id, %error, "outgoing connection failed");
+                if let SynapseRole::Worker {
+                    manual_master: Some(addr),
+                    ..
+                } = &self.role
+                    && peer_id
+                        .is_none_or(|peer| super::helpers::extract_peer_id(addr) == Some(peer))
+                    && self.next_redial_at.is_none()
+                {
+                    self.next_redial_at = Some(Instant::now() + Duration::from_secs(1));
+                }
             }
             SwarmEvent::IncomingConnectionError { error, .. } => {
                 warn!(%error, "incoming connection failed");
@@ -116,7 +150,12 @@ impl SynapseNode {
         match event {
             mdns::Event::Discovered(peers) => {
                 for (peer_id, address) in peers {
-                    if peer_id == self.local_peer_id() {
+                    if peer_id == self.local_peer_id()
+                        || !self
+                            .net_config
+                            .discovery
+                            .allows(&peer_id, crate::netconfig::DiscoverySource::Lan)
+                    {
                         continue;
                     }
 
@@ -157,8 +196,13 @@ impl SynapseNode {
                 RequestResponseMessage::Request {
                     request, channel, ..
                 } => self.handle_inbound_request(peer, request, channel),
-                RequestResponseMessage::Response { response, .. } => {
-                    self.handle_inbound_response(peer, response);
+                RequestResponseMessage::Response {
+                    request_id,
+                    response,
+                } => {
+                    if self.accept_tracked_response(request_id, peer, &response) {
+                        self.handle_inbound_response(peer, response);
+                    }
                 }
             },
             RequestResponseEvent::OutboundFailure {
@@ -168,11 +212,7 @@ impl SynapseNode {
                 ..
             } => {
                 warn!(%peer, %request_id, %error, "outbound request failed");
-                if matches!(self.role, SynapseRole::Master { .. }) && self.generation_active {
-                    self.fail_generation(format!(
-                        "outbound request {request_id} to {peer} failed: {error}"
-                    ));
-                }
+                self.handle_tracked_failure(request_id, peer);
             }
             RequestResponseEvent::InboundFailure {
                 peer,
@@ -200,12 +240,31 @@ impl SynapseNode {
                     observed_addr = %info.observed_addr,
                     "identify: received peer info"
                 );
-                // Add the peer's listen addresses to the DHT for discovery.
-                for addr in &info.listen_addrs {
-                    self.swarm
-                        .behaviour_mut()
-                        .kad
-                        .add_address(&peer_id, addr.clone());
+                // Only configured DHT membership/entry points contribute
+                // addresses. DHT is absent entirely when discovery is off.
+                let approved = self
+                    .net_config
+                    .discovery
+                    .allowed_peers
+                    .contains(&peer_id.to_string())
+                    || self
+                        .net_config
+                        .bootstrap
+                        .iter()
+                        .chain(&self.net_config.relays)
+                        .any(|addr| super::helpers::extract_peer_id(addr) == Some(peer_id));
+                if approved && let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
+                    for addr in info.listen_addrs.iter().take(8) {
+                        let mut pinned = addr.clone();
+                        if super::helpers::extract_peer_id(&pinned).is_none() {
+                            pinned.push(libp2p::multiaddr::Protocol::P2p(peer_id));
+                        }
+                        if crate::netconfig::validate_direct_peer_addr(&pinned)
+                            .is_ok_and(|peer| peer == peer_id)
+                        {
+                            kad.add_address(&peer_id, pinned);
+                        }
+                    }
                 }
 
                 // Cache authenticated workers for faster reconnection
@@ -244,7 +303,13 @@ impl SynapseNode {
                     // Dial discovered peers that run the same model.
                     // Dial discovered peers that run the same model.
                     for peer in providers {
-                        if peer != self.local_peer_id() && !self.dialed_peers.contains(&peer) {
+                        if peer != self.local_peer_id()
+                            && !self.dialed_peers.contains(&peer)
+                            && self
+                                .net_config
+                                .discovery
+                                .allows(&peer, crate::netconfig::DiscoverySource::Dht)
+                        {
                             info!(%peer, "DHT: dialing discovered peer");
                             if let Err(e) = self.swarm.dial(peer) {
                                 warn!(%peer, %e, "DHT: failed to dial peer");
@@ -283,6 +348,10 @@ impl SynapseNode {
     fn handle_ping_event(&mut self, event: ping::Event) {
         match event.result {
             Ok(duration) => {
+                if self.peer_rtts.len() < 64 || self.peer_rtts.contains_key(&event.peer) {
+                    self.peer_rtts
+                        .insert(event.peer, (duration, Instant::now()));
+                }
                 debug!(peer = %event.peer, rtt_ms = duration.as_millis(), "ping: ok");
             }
             Err(error) => {
@@ -297,12 +366,46 @@ impl SynapseNode {
         request: super::super::RequestMessage,
         channel: request_response::ResponseChannel<super::super::ResponseMessage>,
     ) {
+        if !self.charge_inbound_request(peer, &request) {
+            self.reject(channel, "peer traffic quota exceeded");
+            return;
+        }
+        if self.revocations.contains(&peer) {
+            self.reject(channel, "peer revoked");
+            return;
+        }
         match request {
             super::super::RequestMessage::Challenge(_) => {
                 self.reject(channel, "worker does not accept challenges");
             }
-            super::super::RequestMessage::CapabilityPing(_) => {
-                self.reject(channel, "worker does not accept capability pings");
+            super::super::RequestMessage::CapabilityPing(capability) => {
+                if !matches!(self.role, SynapseRole::Master { .. })
+                    || !self.authenticated_workers.contains(&peer)
+                    || capability.compute_score == 0
+                    || capability.available_ram_mb == 0
+                {
+                    self.reject(channel, "unauthorized or invalid capability update");
+                    return;
+                }
+                self.worker_registry.update_capability(peer, capability);
+                let newly_ready = !self.worker_peers.contains(&peer);
+                if newly_ready {
+                    self.worker_peers.push(peer);
+                }
+                self.send_response(
+                    channel,
+                    super::super::ResponseMessage::CapabilityAck { accepted: true },
+                );
+                if newly_ready {
+                    self.send_health_ping(peer);
+                    self.emit(ChatEvent::WorkerConnected);
+                }
+            }
+            super::super::RequestMessage::PrepareShard(assignment) => {
+                self.handle_prepare_shard(peer, assignment, channel)
+            }
+            super::super::RequestMessage::ReleaseShard(key) => {
+                self.handle_release_shard(peer, key, channel)
             }
             super::super::RequestMessage::NodeHello {
                 hello,
@@ -409,82 +512,51 @@ impl SynapseNode {
             return;
         };
 
-        if let Err(error) = response.validate() {
-            warn!(%peer, %error, "ChallengeResponse validation failed");
-            self.reject(channel, "invalid ChallengeResponse");
+        // Consume on every attempt, including invalid signatures and replay.
+        let Some(pending_challenge) = self.worker_registry.take_challenge(&peer) else {
+            self.reject(channel, "no pending authentication challenge");
             return;
-        }
-
-        let pending_challenge = match self.worker_registry.get_challenge(&peer) {
-            Some(c) => c,
-            None => {
-                warn!(%peer, "ChallengeResponse received but no challenge was issued");
-                self.reject(channel, "no pending challenge");
-                return;
-            }
         };
-
-        if response.nonce != pending_challenge.nonce {
-            warn!(%peer, "challenge nonce mismatch");
-            self.reject(channel, "invalid nonce");
-            return;
-        }
-
-        // Verify the signature
-        let signing_payload = pending_challenge.signing_payload();
-        if let Err(e) = crate::NodeIdentity::verify_remote(
-            &response.public_key,
-            &signing_payload,
-            &response.signature,
-        ) {
-            warn!(%peer, %e, "challenge signature verification failed");
-            self.reject(channel, "invalid signature");
-            return;
-        }
-
-        // Derive expected peer_id from public key and verify it matches the sender
-        let provided_pk =
-            match libp2p::identity::PublicKey::try_decode_protobuf(&response.public_key) {
-                Ok(pk) => pk,
-                Err(_) => {
-                    self.reject(channel, "invalid public key");
-                    return;
-                }
-            };
-        if provided_pk.to_peer_id() != peer {
-            warn!(%peer, "public key does not match peer id");
-            self.reject(channel, "identity mismatch");
-            return;
-        }
-
-        // Verify pairing code hash
         let peer_key = peer.to_string();
-        if let Err(error) =
-            crate::verify_pairing_code_hash(expected_pairing_code, &response.pairing_code_hash)
+        if crate::pairing::verify_challenge_response(
+            &pending_challenge,
+            &response,
+            expected_pairing_code,
+            self.local_peer_id(),
+            peer,
+            super::assignments::unix_now(),
+        )
+        .is_err()
         {
-            warn!(%peer, %error, "pairing code hash rejected");
             self.pairing_rate_limiter.record_failure(&peer_key);
             self.reject(channel, "authentication failed");
             return;
         }
-
+        let proof = match crate::pairing::coordinator_proof(
+            &pending_challenge,
+            expected_pairing_code,
+            self.local_peer_id(),
+            peer,
+        ) {
+            Ok(proof) => proof,
+            Err(_) => {
+                self.reject(channel, "coordinator proof failed");
+                return;
+            }
+        };
         self.pairing_rate_limiter.record_success(&peer_key);
 
         self.authenticated_workers.insert(peer);
-        if !self.worker_peers.contains(&peer) {
-            self.worker_peers.push(peer);
-        }
-        self.worker_registry.mark_authenticated(peer, None); // Retains existing capability from upsert
-        // Pre-warm connection to eliminate cold-start latency on first inference
-        self.send_health_ping(peer);
-
-        info!(%peer, "worker authenticated via challenge-response and ready");
-        self.send_response(channel, super::super::ResponseMessage::Authenticated);
-
-        self.emit(super::ChatEvent::WorkerConnected);
+        self.worker_registry.mark_authenticated(peer, None);
+        self.send_response(
+            channel,
+            super::super::ResponseMessage::PairingAccepted(proof),
+        );
+        // The worker confirms receipt using CapabilityPing. Only then is it a
+        // route candidate, preventing prepare messages racing mutual auth.
     }
 
-    fn redial_manual_master(&mut self) {
+    pub(super) fn redial_manual_master(&mut self) {
         const MAX_REDIAL_ATTEMPTS: u32 = 10;
         const REDIAL_BASE_DELAY: Duration = Duration::from_secs(1);
         const REDIAL_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -509,9 +581,7 @@ impl SynapseNode {
             return;
         }
 
-        self.redial_attempts += 1;
-
-        if self.redial_attempts > MAX_REDIAL_ATTEMPTS {
+        if self.redial_attempts >= MAX_REDIAL_ATTEMPTS {
             warn!(
                 address = %addr,
                 attempts = self.redial_attempts,
@@ -520,6 +590,11 @@ impl SynapseNode {
             return;
         }
 
+        if super::helpers::extract_peer_id(addr).is_some_and(|peer| self.swarm.is_connected(&peer))
+        {
+            return;
+        }
+        self.redial_attempts += 1;
         // Exponential backoff: 1s, 2s, 4s, 8s, ... capped at 30s.
         let delay = REDIAL_BASE_DELAY
             .saturating_mul(2u32.saturating_pow(self.redial_attempts.saturating_sub(1)))
@@ -545,18 +620,10 @@ impl SynapseNode {
 
     /// Notify connected workers and clean up state before shutdown.
     pub(super) fn shutdown_cleanup(&mut self) {
-        let trace_id = format!("shutdown-{}", std::process::id());
-        let clear = crate::ClearCache {
-            trace_id: trace_id.clone(),
-        };
-        for peer in &self.worker_peers {
-            info!(%peer, %trace_id, "sending shutdown ClearCache to worker");
-            let request = super::super::RequestMessage::ClearCache(clear.clone());
-            self.swarm
-                .behaviour_mut()
-                .request_response
-                .send_request(peer, request);
-        }
+        self.token_decode_state.reset();
+        self.release_generation_assignments();
+        self.release_worker_assignment();
+        self.pipeline = None;
 
         if self.generation_active {
             self.fail_generation("master shutting down");

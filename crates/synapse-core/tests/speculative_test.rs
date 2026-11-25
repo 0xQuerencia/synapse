@@ -13,9 +13,9 @@
 
 use candle_core::{Device, Tensor};
 use synapse_core::ToyLlamaConfig;
-use synapse_core::inference::{ToyLlama, download_model};
+use synapse_core::inference::ToyLlama;
 
-const TINY_MODEL: &str = "hf-internal-testing/tiny-random-LlamaForCausalLM";
+mod support;
 
 fn token_tensor(ids: &[u32]) -> Tensor {
     Tensor::new(ids, &Device::Cpu)
@@ -44,9 +44,7 @@ fn assert_all_close(a: &Tensor, b: &Tensor, what: &str) {
 /// forwards over `[a]` then `[b]`, both in logits and final cache length.
 #[tokio::test]
 async fn extend_block_matches_sequential_decode() {
-    let files = download_model(TINY_MODEL)
-        .await
-        .expect("download should succeed");
+    let files = support::fixture_files();
     let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
     let model = ToyLlama::load(&config, &files.weights).expect("model should load");
 
@@ -78,6 +76,7 @@ async fn extend_block_matches_sequential_decode() {
     assert_all_close(&pos1, &ref_logits_b, "extend pos1 vs decode b");
 
     // Cache lengths must agree too.
+    let cache_len_extend = model.layer_kv_cache(0).unwrap().sequence_len().unwrap();
     let cache_len_ref = {
         model.clear_kv_cache().unwrap();
         model.forward_prefill(&token_tensor(&prompt)).unwrap();
@@ -85,7 +84,6 @@ async fn extend_block_matches_sequential_decode() {
         model.forward_decode(&token_tensor(&[block[1]])).unwrap();
         model.layer_kv_cache(0).unwrap().sequence_len().unwrap()
     };
-    let cache_len_extend = model.layer_kv_cache(0).unwrap().sequence_len().unwrap();
     assert_eq!(cache_len_extend, cache_len_ref, "final cache length");
 }
 
@@ -94,9 +92,7 @@ async fn extend_block_matches_sequential_decode() {
 /// ended up.
 #[tokio::test]
 async fn truncate_after_rejected_drafts_restores_reference_state() {
-    let files = download_model(TINY_MODEL)
-        .await
-        .expect("download should succeed");
+    let files = support::fixture_files();
     let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
     let model = ToyLlama::load(&config, &files.weights).expect("model should load");
 
@@ -127,7 +123,9 @@ async fn truncate_after_rejected_drafts_restores_reference_state() {
     model.forward_prefill(&token_tensor(&[1, 2, 3])).unwrap();
     model
         .forward_layers_speculative(
-            &model.embed(&token_tensor(&[t1, t2, 31_999])).unwrap(),
+            &model
+                .embed(&token_tensor(&[t1, t2, (config.vocab_size - 1) as u32]))
+                .unwrap(),
             0..config.num_hidden_layers,
         )
         .unwrap();

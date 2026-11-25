@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "model_id": "synapse/tiny-llama-fixture",
+  "revision": "fixture-v1",
+  "weights": "model.safetensors",
+  "artifacts": [
+    {
+      "filename": "config.json",
+      "size_bytes": 413,
+      "sha256": "6d3185f2b5726c4306287051e7741bf95510b0e4c059342491d345a0837988b3"
+    },
+    {
+      "filename": "model.safetensors",
+      "size_bytes": 29000,
+      "sha256": "947e138695eacd8da8c1e8a27748a3d3182fb660d440756fc6611b03f0621d46"
+    },
+    {
+      "filename": "tokenizer.json",
+      "size_bytes": 2183,
+      "sha256": "1dc60e019bcf944a9e64c484e7887d60e62872412dc18f14ebc61b77364644b5"
+    }
+  ]
+}
