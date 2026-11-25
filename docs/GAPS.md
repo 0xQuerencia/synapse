@@ -1,35 +1,40 @@
 # Remaining gaps and evidence boundaries
 
-This register distinguishes software work from requirements that cannot be completed by a source change alone. It accompanies the master plan and the machine-readable [gate record](evidence/gates.json). No gate is marked accepted by this file. Update evidence at the actual integrated revision, and preserve failed or blocked runs.
+The 34-package local tranche implements substantial runtime, network, product and packaging paths. Its [implementation status](IMPLEMENTATION_STATUS.md), [final execution record](evidence/final-tranche.md), and [machine-readable gates](evidence/gates.json) distinguish code, actual local tests and acceptance. No gate is accepted by this register. Planned PR labels identify work packages; **no GitHub PRs or release artifacts have been published, and no production deployment has occurred**.
 
 ## Required external evidence
 
-| Gap | Why local code/tests are insufficient | Concrete next evidence |
+| Gap | What the local work establishes | Next evidence needed to close it |
 | --- | --- | --- |
-| Physical memory benefit | Two loopback processes share one physical host and OS page cache | Two consenting machines, resident-range traces, real memory measurements and correct output beyond each configured individual budget |
-| Separate-network connectivity | Simulated delay and a local relay do not exercise real NAT/router/ISP conditions | Actual direct/relay runs across separate routers, bounded failure tests, coarse consented topology |
-| Model/hardware compatibility | A tiny fixture does not certify a useful model, quantized format or accelerator | Exact approved model revision/template/backend, numerical parity and actual target device |
-| License ownership | Root MIT and package Apache-2.0 metadata disagree | Authorized maintainer rights decision and consistent metadata before release |
-| Signed release trust | A locally generated key only proves possession of that test key | Identified signing-key owner, independently distributed trusted public key and revocation/rotation procedure |
-| Pilot economics and operation | Simulated credits cannot pay relay/DB/electricity costs or establish demand | Approved cash budget, actual workload/capacity measurements and accountable operator |
-| Community integrity/privacy | Signed claims and encryption do not prove correct computation or hide prompts from workers | Independent review, approved hosts, explicit consent, durable accounting and operational drills |
-| Independent usability | Developer-run tests cannot establish a fresh user's experience | A separate tester installs, connects, runs, cancels and removes the supported package |
+| Physical memory benefit | Independent same-host processes use exact partial ranges and model-shaped reservations; process memory can be observed | Two consenting physical machines, actual resident/peak memory, no hidden full copy, correct output beyond each configured individual budget and an explanation of physical capacity |
+| Separate-network connectivity | Authenticated local direct/relay transport, QUIC inference, bounded delayed-transport and worker-loss experiments | Actual devices behind separate routers, direct and relayed inference, UDP/CGNAT/firewall constraints, failure/cleanup tests and consented coarse topology |
+| Useful model/hardware compatibility | Original Llama reference, supported architecture checks, synthetic GGUF F32/Q8_0/Q4_0 and sliced/full parity | Exact approved trained-model revision/template/backend, numerical and language-quality criteria, actual hardware and measured memory/latency. Any pinned-model local result must retain its real source/evidence. |
+| License ownership and model rights | Root MIT preserved; explicit signed model grants, unknown/revoked/unauthorized policy rejection | Authorized maintainer resolution of Apache-2.0 metadata discrepancy; reviewed third-party model rights and approver; no inferred redistribution permission |
+| Production trust and releases | Local signing/checksum tooling, atomic cache/package activation, key-bound verification, rollback and corruption tests | Identified key owners, independently authenticated trust-key distribution, rotation/revocation drills, reproducible artifact/SBOM and release approval |
+| Independent installation/usability | Developer-run actual process/API controls, Linux installer tests, browser keyboard/responsive checks | A fresh independent tester installs, connects physical devices, runs, cancels, upgrades, rolls back and removes each supported package; assistive-technology and physical-mobile checks |
+| Community operation and economics | Local/private inference and safe policy building blocks; planned accounting contracts | Hosted membership and tenant authorization, transactional reservation/settlement, approved hosts/models, explicit consent, cash budget, durable recovery and accountable pilot operator |
+| Community integrity/privacy | Signed identity and bounded encrypted transport; workers execute model-only operations | Independent adversarial review, approved host verification, explicit data threat model, privacy limits and operational drills. Signatures do not prove correct computation or hide activations from workers. |
+| Published review and remote CI | Local commits, prepared workflows and retained local execution evidence | Authorized GitHub publication followed by actual remote CI/review. Prepared PR descriptions are not published or merged PRs. |
 
-## Implementation details that require explicit contracts
+## Remaining implementation and integration boundaries
 
-- **Accepted output and cancellation:** bind authoritative output intervals to a request/epoch; specify which event establishes delivery and where cancellation stops further chargeable work. Retried computation must not appear or settle twice.
-- **Recovery and persistence:** a restarted coordinator cannot safely reconstruct a session without authorized token history. Fail explicitly when that state is unavailable; do not persist prompts by default merely to claim recovery.
-- **Trust roots:** model integrity hashes are not publisher approval. Key enrollment, distribution, revocation and model rights remain distinct from a manifest digest.
-- **Actual enforcement:** expose which CPU/RAM/GPU/network limits the current backend and OS enforce. Configuration fields and estimated metrics are not proof of isolation.
-- **Compatibility:** every binary protocol change requires negotiated version and golden vectors. JSON fixture schemas describe data shapes, not the bincode wire format.
-- **Live status:** labels such as connected, ready, paused or verified must come from actual daemon/ledger state. The public landing explorer remains a clearly labeled local simulation.
+| Boundary | Implemented behavior | Remaining work or limit |
+| --- | --- | --- |
+| Output delivery and cancellation | Correlated request/session/epoch handling, bounded queues, duplicate protection, terminal failure before stream completion and acknowledged worker cleanup | Hosted exactly-once financial settlement is not implemented. Preserve actual accepted-output semantics when adding billing. |
+| Recovery without prompt persistence | Durable route epochs, request-scoped KV/admission, bounded recovery state and explicit failure after unrecoverable worker loss | General seamless replay across workers/restarts requires approved token-history retention and reference parity; do not persist prompts by default just to claim recovery. |
+| Signed invites | Recipient/pool-bound signatures, expiry, single-use ledger and revocation primitives | Current application joins use mutual pairing. Complete signed-invitation enrollment, QR and recovery flows need an actual caller and QA before being described as available. |
+| Catalog approval | Explicit publisher keys/rights, expiry/revocation checks, safe regular-file import, immutable content-addressed views, current-policy verification and pin-aware pruning | Production publisher enrollment/distribution and third-party approvals remain owner work. A raw local model-directory development path is distinct from a catalog-enforced production flow. |
+| Resource enforcement | Exact model/KV/scratch reservations, bounded protocol allocation, quotas, controls and a dedicated Linux `RLIMIT_AS` option | Reservation estimates are not OS isolation. No portable sandbox, resident-memory ceiling, GPU partition, disk-wide quota, battery or thermal enforcement is claimed. Cache quota counts logical unique artifacts, with bounded metadata overhead outside that count. |
+| Session startup control | Actual workspace status and acknowledged idle-worker controls | The GUI serializes startup during model loading; interrupting that load needs additional lifecycle work. Active drain/recovery behavior must keep its separate runtime evidence. |
+| Compatibility | `/synapse/0.4.0`, exact schemas, canonical signed encodings and golden bytes | Independent implementations and physical network interoperability remain external evidence. JSON schema validity does not prove signature validity or authorize a job. |
+| Security review | Deterministic hostile-input corpus, regression tests, private state handling, repository hygiene and locked SBOM generation | No independent penetration test, long-running coverage-guided fuzz campaign or comprehensive dependency advisory audit is claimed. |
 
-## Product verification scope
+## Product and test scope
 
-The static site has deterministic resource-model tests, offline semantic/link/contrast checks and browser QA. Browser iframe viewport checks exercise mobile/tablet CSS layouts; they do not establish physical-phone, touch or screen-reader usability. Reduced-motion CSS is checked; the QA report distinguishes that from OS preference emulation.
+The landing has eight deterministic simulator tests, offline semantics/link/contrast checks and browser QA. Its per-device memory math and route comparisons are fictional examples, explicitly labeled; it opens no connections and creates no credits. The application has separate actual server/process tests and separate browser layout/keyboard checks. A labeled static workspace layout fixture rejects mutation; it does not impersonate a connected live session.
 
-The local application has a separate QA owner and must exercise real authentication, same-origin protections, error states, streaming cancellation, resource controls and keyboard flow against the integrated backend. Landing-page checks do not certify the application.
+Browser iframe viewport checks exercise mobile/tablet CSS. They do not establish physical-phone, touch, native screen-reader or independent human usability. Reduced-motion CSS checks are recorded separately from OS preference emulation. Performance metrics must come from executed, identified workloads; timings on original tiny fixtures cannot support useful-model speed claims.
 
-## Rule for closing a gap
+## Closing a gap
 
-Attach revision, environment, exact command/run, actual result, limitations and reviewer where required. Use `loopback`, `physical_lan`, `physical_wan` or `simulated_wan` explicitly. Keep implementation, local test, accepted and released states separate. No fabricated speed, users, geography, earnings or independent approval.
+Attach the requirement, source/model revision, environment, exact command/run, actual result, artifact and limitations; include reviewer/owner approval where required. Use `loopback`, `physical_lan`, `physical_wan` or `simulated_wan` explicitly. Keep implemented, locally tested, accepted and released states separate. Preserve failed and blocked runs. Unknown measurements stay missing. Never invent users, geography, speed, earnings, rights or independent approval.

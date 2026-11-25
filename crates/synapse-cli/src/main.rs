@@ -16,6 +16,8 @@ use synapse_core::{
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
+mod catalog;
+
 #[derive(Debug, Parser)]
 #[command(name = "synapse")]
 #[command(about = "LAN sharded AI inference proof of concept")]
@@ -35,6 +37,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Inspect signed model policy and manage a verified local model cache.
+    Catalog {
+        #[command(subcommand)]
+        command: catalog::CatalogCommand,
+    },
     /// Start a master node and chat with the AI.
     Host {
         #[arg(long)]
@@ -168,6 +175,7 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
+        Some(Command::Catalog { command }) => catalog::run(command),
         Some(Command::Host {
             master,
             model,

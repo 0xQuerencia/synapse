@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/MASTER_PLAN.md",
-  "scope": "Acceptance gates; individual local test results are recorded separately.",
+  "scope": "Acceptance gates remain separate from the 34 locally implemented work packages and their revision-specific local checks.",
   "gates": [
     {
       "id": "G0",
@@ -12,7 +12,17 @@
         "Deterministic local and real-model parity",
         "Owner license/rights decision"
       ],
-      "evidence": []
+      "evidence": [],
+      "local_evidence": [
+        {
+          "artifact": "docs/evidence/foundation.md",
+          "scope": "Historical repaired baseline checks; use its own revision and limits."
+        },
+        {
+          "artifact": "docs/evidence/final-tranche.md",
+          "scope": "Final integrated local commands, revision and artifacts; no owner license decision implied."
+        }
+      ]
     },
     {
       "id": "G1",
@@ -23,7 +33,17 @@
         "Exact resident layer ranges",
         "Measured individual memory limits and combined successful output"
       ],
-      "evidence": []
+      "evidence": [],
+      "local_evidence": [
+        {
+          "artifact": "docs/evidence/gui-http-smoke.md",
+          "scope": "Same-host real processes, authenticated QUIC, exact reference tokens and worker execution; not two physical devices."
+        },
+        {
+          "artifact": "docs/evidence/final-tranche.md",
+          "scope": "Configured reservation and resident-range experiments; physical RAM benefit remains unaccepted."
+        }
+      ]
     },
     {
       "id": "G2",
@@ -34,7 +54,17 @@
         "Actual authenticated direct and relay inference",
         "Failure/cancel/resource tests and review"
       ],
-      "evidence": []
+      "evidence": [],
+      "local_evidence": [
+        {
+          "artifact": "docs/evidence/private-transport.md",
+          "scope": "Local direct and relayed identity tests only."
+        },
+        {
+          "artifact": "docs/evidence/final-tranche.md",
+          "scope": "Loopback or simulated impairment is labeled as such; no physical WAN claim."
+        }
+      ]
     },
     {
       "id": "G3",
@@ -45,7 +75,13 @@
         "Real transactional accounting and recovery",
         "Operator budget and independent pilot review"
       ],
-      "evidence": []
+      "evidence": [],
+      "local_evidence": [
+        {
+          "artifact": "docs/model-catalog.md",
+          "scope": "Local trust/rights/cache controls; no hosted community pool or financial settlement."
+        }
+      ]
     },
     {
       "id": "G4",
@@ -56,7 +92,8 @@
         "Complete multi-stage route and exactly-once settlement",
         "Independent sharded privacy/security acceptance"
       ],
-      "evidence": []
+      "evidence": [],
+      "local_evidence": []
     },
     {
       "id": "G5",
@@ -67,7 +104,17 @@
         "Independent clean install/update/uninstall",
         "Support matrix and release approval"
       ],
-      "evidence": []
+      "evidence": [],
+      "local_evidence": [
+        {
+          "artifact": "docs/release-installation.md",
+          "scope": "Local package verification/update/rollback/uninstall mechanisms and tests; no published supported release."
+        },
+        {
+          "artifact": "docs/evidence/landing-qa.md",
+          "scope": "Developer browser/layout checks; no independent installation or assistive-technology acceptance."
+        }
+      ]
     },
     {
       "id": "G6",
@@ -77,7 +124,53 @@
         "Independent adversarial verification/privacy/economic review",
         "Explicit public-swarm launch decision"
       ],
-      "evidence": []
+      "evidence": [],
+      "local_evidence": []
     }
-  ]
+  ],
+  "local_implementation": {
+    "package_count": 34,
+    "package_ids": [
+      "PR-01",
+      "PR-02",
+      "PR-03",
+      "PR-04",
+      "PR-05",
+      "PR-06",
+      "PR-07",
+      "PR-08",
+      "PR-09",
+      "PR-10",
+      "PR-11",
+      "PR-12",
+      "PR-13",
+      "PR-14",
+      "PR-15",
+      "PR-16",
+      "PR-17",
+      "PR-18",
+      "PR-19",
+      "PR-20",
+      "PR-21",
+      "PR-25",
+      "PR-26",
+      "PR-33",
+      "PR-39",
+      "PR-40",
+      "PR-41",
+      "PR-42",
+      "PR-43",
+      "PR-44",
+      "PR-45",
+      "PR-51",
+      "PR-52",
+      "PR-53"
+    ],
+    "evidence_record": "docs/evidence/final-tranche.md",
+    "scope": "Prepared local implementation tranche; final integration revision, exact tests and remaining failures are recorded by the integration owner. This count is not package or release acceptance.",
+    "github_pull_requests_published": 0,
+    "release_artifacts_published": 0,
+    "production_deployments": 0,
+    "remote_ci_for_tranche": "not_claimed_before_publication"
+  }
 }

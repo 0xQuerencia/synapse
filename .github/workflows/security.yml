@@ -20,7 +20,9 @@ jobs:
       - name: Install pinned contract validator
         run: python3 -m pip install --disable-pip-version-check -r schemas/requirements.txt
       - name: Validate contracts and negative fixtures
-        run: python3 schemas/check.py --source-root . --wire-root .
+        run: |
+          python3 schemas/check.py --source-root . --wire-root .
+          python3 schemas/check_catalog.py --source-root .
       - name: Repository policy and tool regression tests
         run: |
           python3 scripts/security/check_repository.py

@@ -1,0 +1,87 @@
+{
+  "steps": [
+    {
+      "command": [
+        "/workspace/scratch/502d906b01b6/cargo-target/debug/examples/catalog",
+        "fixture",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture"
+      ],
+      "exit_code": 0,
+      "stdout": "{\n  \"manifest_digest\": \"71f436fd2068447ac8824a1c4e199e40703e680f883182204841e3c13abab569\",\n  \"model_id\": \"synapse/catalog-test-fixture\",\n  \"revision\": \"fixture-v1\",\n  \"publisher\": \"12D3KooWM8iEb8GdxAeBaCQFgNQYcGVeokWzsWH8S9LL8Cbex6Uh\",\n  \"license\": \"MIT (original synthetic test data)\",\n  \"rights\": {\n    \"local_inference\": true,\n    \"remote_hosting\": false,\n    \"redistribution\": false\n  },\n  \"purpose\": \"local_inference\",\n  \"artifact_count\": 3,\n  \"unique_artifact_bytes\": 59,\n  \"expires_at_unix\": 1795717456\n}",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/workspace/scratch/502d906b01b6/cargo-target/debug/examples/catalog",
+        "inspect",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/record.json",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/trust.json",
+        "local"
+      ],
+      "exit_code": 0,
+      "stdout": "{\n  \"manifest_digest\": \"71f436fd2068447ac8824a1c4e199e40703e680f883182204841e3c13abab569\",\n  \"model_id\": \"synapse/catalog-test-fixture\",\n  \"revision\": \"fixture-v1\",\n  \"publisher\": \"12D3KooWM8iEb8GdxAeBaCQFgNQYcGVeokWzsWH8S9LL8Cbex6Uh\",\n  \"license\": \"MIT (original synthetic test data)\",\n  \"rights\": {\n    \"local_inference\": true,\n    \"remote_hosting\": false,\n    \"redistribution\": false\n  },\n  \"purpose\": \"local_inference\",\n  \"artifact_count\": 3,\n  \"unique_artifact_bytes\": 59,\n  \"expires_at_unix\": 1795717456\n}",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/workspace/scratch/502d906b01b6/cargo-target/debug/examples/catalog",
+        "import",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/source",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/record.json",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/trust.json",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/cache",
+        "1048576",
+        "local"
+      ],
+      "exit_code": 0,
+      "stdout": "{\n  \"manifest_digest\": \"71f436fd2068447ac8824a1c4e199e40703e680f883182204841e3c13abab569\",\n  \"directory\": \"/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/cache/models/71f436fd2068447ac8824a1c4e199e40703e680f883182204841e3c13abab569\",\n  \"unique_artifact_bytes\": 59\n}",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/workspace/scratch/502d906b01b6/cargo-target/debug/examples/catalog",
+        "verify",
+        "71f436fd2068447ac8824a1c4e199e40703e680f883182204841e3c13abab569",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/trust.json",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/cache",
+        "1048576",
+        "local"
+      ],
+      "exit_code": 0,
+      "stdout": "{\n  \"manifest_digest\": \"71f436fd2068447ac8824a1c4e199e40703e680f883182204841e3c13abab569\",\n  \"directory\": \"/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/cache/models/71f436fd2068447ac8824a1c4e199e40703e680f883182204841e3c13abab569\",\n  \"unique_artifact_bytes\": 59\n}",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/workspace/scratch/502d906b01b6/cargo-target/debug/examples/catalog",
+        "verify",
+        "71f436fd2068447ac8824a1c4e199e40703e680f883182204841e3c13abab569",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/trust.json",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/cache",
+        "1048576",
+        "host"
+      ],
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Error: catalog rights do not permit requested purpose"
+    },
+    {
+      "command": [
+        "/workspace/scratch/502d906b01b6/cargo-target/debug/examples/catalog",
+        "prune",
+        "/workspace/scratch/502d906b01b6/synapse-catalog-smoke-blt568ov/original-fixture/cache",
+        "1048576",
+        "0"
+      ],
+      "exit_code": 0,
+      "stdout": "{\n  \"removed_models\": [\n    \"71f436fd2068447ac8824a1c4e199e40703e680f883182204841e3c13abab569\"\n  ],\n  \"removed_objects\": 2,\n  \"pinned_models\": [],\n  \"remaining_bytes\": 0\n}",
+      "stderr": ""
+    }
+  ],
+  "result": {
+    "manifest_digest": "71f436fd2068447ac8824a1c4e199e40703e680f883182204841e3c13abab569",
+    "unique_artifact_bytes": 59,
+    "remaining_bytes_after_prune": 0,
+    "denied_hosting": true
+  }
+}

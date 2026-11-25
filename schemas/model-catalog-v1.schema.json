@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:synapse:schema:model-catalog-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "publisher": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "public_key": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 255
+      },
+      "minItems": 1,
+      "maxItems": 128
+    },
+    "issued_at_unix": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "expires_at_unix": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "status": {
+      "enum": [
+        "approved",
+        "disabled",
+        "revoked"
+      ]
+    },
+    "license": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "rights": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "local_inference": {
+          "type": "boolean"
+        },
+        "remote_hosting": {
+          "type": "boolean"
+        },
+        "redistribution": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "local_inference",
+        "remote_hosting",
+        "redistribution"
+      ]
+    },
+    "provenance": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "not": {
+            "enum": [
+              "main",
+              "master"
+            ]
+          }
+        },
+        "weights": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^(?!\\.)(?!.*\\.\\.)[A-Za-z0-9_.-]+$"
+        },
+        "artifacts": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 10000,
+          "items": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "urn:synapse:schema:model-artifact:1",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "filename": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255,
+                "pattern": "^(?!\\.)(?!.*\\.\\.)[A-Za-z0-9_.-]+$"
+              },
+              "size_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 18446744073709551615
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{64}$"
+              }
+            },
+            "required": [
+              "filename",
+              "size_bytes",
+              "sha256"
+            ]
+          }
+        }
+      },
+      "required": [
+        "schema_version",
+        "model_id",
+        "revision",
+        "weights",
+        "artifacts"
+      ]
+    },
+    "signature": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 255
+      },
+      "minItems": 64,
+      "maxItems": 64
+    }
+  },
+  "required": [
+    "schema_version",
+    "publisher",
+    "public_key",
+    "issued_at_unix",
+    "expires_at_unix",
+    "status",
+    "license",
+    "rights",
+    "provenance",
+    "manifest",
+    "signature"
+  ]
+}

@@ -19,6 +19,10 @@ struct TestBehaviour {
 }
 
 fn node(server: bool) -> Swarm<TestBehaviour> {
+    node_with_limits(server, RelayLimits::default())
+}
+
+fn node_with_limits(server: bool, limits: RelayLimits) -> Swarm<TestBehaviour> {
     SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -33,9 +37,10 @@ fn node(server: bool) -> Swarm<TestBehaviour> {
             let local = key.public().to_peer_id();
             TestBehaviour {
                 relay_client: client,
-                relay_server: Toggle::from(server.then(|| {
-                    relay::Behaviour::new(local, RelayLimits::default().to_libp2p_config().unwrap())
-                })),
+                relay_server: Toggle::from(
+                    server
+                        .then(|| relay::Behaviour::new(local, limits.to_libp2p_config().unwrap())),
+                ),
                 identify: identify::Behaviour::new(identify::Config::new(
                     "synapse/transport-test/1".into(),
                     key.public(),
@@ -49,6 +54,59 @@ fn node(server: bool) -> Swarm<TestBehaviour> {
         .unwrap()
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(20)))
         .build()
+}
+
+#[tokio::test]
+async fn relay_reservation_capacity_refuses_extra_peer_without_evicting_existing_one() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut relay = node_with_limits(true, RelayLimits {
+            max_reservations: 1,
+            max_reservations_per_peer: 1,
+            ..RelayLimits::default()
+        });
+        let mut first = node(false);
+        let mut extra = node(false);
+        let relay_peer = *relay.local_peer_id();
+        let extra_peer = *extra.local_peer_id();
+        let address = listen(&mut relay).await;
+        let mut advertised = address.clone();
+        advertised.pop();
+        relay.add_external_address(advertised);
+        let reservation = address.with(libp2p::multiaddr::Protocol::P2pCircuit);
+        first.listen_on(reservation.clone()).unwrap();
+        loop {
+            tokio::select! {
+                _ = relay.select_next_some() => {},
+                event = first.select_next_some() => match event {
+                    SwarmEvent::NewListenAddr { address, .. } if address.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit)) => break,
+                    SwarmEvent::ListenerError { error, .. } => panic!("first reservation failed: {error}"),
+                    _ => {},
+                }
+            }
+        }
+        extra.listen_on(reservation).unwrap();
+        let mut denied = false;
+        let mut client_failed = false;
+        while !denied || !client_failed {
+            tokio::select! {
+                event = relay.select_next_some() => {
+                    if let SwarmEvent::Behaviour(TestBehaviourEvent::RelayServer(relay::Event::ReservationReqDenied { src_peer_id, status })) = event {
+                        assert_eq!(src_peer_id, extra_peer);
+                        assert!(matches!(status, relay::StatusCode::ResourceLimitExceeded));
+                        denied = true;
+                    }
+                },
+                _ = first.select_next_some() => {},
+                event = extra.select_next_some() => match event {
+                    SwarmEvent::ListenerError { .. } | SwarmEvent::ListenerClosed { reason: Err(_), .. } => client_failed = true,
+                    SwarmEvent::NewListenAddr { address, .. } if address.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit)) => panic!("relay admitted a reservation beyond its configured cap"),
+                    _ => {},
+                },
+            }
+        }
+        assert!(first.is_connected(&relay_peer));
+        assert!(first.listeners().any(|address| address.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))));
+    }).await.expect("relay capacity refusal deadline exceeded");
 }
 
 async fn listen(swarm: &mut Swarm<TestBehaviour>) -> Multiaddr {
