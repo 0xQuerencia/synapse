@@ -83,3 +83,18 @@ See [the stage-two status and review](../docs/community/STAGE2.md), [policy draf
 ```sh
 python3 community/tools/release_gate.py --assert-release
 ```
+
+## Recipient-bound local enrollment
+
+Operators can issue a short-lived, one-time invitation to a specific Ed25519 recipient key. No public registration or automatic consent is enabled. The invite bearer alone cannot create a member. Use a new private directory owned by the local test operator or recipient; the following commands write secrets with mode 0600 and print only public metadata. Run against the loopback testnet listener. Share the invitation file only through an appropriately private out-of-band channel; do not publish it, its key, or credential contents.
+
+```sh
+python3 -m synapse_testnet.enrollment generate-key --out "$RECIPIENT_DIR/key.json"
+# Operator receives the public recipient value printed above:
+python3 -m synapse_testnet.enrollment issue --operator-file "$TESTNET/operator.json" --member invited-worker --role worker --recipient "$RECIPIENT_PUBLIC_KEY" --out "$TESTNET/invite.json"
+# Recipient securely receives invite.json and uses their own key:
+python3 -m synapse_testnet.enrollment redeem --invite-file "$RECIPIENT_DIR/invite.json" --key-file "$RECIPIENT_DIR/key.json" --out "$RECIPIENT_DIR/credential.json"
+python3 -m synapse_testnet.enrollment rotate --credential-file "$RECIPIENT_DIR/credential.json"
+```
+
+Explicit consent and device approval are still required. Rotation immediately invalidates the previous token. If delivery of a newly issued or rotated credential fails after a successful server commit, operator recovery is required; do not retry using an already consumed ticket or assume the old token is valid. This is a local testnet workflow, not hosted OIDC, native network QR pairing, or production account recovery.

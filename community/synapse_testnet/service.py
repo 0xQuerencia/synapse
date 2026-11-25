@@ -49,6 +49,64 @@ class Service(Ledger):
             self.audit(db,a['pool'],a['id'],'member_enrolled',member,{'role':role})
         return credential
 
+    @staticmethod
+    def _invite_claim(row):
+        return {key:row[key] for key in ('id','pool','issuer','member','role','recipient','expires')}
+
+    def issue_invite(self,token,member,role,recipient,ttl):
+        """Operator-only, bounded, recipient-key-bound invitation. No auto-consent."""
+        ident(member); digest(recipient); integer(ttl,1,3600)
+        require(role in ('requester','worker','verifier'),'INVALID_ROLE')
+        ticket=secrets.token_urlsafe(32)
+        with self.tx() as db:
+            a=self.actor(db,token,{'operator'}); now=self.clock(); p=a['pool']
+            db.execute('DELETE FROM enrollment_invites WHERE pool=? AND expires<=?',(p,now))
+            require(db.execute('SELECT COUNT(*) FROM enrollment_invites WHERE pool=?',(p,)).fetchone()[0]<128,'INVITE_LIMIT',429)
+            require(db.execute('SELECT COUNT(*) FROM members WHERE pool=?',(p,)).fetchone()[0]<128,'MEMBER_LIMIT',429)
+            require(not db.execute('SELECT 1 FROM members WHERE id=?',(member,)).fetchone(),'MEMBER_EXISTS',409)
+            require(not db.execute("SELECT 1 FROM enrollment_invites WHERE member=? AND state='issued' AND expires>?",(member,now)).fetchone(),'INVITE_ALREADY_ISSUED',409)
+            claim={'id':uid(),'pool':p,'issuer':a['id'],'member':member,'role':role,'recipient':recipient,'expires':now+ttl}
+            db.execute('INSERT INTO enrollment_invites(id,pool,issuer,member,role,recipient,ticket_hash,expires) VALUES(?,?,?,?,?,?,?,?)',
+                       (claim['id'],p,a['id'],member,role,recipient,sha(ticket.encode()),claim['expires']))
+            self.audit(db,p,a['id'],'invite_issued',claim['id'],{'role':role})
+            return {'claim':claim,'ticket':ticket,'fake_credits':True}
+
+    def revoke_invite(self,token,invite):
+        ident(invite)
+        with self.tx() as db:
+            a=self.actor(db,token,{'operator'}); p=a['pool']
+            r=self.row(db,'SELECT * FROM enrollment_invites WHERE id=? AND pool=?',(invite,p))
+            require(r['state']!='redeemed','INVITE_ALREADY_REDEEMED',409)
+            db.execute("UPDATE enrollment_invites SET state='revoked' WHERE id=?",(invite,))
+            self.audit(db,p,a['id'],'invite_revoked',invite)
+
+    def redeem_invite(self,ticket,claim,signature):
+        """The bearer ticket is insufficient: recipient proof is also required."""
+        require(isinstance(ticket,str) and 32<=len(ticket)<=100,'INVITE_DENIED',403)
+        require(isinstance(claim,dict) and set(claim)=={'id','pool','issuer','member','role','recipient','expires'},'INVITE_DENIED',403)
+        ident(claim['id']); credential=secrets.token_urlsafe(32)
+        with self.tx() as db:
+            row=db.execute('SELECT * FROM enrollment_invites WHERE id=? AND ticket_hash=?',(claim['id'],sha(ticket.encode()))).fetchone()
+            require(row is not None and row['state']=='issued' and row['expires']>self.clock() and claim==self._invite_claim(row),'INVITE_DENIED',403)
+            issuer=db.execute("SELECT 1 FROM members WHERE id=? AND pool=? AND role='operator' AND enabled=1",(row['issuer'],row['pool'])).fetchone()
+            require(issuer is not None,'INVITE_DENIED',403)
+            verify_sig(row['recipient'],claim,signature,b'synapse-testnet-enrollment-v1\0')
+            require(db.execute('SELECT COUNT(*) FROM members WHERE pool=?',(row['pool'],)).fetchone()[0]<128,'MEMBER_LIMIT',429)
+            require(not db.execute('SELECT 1 FROM members WHERE id=?',(row['member'],)).fetchone(),'INVITE_DENIED',403)
+            db.execute('INSERT INTO members(id,pool,role,token_hash) VALUES(?,?,?,?)',(row['member'],row['pool'],row['role'],sha(credential.encode())))
+            db.execute("UPDATE enrollment_invites SET state='redeemed' WHERE id=?",(row['id'],))
+            self.audit(db,row['pool'],row['member'],'invite_redeemed',row['id'])
+            return {'token':credential,'member':row['member'],'role':row['role'],'consent_required':True,'fake_credits':True}
+
+    def rotate_token(self,token):
+        """Atomic bearer rotation; old token immediately fails authentication."""
+        replacement=secrets.token_urlsafe(32)
+        with self.tx() as db:
+            a=self.actor(db,token)
+            db.execute('UPDATE members SET token_hash=? WHERE id=?',(sha(replacement.encode()),a['id']))
+            self.audit(db,a['pool'],a['id'],'credential_rotated',a['id'])
+            return {'token':replacement,'member':a['id'],'role':a['role'],'fake_credits':True}
+
     def consent(self, token, version, external_compute):
         require(external_compute is True,'EXPLICIT_CONSENT_REQUIRED',403)
         with self.tx() as db:

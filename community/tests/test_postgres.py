@@ -125,3 +125,15 @@ class PostgresIntegrationTests(unittest.TestCase):
             with self.s.tx() as db: db.execute("UPDATE accounts SET balance=0 WHERE kind='available'")
         self.assertEqual(self.s.balance(self.client)['available'], 100_000_000)
         with self.s.read() as db: self.assertTrue(self.s.reconcile(db))
+
+    def test_invite_and_credential_rotation(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        key=Ed25519PrivateKey.generate()
+        invite=self.s.issue_invite(self.op,'pg-invitee','requester',key.public_key().public_bytes_raw().hex(),60)
+        signature=key.sign(b'synapse-testnet-enrollment-v1\0'+canonical(invite['claim'])).hex()
+        result=self.s.redeem_invite(invite['ticket'],invite['claim'],signature)
+        self.assertTrue(result['consent_required'])
+        replacement=self.s.rotate_token(result['token'])['token']
+        with self.assertRaisesRegex(Denied,'AUTH_REQUIRED'):self.s.balance(result['token'])
+        self.assertEqual(self.s.balance(replacement)['available'],0)
+        with self.assertRaisesRegex(Denied,'INVITE_DENIED'):self.s.redeem_invite(invite['ticket'],invite['claim'],signature)
