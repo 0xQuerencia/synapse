@@ -57,6 +57,12 @@ jobs:
           "$RUNNER_TEMP/synapse-native-lab/bin/python" scripts/native_accounting_lab.py \
             --binary target/debug/synapse-gui --source-revision "$GITHUB_SHA" \
             --out artifacts/native-accounting-lab
+      - name: Meter actual private sharded CPU inference and refund interrupted work
+        run: |
+          for transport in quic tcp; do
+            "$RUNNER_TEMP/synapse-native-lab/bin/python" scripts/sharded_accounting_lab.py --binary target/debug/synapse --transport "$transport" --out "artifacts/sharded-accounting-$transport"
+          done
+          "$RUNNER_TEMP/synapse-native-lab/bin/python" scripts/sharded_accounting_lab.py --binary target/debug/synapse --transport tcp --interrupt-worker --out artifacts/sharded-accounting-fault
       - name: Preserve synthetic redacted evidence, including failed runs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
