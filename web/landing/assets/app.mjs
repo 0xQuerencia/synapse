@@ -1,6 +1,7 @@
 import { chooseRoute, defaultDevices, MiB } from './simulator.mjs';
 document.documentElement.classList.add('js');
 const form = document.querySelector('#explorer-form');
+form.querySelectorAll('fieldset').forEach(fieldset => { fieldset.disabled = false; });
 const status = document.querySelector('#route-status');
 const output = document.querySelector('#route-output');
 const labels = { local: 'Run on your laptop', remote: 'Use one full-model host', sharded: 'Split across trusted devices' };
@@ -76,6 +77,7 @@ document.addEventListener('keydown', event => {
 });
 
 const copy = document.querySelector('#copy-command');
+copy.disabled = false;
 copy.addEventListener('click', async () => {
   try {
     await navigator.clipboard.writeText(document.querySelector('#build-command').textContent);

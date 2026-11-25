@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "source": "docs/MASTER_PLAN.md",
+  "scope": "Acceptance gates; individual local test results are recorded separately.",
+  "gates": [
+    {
+      "id": "G0",
+      "accepted": false,
+      "state": "in_progress",
+      "required_evidence": [
+        "Green CI on the integrated revision",
+        "Deterministic local and real-model parity",
+        "Owner license/rights decision"
+      ],
+      "evidence": []
+    },
+    {
+      "id": "G1",
+      "accepted": false,
+      "state": "awaiting_external_evidence",
+      "required_evidence": [
+        "Two independent physical devices",
+        "Exact resident layer ranges",
+        "Measured individual memory limits and combined successful output"
+      ],
+      "evidence": []
+    },
+    {
+      "id": "G2",
+      "accepted": false,
+      "state": "awaiting_external_evidence",
+      "required_evidence": [
+        "Different routers and consenting peers",
+        "Actual authenticated direct and relay inference",
+        "Failure/cancel/resource tests and review"
+      ],
+      "evidence": []
+    },
+    {
+      "id": "G3",
+      "accepted": false,
+      "state": "disabled",
+      "required_evidence": [
+        "Approved model/pool and explicit consent",
+        "Real transactional accounting and recovery",
+        "Operator budget and independent pilot review"
+      ],
+      "evidence": []
+    },
+    {
+      "id": "G4",
+      "accepted": false,
+      "state": "disabled",
+      "required_evidence": [
+        "Accepted full-model pilot",
+        "Complete multi-stage route and exactly-once settlement",
+        "Independent sharded privacy/security acceptance"
+      ],
+      "evidence": []
+    },
+    {
+      "id": "G5",
+      "accepted": false,
+      "state": "disabled",
+      "required_evidence": [
+        "Trusted release signatures",
+        "Independent clean install/update/uninstall",
+        "Support matrix and release approval"
+      ],
+      "evidence": []
+    },
+    {
+      "id": "G6",
+      "accepted": false,
+      "state": "research",
+      "required_evidence": [
+        "Independent adversarial verification/privacy/economic review",
+        "Explicit public-swarm launch decision"
+      ],
+      "evidence": []
+    }
+  ]
+}
