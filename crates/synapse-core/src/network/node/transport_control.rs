@@ -2,6 +2,7 @@
 //! worker control. Only this module sends tracked requests to libp2p.
 use super::{DEFAULT_REQUEST_TIMEOUT, NetworkError, SynapseNode, SynapseRole};
 use crate::inference::assignment::LeaseKey;
+use crate::network::quota::TrafficQuota;
 use crate::network::stream::{ResponseKind, ResponseScope};
 use crate::network::worker::{
     WorkerControlHandle, WorkerControlRequest, WorkerSnapshot, worker_control_channel,
@@ -10,6 +11,20 @@ use crate::network::{RequestMessage, ResponseMessage};
 use libp2p::{PeerId, request_response::OutboundRequestId};
 use std::time::Instant;
 use tracing::warn;
+
+/// Both directions share the same receive budget. Include the marker and
+/// length prefix so tiny control messages cannot bypass byte accounting.
+fn charge_message<T: serde::Serialize>(
+    quota: &mut TrafficQuota,
+    peer: PeerId,
+    message: &T,
+    now: Instant,
+) -> bool {
+    bincode::serialized_size(message)
+        .ok()
+        .and_then(|bytes| bytes.checked_add(5))
+        .is_some_and(|bytes| quota.check_and_charge(peer, bytes, now).is_ok())
+}
 
 fn base_scope(peer: PeerId, kind: ResponseKind, trace_id: String) -> ResponseScope {
     ResponseScope {
@@ -188,6 +203,18 @@ impl SynapseNode {
         peer: PeerId,
         response: &ResponseMessage,
     ) -> bool {
+        if !charge_message(&mut self.traffic_quota, peer, response, Instant::now()) {
+            warn!(%peer, "inbound response quota exhausted");
+            if self
+                .pending_requests
+                .scope(id)
+                .is_some_and(|scope| scope.peer == peer)
+            {
+                self.handle_tracked_failure(id, peer);
+            }
+            let _ = self.swarm.disconnect_peer_id(peer);
+            return false;
+        }
         let Some(expected) = self.pending_requests.scope(id).cloned() else {
             return false;
         };
@@ -217,11 +244,20 @@ impl SynapseNode {
     }
 
     pub(super) fn handle_tracked_failure(&mut self, id: OutboundRequestId, peer: PeerId) {
-        if let Some(scope) = self.pending_requests.remove(id)
-            && scope.peer == peer
-            && self.scope_is_active_generation(&scope)
+        if self
+            .pending_requests
+            .scope(id)
+            .is_none_or(|scope| scope.peer != peer)
         {
-            self.fail_generation("assigned worker request failed");
+            return;
+        }
+        if let Some(scope) = self.pending_requests.remove(id) {
+            if self.scope_is_active_generation(&scope) {
+                self.fail_generation("assigned worker request failed");
+            } else if matches!(scope.kind, ResponseKind::Hello | ResponseKind::Pairing) {
+                self.pending_coordinator_challenges.remove(&peer);
+                self.greeted_peers.remove(&peer);
+            }
         }
     }
 
@@ -230,15 +266,12 @@ impl SynapseNode {
         peer: PeerId,
         request: &RequestMessage,
     ) -> bool {
-        bincode::serialized_size(request).ok().is_some_and(|bytes| {
-            self.traffic_quota
-                .check_and_charge(peer, bytes, Instant::now())
-                .is_ok()
-        })
+        charge_message(&mut self.traffic_quota, peer, request, Instant::now())
     }
 
     pub(super) fn transport_tick(&mut self) {
         let now = Instant::now();
+        self.pairing_rate_limiter.cleanup();
         let expired = self.pending_requests.expire(now);
         if expired
             .iter()
@@ -246,6 +279,16 @@ impl SynapseNode {
         {
             self.fail_generation("assigned worker response deadline expired");
         }
+        for scope in expired {
+            if matches!(scope.kind, ResponseKind::Hello | ResponseKind::Pairing) {
+                self.pending_coordinator_challenges.remove(&scope.peer);
+                self.greeted_peers.remove(&scope.peer);
+                let _ = self.swarm.disconnect_peer_id(scope.peer);
+            }
+        }
+        let unix_now = super::assignments::unix_now();
+        self.pending_coordinator_challenges
+            .retain(|_, challenge| challenge.validate_at(unix_now).is_ok());
         let active_jobs = usize::from(self.worker_assignment.is_some());
         if let Some(effect) = self.worker_controller.tick(active_jobs, now) {
             if effect.release_active {
@@ -318,6 +361,34 @@ impl SynapseNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn requests_and_responses_share_framed_receive_budget() {
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let request = RequestMessage::HealthPing;
+        let response = ResponseMessage::rejected("busy");
+        let exact_bytes = bincode::serialized_size(&request).unwrap()
+            + bincode::serialized_size(&response).unwrap()
+            + 10;
+        let mut quota = TrafficQuota::new(
+            crate::network::quota::TrafficLimits {
+                bytes_per_peer: exact_bytes,
+                bytes_total: exact_bytes,
+                messages_per_peer: 16,
+                messages_total: 16,
+                max_peers: 2,
+                window: std::time::Duration::from_secs(60),
+            },
+            now,
+        )
+        .unwrap();
+        assert!(charge_message(&mut quota, peer, &request, now));
+        assert!(charge_message(&mut quota, peer, &response, now));
+        assert!(!charge_message(&mut quota, peer, &response, now));
+        // A second authenticated identity does not reset the global budget.
+        assert!(!charge_message(&mut quota, PeerId::random(), &request, now));
+    }
+
     #[test]
     fn activation_scope_extracts_exact_session_epoch_and_keeps_token_trace() {
         let peer = PeerId::random();

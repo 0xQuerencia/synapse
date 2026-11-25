@@ -39,31 +39,40 @@ impl SynapseNode {
                 .manifest
                 .digest()?,
         };
-        let admission = self
-            .admission
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("local memory capacity is unknown"))?;
-        admission.reserve(
-            key.clone(),
-            &self.local_peer_id().to_string(),
-            self.memory_limit_bytes,
-            Duration::from_secs(300),
-            Instant::now(),
-        )?;
-        self.generation_lease = Some(key.clone());
-        self.load_assigned_range(route.master_layer_range.clone())?;
-        admission.mark_ready(&key, &self.local_peer_id().to_string(), Instant::now())?;
         let context_tokens = self
             .token_ids
             .len()
             .checked_add(self.current_max_tokens())
             .ok_or_else(|| anyhow::anyhow!("context overflow"))?;
+        let estimate = self
+            .memory_profile
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memory profile unavailable"))?
+            .estimate(
+                route.master_layer_range.len(),
+                context_tokens,
+                crate::inference::pipeline::TensorRoles::COORDINATOR,
+            )?;
+        let admission = self
+            .admission
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("local memory capacity unknown"))?;
+        admission.reserve(
+            key.clone(),
+            &self.local_peer_id().to_string(),
+            estimate.total_bytes,
+            Duration::from_secs(300),
+            Instant::now(),
+        )?;
+        self.generation_lease = Some(key.clone());
+        self.load_assigned_range(route.master_layer_range.clone(), context_tokens)?;
+        admission.mark_ready(&key, &self.local_peer_id().to_string(), Instant::now())?;
         let mut expected = BTreeMap::new();
         for hop in &route.worker_hops {
             let capability = self
                 .worker_registry
                 .capability_for(&hop.peer_id)
-                .and_then(|capability| capability.available_ram_mb)
+                .and_then(|capability| capability.available_memory_bytes)
                 .unwrap_or(0);
             let assignment = ShardAssignment {
                 protocol_version: 1,
@@ -72,9 +81,7 @@ impl SynapseNode {
                 layer_end: hop.layer_range.end.try_into()?,
                 total_layers: self.total_layers.try_into()?,
                 context_tokens: context_tokens.try_into()?,
-                memory_limit_bytes: capability
-                    .checked_mul(1024 * 1024)
-                    .ok_or_else(|| anyhow::anyhow!("memory cap overflow"))?,
+                memory_limit_bytes: capability,
                 ttl_ms: 300_000,
             };
             assignment.validate()?;
@@ -154,29 +161,42 @@ impl SynapseNode {
             "context exceeds model limit"
         );
         let now = Instant::now();
-        if let Some(active) = &self.worker_assignment {
-            if active.expires_at > now {
-                ensure!(
-                    active.owner == peer,
-                    "worker is leased to another coordinator"
-                );
-                if active.assignment == assignment {
-                    return Ok(ShardReady {
-                        assignment,
-                        resident_weight_bytes: self
-                            .pipeline
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("ready shard was unloaded"))?
-                            .resident_weight_bytes(),
-                    });
-                }
-                ensure!(
-                    active.assignment.key.session_id == assignment.key.session_id
-                        && assignment.key.route_epoch > active.assignment.key.route_epoch,
-                    "worker already has an active session"
-                );
+        if let Some(active) = &self.worker_assignment
+            && active.expires_at > now
+        {
+            ensure!(
+                active.owner == peer,
+                "worker is leased to another coordinator"
+            );
+            if active.assignment == assignment {
+                return Ok(ShardReady {
+                    assignment,
+                    resident_weight_bytes: self
+                        .pipeline
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("ready shard was unloaded"))?
+                        .resident_weight_bytes(),
+                });
             }
+            ensure!(
+                active.assignment.key.session_id == assignment.key.session_id
+                    && assignment.key.route_epoch > active.assignment.key.route_epoch,
+                "worker already has an active session"
+            );
         }
+        let estimate = self
+            .memory_profile
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memory profile unavailable"))?
+            .estimate(
+                assignment.layer_range().len(),
+                assignment.context_tokens as usize,
+                crate::inference::pipeline::TensorRoles::WORKER,
+            )?;
+        ensure!(
+            estimate.total_bytes <= assignment.memory_limit_bytes,
+            "model/context reservation exceeds assignment cap before allocation"
+        );
         self.release_worker_assignment();
         let admission = self
             .admission
@@ -185,11 +205,13 @@ impl SynapseNode {
         admission.reserve(
             assignment.key.clone(),
             &peer.to_string(),
-            assignment.memory_limit_bytes,
+            estimate.total_bytes,
             Duration::from_millis(assignment.ttl_ms as u64),
             now,
         )?;
-        if let Err(error) = self.load_assigned_range(assignment.layer_range()) {
+        if let Err(error) =
+            self.load_assigned_range(assignment.layer_range(), assignment.context_tokens as usize)
+        {
             admission.release(&assignment.key, &peer.to_string())?;
             self.pipeline = None;
             return Err(error);
@@ -302,6 +324,7 @@ impl SynapseNode {
         self.shard_readiness = None;
         if matches!(self.role, SynapseRole::Master { .. }) {
             self.pipeline = None;
+            self.active_memory_estimate = None;
         }
     }
 
@@ -371,6 +394,7 @@ impl SynapseNode {
         }
         if matches!(self.role, SynapseRole::Worker { .. }) {
             self.pipeline = None;
+            self.active_memory_estimate = None;
         }
     }
 }

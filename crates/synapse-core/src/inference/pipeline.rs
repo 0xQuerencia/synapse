@@ -240,7 +240,7 @@ pub fn run_micro_benchmark(device: &Device) -> u64 {
         Ok(tensor) => tensor,
         Err(error) => {
             warn!(%error, "failed to build lhs tensor for micro-benchmark");
-            return 1;
+            return 0;
         }
     };
     let rhs = match Tensor::new(rhs_data.as_slice(), device)
@@ -249,32 +249,37 @@ pub fn run_micro_benchmark(device: &Device) -> u64 {
         Ok(tensor) => tensor,
         Err(error) => {
             warn!(%error, "failed to build rhs tensor for micro-benchmark");
-            return 1;
+            return 0;
         }
     };
 
     if let Err(error) = device.synchronize() {
         warn!(%error, "failed to synchronize device before micro-benchmark");
-        return 1;
+        return 0;
     }
 
+    let benchmark_started = Instant::now();
     let mut samples_ms = Vec::with_capacity(BENCHMARK_RUNS);
     for run in 0..(WARMUP_RUNS + BENCHMARK_RUNS) {
+        if benchmark_started.elapsed() > std::time::Duration::from_secs(2) {
+            warn!("device probe exceeded its measurement budget");
+            return 0;
+        }
         let started = Instant::now();
         let matmul = match lhs.broadcast_matmul(&rhs) {
             Ok(output) => output,
             Err(error) => {
                 warn!(%error, "micro-benchmark matrix multiplication failed");
-                return 1;
+                return 0;
             }
         };
         if let Err(error) = matmul.sum_all().and_then(|sum| sum.to_scalar::<f32>()) {
             warn!(%error, "micro-benchmark reduction failed");
-            return 1;
+            return 0;
         }
         if let Err(error) = device.synchronize() {
             warn!(%error, "failed to synchronize device during micro-benchmark");
-            return 1;
+            return 0;
         }
 
         if run >= WARMUP_RUNS {
@@ -284,7 +289,7 @@ pub fn run_micro_benchmark(device: &Device) -> u64 {
 
     samples_ms.sort_by(|a, b| a.total_cmp(b));
     let median_ms = samples_ms[samples_ms.len() / 2];
-    micro_benchmark_score(median_ms)
+    micro_benchmark_score(median_ms).min(crate::protocol::MAX_COMPUTE_SCORE)
 }
 
 // ─── Building blocks ─────────────────────────────────────────────────────────
@@ -2184,6 +2189,68 @@ pub fn gguf_layer_count(path: &Path) -> Result<usize> {
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let content = gguf_file::Content::read(&mut file).context("failed to parse GGUF header")?;
     gguf_u64(&content, "llama.block_count").map(|n| n as usize)
+}
+
+/// Validate independent sidecar dimensions before any tensor allocation or
+/// memory reservation. A sidecar cannot understate the actual GGUF model.
+pub fn validate_gguf_config(path: &Path, config: &ToyLlamaConfig) -> Result<()> {
+    config.validate()?;
+    let mut file = File::open(path)?;
+    let content = gguf_file::Content::read(&mut file)?;
+    anyhow::ensure!(
+        content
+            .metadata
+            .get("general.architecture")
+            .and_then(|value| value.to_string().ok())
+            .is_some_and(|value| value == "llama"),
+        "unsupported or missing GGUF architecture"
+    );
+    for (key, expected) in [
+        ("llama.embedding_length", config.hidden_size),
+        ("llama.block_count", config.num_hidden_layers),
+        ("llama.attention.head_count", config.num_attention_heads),
+        ("llama.vocab_size", config.vocab_size),
+    ] {
+        anyhow::ensure!(
+            gguf_u64(&content, key)? == expected as u64,
+            "GGUF sidecar mismatch for {key}"
+        );
+    }
+    for (key, expected, default) in [
+        (
+            "llama.attention.head_count_kv",
+            config.num_key_value_heads,
+            config.num_attention_heads,
+        ),
+        (
+            "llama.feed_forward_length",
+            config.intermediate_size,
+            4 * config.hidden_size,
+        ),
+        ("llama.context_length", config.max_position_embeddings, 4096),
+        (
+            "llama.rope.dimension_count",
+            config.head_dim(),
+            config.head_dim(),
+        ),
+    ] {
+        anyhow::ensure!(
+            gguf_u64_or(&content, key, default as u64) == expected as u64,
+            "GGUF sidecar mismatch for {key}"
+        );
+    }
+    anyhow::ensure!(
+        gguf_f64_or(&content, "llama.rope.freq_base", 10000.0) == config.rope_theta,
+        "GGUF sidecar RoPE mismatch"
+    );
+    anyhow::ensure!(
+        (gguf_f64_or(&content, "llama.attention.layer_norm_rms_epsilon", 1e-5)
+            - config.rms_norm_eps)
+            .abs()
+            <= 1e-10,
+        "GGUF sidecar normalization mismatch"
+    );
+    Ok(())
 }
 
 fn gguf_u64_or(content: &gguf_file::Content, key: &str, default: u64) -> u64 {

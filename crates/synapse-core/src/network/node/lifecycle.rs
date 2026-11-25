@@ -170,6 +170,8 @@ impl SynapseNode {
             admission: crate::inference::admission::CapacityPool::new(memory_limit_bytes, 1).ok(),
             memory_limit_bytes,
             coordinator_only: false,
+            memory_profile: None,
+            active_memory_estimate: None,
             role,
             model,
             swarm,
@@ -286,6 +288,8 @@ impl SynapseNode {
             .extension()
             .is_some_and(|extension| extension == "gguf");
         let total = if is_gguf {
+            crate::inference::pipeline::validate_gguf_config(&files.weights, &config)
+                .map_err(|error| NetworkError::Inference(error.to_string()))?;
             gguf_layer_count(&files.weights)
                 .map_err(|error| NetworkError::Inference(error.to_string()))?
         } else {
@@ -302,6 +306,10 @@ impl SynapseNode {
             revision: Some(files.manifest.revision.clone()),
             sha256: Some(digest),
         };
+        self.memory_profile = Some(
+            crate::inference::memory::ModelMemoryProfile::new(&config, is_gguf)
+                .map_err(|error| NetworkError::Inference(error.to_string()))?,
+        );
         self.pipeline = None;
         self.tokenizer = Some(std::sync::Arc::new(tokenizer));
         self.total_layers = total;
@@ -310,10 +318,16 @@ impl SynapseNode {
         let device = crate::inference::get_best_device()
             .map_err(|error| NetworkError::Inference(error.to_string()))?;
         let score = crate::inference::run_micro_benchmark(&device);
+        if score == 0 {
+            return Err(NetworkError::Inference(
+                "device throughput probe failed or timed out".into(),
+            ));
+        }
         self.measured_compute_score = Some(score);
         if let Some(capability) = self.local_capability.as_mut() {
             capability.compute_score = Some(score);
-            capability.available_ram_mb = Some(self.memory_limit_bytes / (1024 * 1024));
+            capability.available_ram_mb = Some(self.memory_limit_bytes.div_ceil(1024 * 1024));
+            capability.available_memory_bytes = Some(self.memory_limit_bytes);
         }
         info!(total_layers=total, model_digest=?self.model.sha256, "model artifacts verified; awaiting shard assignment");
         Ok(())
@@ -338,7 +352,8 @@ impl SynapseNode {
         );
         self.memory_limit_bytes = bytes;
         if let Some(capability) = self.local_capability.as_mut() {
-            capability.available_ram_mb = Some(bytes / (1024 * 1024));
+            capability.available_ram_mb = Some(bytes.div_ceil(1024 * 1024));
+            capability.available_memory_bytes = Some(bytes);
         }
         Ok(())
     }
@@ -356,6 +371,7 @@ impl SynapseNode {
     pub(super) fn load_assigned_range(
         &mut self,
         range: std::ops::Range<usize>,
+        context_tokens: usize,
     ) -> anyhow::Result<()> {
         let files = self
             .model_files
@@ -369,14 +385,22 @@ impl SynapseNode {
             range.start <= range.end && range.end <= self.total_layers,
             "invalid model range"
         );
-        // Release old storage before loading a replacement, avoiding a hidden
-        // second copy during replanning.
-        self.pipeline = None;
         let roles = if matches!(self.role, SynapseRole::Master { .. }) {
             crate::inference::pipeline::TensorRoles::COORDINATOR
         } else {
             crate::inference::pipeline::TensorRoles::WORKER
         };
+        let estimate = self
+            .memory_profile
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memory profile unavailable"))?
+            .estimate(range.len(), context_tokens, roles)?;
+        anyhow::ensure!(
+            estimate.total_bytes <= self.memory_limit_bytes,
+            "model/context memory exceeds policy before weight allocation"
+        );
+        self.pipeline = None;
+        self.active_memory_estimate = None;
         let model: std::sync::Arc<dyn ShardedModel> = if files
             .weights
             .extension()
@@ -402,7 +426,7 @@ impl SynapseNode {
             "resident layer range differs from assignment"
         );
         anyhow::ensure!(
-            model.resident_weight_bytes() <= self.memory_limit_bytes,
+            model.resident_weight_bytes() <= estimate.weights_bytes,
             "resident weights exceed memory cap"
         );
         info!(
@@ -411,6 +435,7 @@ impl SynapseNode {
             resident_weight_bytes = model.resident_weight_bytes(),
             "assigned shard resident"
         );
+        self.active_memory_estimate = Some(estimate);
         self.pipeline = Some(model);
         Ok(())
     }

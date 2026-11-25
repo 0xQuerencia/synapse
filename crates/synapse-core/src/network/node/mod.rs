@@ -18,7 +18,7 @@ mod batch_tuning;
 mod speculation;
 
 use crate::{
-    ModelIdentity, NodeCapability, PairingRateLimiter,
+    ModelIdentity, PairingRateLimiter,
     inference::{ShardedModel, SimpleTokenizer},
 };
 
@@ -121,6 +121,7 @@ enum WorkerConnectionState {
 struct WorkerCapabilitySnapshot {
     compute_score: Option<u64>,
     available_ram_mb: Option<u64>,
+    available_memory_bytes: Option<u64>,
 }
 
 impl WorkerCapabilitySnapshot {
@@ -134,18 +135,14 @@ impl WorkerCapabilitySnapshot {
         let snapshot = Self {
             compute_score: hello.compute_score,
             available_ram_mb,
+            available_memory_bytes: hello
+                .memory_bytes
+                .or_else(|| available_ram_mb.and_then(|mb| mb.checked_mul(1024 * 1024))),
         };
         if snapshot.compute_score.is_none() && snapshot.available_ram_mb.is_none() {
             return None;
         }
         Some(snapshot)
-    }
-
-    fn planner_capability(&self) -> Option<NodeCapability> {
-        Some(NodeCapability {
-            compute_score: self.compute_score?,
-            available_ram_mb: self.available_ram_mb?,
-        })
     }
 }
 
@@ -180,6 +177,10 @@ impl WorkerRegistry {
             entry.capability = Some(WorkerCapabilitySnapshot {
                 compute_score: Some(capability.compute_score),
                 available_ram_mb: Some(capability.available_ram_mb),
+                available_memory_bytes: entry
+                    .capability
+                    .as_ref()
+                    .and_then(|c| c.available_memory_bytes),
             });
             entry.wire_capability = Some(capability);
             entry.last_seen_at = Instant::now();
@@ -214,14 +215,6 @@ impl WorkerRegistry {
         self.entries
             .get(peer_id)
             .and_then(|entry| entry.capability.clone())
-    }
-
-    /// Structured (Phase 2) capability snapshot for the peer, if
-    /// the worker has sent a `CapabilityPing` heartbeat.
-    pub fn wire_capability(&self, peer_id: &PeerId) -> Option<crate::WorkerCapability> {
-        self.entries
-            .get(peer_id)
-            .and_then(|entry| entry.wire_capability.clone())
     }
 
     /// Phase 4: record live per-device telemetry for a worker from the
@@ -322,6 +315,7 @@ pub struct NodeStatusSnapshot {
     pub owned_layer_range: Option<Range<usize>>,
     pub memory_budget_bytes: u64,
     pub model_digest: Option<String>,
+    pub memory_estimate: Option<crate::inference::memory::MemoryEstimate>,
     /// Every worker the registry knows about, with connection state.
     pub peers: Vec<PeerSummary>,
     /// Number of workers that have fully authenticated (challenge-response).
@@ -448,6 +442,8 @@ pub struct SynapseNode {
     memory_limit_bytes: u64,
     admission: Option<crate::inference::admission::CapacityPool>,
     coordinator_only: bool,
+    memory_profile: Option<crate::inference::memory::ModelMemoryProfile>,
+    active_memory_estimate: Option<crate::inference::memory::MemoryEstimate>,
     role: SynapseRole,
     model: ModelIdentity,
     swarm: Swarm<SynapseBehaviour>,
@@ -709,6 +705,7 @@ impl SynapseNode {
                 .as_ref()
                 .map(|model| model.layer_offset()..model.layer_offset() + model.owned_layers()),
             memory_budget_bytes: self.memory_limit_bytes,
+            memory_estimate: self.active_memory_estimate.clone(),
             model_digest: self.model.sha256.clone(),
             peers: self.peers(),
             authenticated_count: if matches!(self.role, SynapseRole::Master { .. }) {
@@ -770,6 +767,7 @@ mod tests {
             Some(WorkerCapabilitySnapshot {
                 compute_score: Some(1700),
                 available_ram_mb: Some(8192),
+                available_memory_bytes: None,
             }),
         );
         let authenticated = registry
@@ -782,6 +780,7 @@ mod tests {
             Some(WorkerCapabilitySnapshot {
                 compute_score: Some(1700),
                 available_ram_mb: Some(8192),
+                available_memory_bytes: None,
             })
         );
         assert!(authenticated.last_seen_at >= connected.last_seen_at);
@@ -791,6 +790,7 @@ mod tests {
             Some(WorkerCapabilitySnapshot {
                 compute_score: Some(1900),
                 available_ram_mb: Some(12288),
+                available_memory_bytes: None,
             }),
         );
         let refreshed = registry
@@ -801,6 +801,7 @@ mod tests {
             Some(WorkerCapabilitySnapshot {
                 compute_score: Some(1900),
                 available_ram_mb: Some(12288),
+                available_memory_bytes: None,
             })
         );
         assert!(refreshed.last_seen_at >= authenticated.last_seen_at);
@@ -816,6 +817,7 @@ mod tests {
             Some(WorkerCapabilitySnapshot {
                 compute_score: Some(900),
                 available_ram_mb: Some(4096),
+                available_memory_bytes: None,
             }),
         );
         registry.mark_disconnected(peer_id);
@@ -829,6 +831,7 @@ mod tests {
             Some(WorkerCapabilitySnapshot {
                 compute_score: Some(900),
                 available_ram_mb: Some(4096),
+                available_memory_bytes: None,
             })
         );
     }

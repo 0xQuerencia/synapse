@@ -350,9 +350,9 @@ mod tests {
         for ranges in [
             vec![0..2, 3..4],
             vec![0..3, 2..4],
-            vec![0..5],
+            std::iter::once(0..5).collect(),
             vec![0..0, 0..4],
-            vec![0..3],
+            std::iter::once(0..3).collect(),
         ] {
             assert!(validate_exact_coverage(4, &ranges).is_err());
         }
@@ -926,5 +926,134 @@ mod capable_tests {
         // covers all layers exactly
         let total: usize = plan.iter().map(|a| a.layer_range.len()).sum();
         assert_eq!(total, 32);
+    }
+}
+
+/// Participant whose capacity was derived from this exact model, context and
+/// IO role. The planner never converts a generic MB value into layers.
+#[derive(Clone, Debug)]
+pub struct BoundedShardParticipant<P> {
+    pub participant: P,
+    pub compute_score: u64,
+    pub max_layers: usize,
+}
+
+pub fn plan_bounded_shards<P: Clone>(
+    total_layers: usize,
+    participants: &[BoundedShardParticipant<P>],
+) -> Result<Vec<StaticShardAssignment<P>>, ProtocolError> {
+    let invalid = || ProtocolError::InvalidShardPlan {
+        reason: "model/context capacity cannot cover route",
+    };
+    if total_layers == 0
+        || total_layers > 1024
+        || participants.is_empty()
+        || participants.len() > 64
+    {
+        return Err(invalid());
+    }
+    let capacity: usize = participants
+        .iter()
+        .filter(|p| p.compute_score > 0)
+        .map(|p| p.max_layers.min(total_layers))
+        .sum();
+    if capacity < total_layers {
+        return Err(invalid());
+    }
+    let mut assigned = vec![0usize; participants.len()];
+    for _ in 0..total_layers {
+        let next = participants
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| p.compute_score > 0 && assigned[*i] < p.max_layers)
+            .min_by(|(ai, a), (bi, b)| {
+                let left = (assigned[*ai] + 1) as u128 * b.compute_score as u128;
+                let right = (assigned[*bi] + 1) as u128 * a.compute_score as u128;
+                left.cmp(&right).then(ai.cmp(bi))
+            })
+            .map(|(i, _)| i)
+            .ok_or_else(invalid)?;
+        assigned[next] += 1;
+    }
+    let mut cursor = 0;
+    let result: Vec<_> = participants
+        .iter()
+        .zip(assigned)
+        .filter(|(_, n)| *n > 0)
+        .map(|(p, n)| {
+            let layer_range = cursor..cursor + n;
+            cursor += n;
+            StaticShardAssignment {
+                participant: p.participant.clone(),
+                layer_range,
+            }
+        })
+        .collect();
+    validate_exact_coverage(
+        total_layers,
+        &result
+            .iter()
+            .map(|a| a.layer_range.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(result)
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    #[test]
+    fn bounded_plans_cover_exactly_without_exceeding_any_model_budget() {
+        for seed in 1usize..2000 {
+            let total = seed % 50 + 1;
+            let participants: Vec<_> = (0..5)
+                .map(|i| BoundedShardParticipant {
+                    participant: i,
+                    compute_score: ((seed * (i + 1)) % 97 + 1) as u64,
+                    max_layers: (seed + i * 7) % 21,
+                })
+                .collect();
+            match plan_bounded_shards(total, &participants) {
+                Ok(plan) => {
+                    validate_exact_coverage(
+                        total,
+                        &plan
+                            .iter()
+                            .map(|a| a.layer_range.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                    for a in plan {
+                        assert!(a.layer_range.len() <= participants[a.participant].max_layers);
+                    }
+                }
+                Err(_) => assert!(participants.iter().map(|p| p.max_layers).sum::<usize>() < total),
+            }
+        }
+    }
+    #[test]
+    fn unknown_or_zero_compute_is_never_a_capacity_fallback() {
+        assert!(
+            plan_bounded_shards(
+                2,
+                &[BoundedShardParticipant {
+                    participant: 0,
+                    compute_score: 0,
+                    max_layers: 100
+                }]
+            )
+            .is_err()
+        );
+        assert!(
+            plan_bounded_shards(
+                2,
+                &[BoundedShardParticipant {
+                    participant: 0,
+                    compute_score: 1,
+                    max_layers: 1
+                }]
+            )
+            .is_err()
+        );
     }
 }

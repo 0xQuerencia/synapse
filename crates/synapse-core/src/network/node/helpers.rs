@@ -77,7 +77,7 @@ impl SynapseNode {
         if let Some(score) = self.measured_compute_score {
             hello.compute_score = Some(score);
         }
-        hello.available_ram_mb = Some(self.memory_limit_bytes / (1024 * 1024));
+        hello.available_ram_mb = Some(self.memory_limit_bytes.div_ceil(1024 * 1024));
         hello.memory_bytes = Some(self.memory_limit_bytes);
         if let Some(capability) = hello.capability.as_mut() {
             capability.compute_score = hello.compute_score.unwrap_or(1);
@@ -109,13 +109,13 @@ impl SynapseNode {
         channel: request_response::ResponseChannel<super::super::ResponseMessage>,
         response: super::super::ResponseMessage,
     ) {
-        if let Err(response) = self
+        if let Err(_response) = self
             .swarm
             .behaviour_mut()
             .request_response
             .send_response(channel, response)
         {
-            error!(?response, "failed to send response");
+            error!("response channel unavailable");
         }
     }
 
@@ -159,6 +159,7 @@ pub(super) fn local_worker_capability_snapshot() -> Option<WorkerCapabilitySnaps
     let snapshot = WorkerCapabilitySnapshot {
         compute_score,
         available_ram_mb,
+        available_memory_bytes: available_ram_mb.and_then(|mb| mb.checked_mul(1024 * 1024)),
     };
     if snapshot.compute_score.is_none() && snapshot.available_ram_mb.is_none() {
         return None;
@@ -178,19 +179,28 @@ fn node_hello(role: NodeRole, model: ModelIdentity) -> NodeHello {
 #[cfg(target_os = "linux")]
 pub(crate) fn detect_available_ram_mb() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let mut total_kib = None;
     let mut available_kib = None;
 
     for line in meminfo.lines() {
         if available_kib.is_none() && line.starts_with("MemAvailable:") {
             available_kib = parse_meminfo_kib(line);
-        } else if total_kib.is_none() && line.starts_with("MemTotal:") {
-            total_kib = parse_meminfo_kib(line);
         }
     }
 
-    let selected_kib = available_kib.or(total_kib)?;
-    let mib = selected_kib / 1024;
+    // Total memory is not usable headroom. Respect a cgroup's remaining
+    // memory where this process is containerized.
+    let selected_kib = available_kib?;
+    let host_bytes = selected_kib.checked_mul(1024)?;
+    let cgroup_headroom = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|limit| limit.trim().parse::<u64>().ok())
+        .and_then(|limit| {
+            std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+                .ok()
+                .and_then(|used| used.trim().parse::<u64>().ok())
+                .map(|used| limit.saturating_sub(used))
+        });
+    let mib = cgroup_headroom.map_or(host_bytes, |bytes| bytes.min(host_bytes)) / (1024 * 1024);
     (mib > 0).then_some(mib)
 }
 

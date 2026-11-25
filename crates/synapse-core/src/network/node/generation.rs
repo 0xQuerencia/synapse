@@ -6,10 +6,11 @@ use tracing::{info, warn};
 use super::{
     ActivationPass, BatchPromptRequest, ChatEvent, GenerationRoutePlan, InFlightActivationHop,
     InFlightRequest, MAX_BATCH_SIZE, SpeculativeRound, StopReason, SynapseNode, SynapseRole,
-    WorkerCapabilitySnapshot, WorkerRouteHop,
+    WorkerRouteHop,
 };
 use crate::inference::{ToyLlama, payload_to_tensor, tensor_to_payload};
 use crate::network::node::speculation::MAX_DRAFT_LEN;
+#[cfg(test)]
 use crate::{WeightedShardParticipant, plan_weighted_shards};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,6 +19,7 @@ enum RouteParticipant {
     Worker(PeerId),
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct RouteWorkerCandidate {
     peer_id: PeerId,
@@ -51,6 +53,7 @@ fn activation_tokens_for_position(
     Ok((pass, tokens))
 }
 
+#[cfg(test)]
 fn build_generation_route(
     total_layers: usize,
     master_capability: Option<crate::NodeCapability>,
@@ -127,6 +130,73 @@ fn ensure_worker_available(
 }
 
 impl SynapseNode {
+    fn plan_model_route(&self) -> anyhow::Result<GenerationRoutePlan> {
+        use crate::inference::pipeline::TensorRoles;
+        use crate::shard::{BoundedShardParticipant, plan_bounded_shards};
+        let profile = self
+            .memory_profile
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("memory profile unavailable"))?;
+        let context = self
+            .token_ids
+            .len()
+            .checked_add(self.current_max_tokens())
+            .ok_or_else(|| anyhow::anyhow!("context overflow"))?;
+        let local_capacity =
+            profile.layer_capacity(self.memory_limit_bytes, context, TensorRoles::COORDINATOR)?;
+        let mut participants = vec![BoundedShardParticipant {
+            participant: RouteParticipant::Master,
+            compute_score: self
+                .measured_compute_score
+                .ok_or_else(|| anyhow::anyhow!("local throughput unmeasured"))?,
+            max_layers: if self.coordinator_only {
+                0
+            } else {
+                local_capacity
+            },
+        }];
+        let mut seen = HashSet::new();
+        for peer in &self.worker_peers {
+            anyhow::ensure!(seen.insert(*peer), "duplicate route candidate");
+            if !self.authenticated_workers.contains(peer) {
+                continue;
+            }
+            let cap = self
+                .worker_registry
+                .capability_for(peer)
+                .ok_or_else(|| anyhow::anyhow!("worker capability unknown"))?;
+            let bytes = cap
+                .available_memory_bytes
+                .ok_or_else(|| anyhow::anyhow!("worker memory unknown"))?;
+            let max_layers = profile
+                .layer_capacity(bytes, context, TensorRoles::WORKER)
+                .unwrap_or(0);
+            let compute_score = cap.compute_score.unwrap_or(0);
+            if max_layers > 0 && compute_score > 0 {
+                participants.push(BoundedShardParticipant {
+                    participant: RouteParticipant::Worker(*peer),
+                    compute_score,
+                    max_layers,
+                });
+            }
+        }
+        let assignments = plan_bounded_shards(self.total_layers, &participants)?;
+        let mut route = GenerationRoutePlan {
+            master_layer_range: 0..0,
+            worker_hops: Vec::new(),
+        };
+        for assignment in assignments {
+            match assignment.participant {
+                RouteParticipant::Master => route.master_layer_range = assignment.layer_range,
+                RouteParticipant::Worker(peer_id) => route.worker_hops.push(WorkerRouteHop {
+                    peer_id,
+                    layer_range: assignment.layer_range,
+                }),
+            }
+        }
+        Ok(route)
+    }
+
     /// Called when a new prompt arrives from the CLI REPL channel.
     pub(super) fn handle_new_prompt(&mut self, prompt: String) {
         let tokenizer = match &self.tokenizer {
@@ -188,37 +258,10 @@ impl SynapseNode {
         self.pending_cache_reset_peers.clear();
         self.in_flight_activation_hop = None;
 
-        let workers_for_generation: Vec<_> = self
-            .worker_peers
-            .iter()
-            .copied()
-            .filter(|peer| self.authenticated_workers.contains(peer))
-            .map(|peer_id| RouteWorkerCandidate {
-                peer_id,
-                capability: self
-                    .worker_registry
-                    .capability_for(&peer_id)
-                    .as_ref()
-                    .and_then(WorkerCapabilitySnapshot::planner_capability),
-                wire_capability: self.worker_registry.wire_capability(&peer_id),
-            })
-            .collect();
-        let route_plan = match build_generation_route(
-            self.total_layers,
-            self.local_capability
-                .as_ref()
-                .and_then(WorkerCapabilitySnapshot::planner_capability)
-                .map(|mut capability| {
-                    if self.coordinator_only {
-                        capability.available_ram_mb = 0;
-                    }
-                    capability
-                }),
-            &workers_for_generation,
-        ) {
+        let route_plan = match self.plan_model_route() {
             Ok(plan) => plan,
             Err(error) => {
-                self.fail_generation(error);
+                self.fail_generation(error.to_string());
                 return;
             }
         };
@@ -1292,7 +1335,7 @@ impl SynapseNode {
                 let mut capability =
                     crate::WorkerCapability::from_probe(&crate::hardware::HardwareProbe::detect());
                 capability.compute_score = self.measured_compute_score.unwrap_or(1);
-                capability.available_ram_mb = self.memory_limit_bytes / (1024 * 1024);
+                capability.available_ram_mb = self.memory_limit_bytes.div_ceil(1024 * 1024);
                 if let Err(error) = self.send_tracked_request(
                     peer,
                     super::super::RequestMessage::CapabilityPing(capability),

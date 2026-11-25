@@ -43,12 +43,21 @@ impl SynapseNode {
                     self.send_worker_hello(peer_id);
                 }
             }
-            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                cause,
+                num_established,
+                ..
+            } => {
+                if num_established > 0 {
+                    return Ok(());
+                }
                 info!(%peer_id, ?cause, "connection closed");
                 self.transport_peer_disconnected(peer_id);
                 if matches!(self.role, SynapseRole::Worker { .. }) {
-                    let was_active_master = self.authenticated_workers.remove(&peer_id)
-                        || self.greeted_peers.remove(&peer_id);
+                    let was_authenticated = self.authenticated_workers.remove(&peer_id);
+                    let was_greeted = self.greeted_peers.remove(&peer_id);
+                    let was_active_master = was_authenticated || was_greeted;
                     self.dialed_peers.remove(&peer_id);
                     self.pending_coordinator_challenges.remove(&peer_id);
                     if self
@@ -512,7 +521,7 @@ impl SynapseNode {
         // route candidate, preventing prepare messages racing mutual auth.
     }
 
-    fn redial_manual_master(&mut self) {
+    pub(super) fn redial_manual_master(&mut self) {
         const MAX_REDIAL_ATTEMPTS: u32 = 10;
         const REDIAL_BASE_DELAY: Duration = Duration::from_secs(1);
         const REDIAL_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -537,9 +546,7 @@ impl SynapseNode {
             return;
         }
 
-        self.redial_attempts += 1;
-
-        if self.redial_attempts > MAX_REDIAL_ATTEMPTS {
+        if self.redial_attempts >= MAX_REDIAL_ATTEMPTS {
             warn!(
                 address = %addr,
                 attempts = self.redial_attempts,
@@ -548,6 +555,11 @@ impl SynapseNode {
             return;
         }
 
+        if super::helpers::extract_peer_id(addr).is_some_and(|peer| self.swarm.is_connected(&peer))
+        {
+            return;
+        }
+        self.redial_attempts += 1;
         // Exponential backoff: 1s, 2s, 4s, 8s, ... capped at 30s.
         let delay = REDIAL_BASE_DELAY
             .saturating_mul(2u32.saturating_pow(self.redial_attempts.saturating_sub(1)))
