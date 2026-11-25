@@ -89,7 +89,7 @@ pub struct SynapseBehaviour {
     pub autonat: autonat::Behaviour,
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
     pub ping: ping::Behaviour,
-    pub mdns: mdns::tokio::Behaviour,
+    pub mdns: Toggle<mdns::tokio::Behaviour>,
     pub request_response: request_response::Behaviour<super::ProtocolCodec>,
 }
 

@@ -27,6 +27,10 @@ use tokio::sync::{Mutex, broadcast, mpsc, watch};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UiChatEvent {
     WorkerConnected,
+    TokenGenerated {
+        token_id: u32,
+        position: usize,
+    },
     Token {
         text: String,
     },
@@ -40,6 +44,9 @@ impl From<ChatEvent> for UiChatEvent {
     fn from(value: ChatEvent) -> Self {
         match value {
             ChatEvent::WorkerConnected => Self::WorkerConnected,
+            ChatEvent::TokenGenerated { token_id, position } => {
+                Self::TokenGenerated { token_id, position }
+            }
             ChatEvent::Token(t) => Self::Token { text: t },
             ChatEvent::GenerationDone {
                 tokens_generated,

@@ -2,6 +2,7 @@ use std::{
     fs,
     io::{self, IsTerminal, Write},
     path::PathBuf,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,9 +10,7 @@ use clap::{ArgAction, Parser, Subcommand};
 use synapse_core::{
     ModelIdentity, NodeIdentity, SimpleTokenizer, ToyLlama, ToyLlamaConfig, download_model,
     generate_pairing_code,
-    network::{
-        ChatEvent, StopReason, SynapseNode, SynapseRole, default_listen_addr, parse_listen_addr,
-    },
+    network::{ChatEvent, StopReason, SynapseNode, SynapseRole, parse_listen_addr},
     split_layers, tensor_to_payload, validate_pairing_code,
 };
 use tracing::{debug, info};
@@ -53,6 +52,28 @@ enum Command {
 
         #[arg(long, default_value = "0.0.0.0:0")]
         listen: String,
+
+        /// Run one supplied prompt and exit with failure on generation errors.
+        #[arg(long, requires = "prompt")]
+        once: bool,
+        /// Send raw text; use for base models and deterministic fixtures.
+        #[arg(long)]
+        raw_prompt: bool,
+        /// Wait for this many authenticated workers before dispatch.
+        #[arg(long, default_value_t = 1)]
+        min_workers: usize,
+        /// Bound worker discovery and generation independently.
+        #[arg(long, default_value_t = 120)]
+        timeout_secs: u64,
+        /// Create a private JSONL record of status, token IDs and actual timings.
+        #[arg(long)]
+        events_jsonl: Option<PathBuf>,
+        /// Per-node inference memory limit (MiB), enforced before shard loading.
+        #[arg(long)]
+        memory_mib: Option<u64>,
+        /// Keep transformer layers entirely on the authenticated workers.
+        #[arg(long)]
+        coordinator_only: bool,
     },
     /// Join an existing master as a worker node.
     Join {
@@ -64,6 +85,12 @@ enum Command {
 
         #[arg(long)]
         code: String,
+        #[arg(long)]
+        memory_mib: Option<u64>,
+        #[arg(long)]
+        events_jsonl: Option<PathBuf>,
+        #[arg(long, default_value = "0.0.0.0:0")]
+        listen: String,
     },
     /// Run a localhost demo (no networking).
     Demo {
@@ -75,6 +102,25 @@ enum Command {
 
         #[arg(long, default_value = "50")]
         max_tokens: usize,
+    },
+    /// Stream deterministic local inference from a verified model directory.
+    Infer {
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value_t = 8)]
+        max_tokens: usize,
+        #[arg(long)]
+        events_jsonl: Option<PathBuf>,
+    },
+    /// Check local readiness without downloading a model or starting a session.
+    Doctor {
+        /// Verify every artifact in an already downloaded model manifest.
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+        #[arg(long, default_value = "config")]
+        config_dir: PathBuf,
     },
     /// Connect to a model swarm via DHT (alias for join without manual address).
     Connect {
@@ -117,13 +163,43 @@ async fn main() -> Result<()> {
             prompt,
             max_tokens,
             listen,
-        }) => host(master, model, prompt, max_tokens, listen).await,
+            once,
+            raw_prompt,
+            min_workers,
+            timeout_secs,
+            events_jsonl,
+            memory_mib,
+            coordinator_only,
+        }) => {
+            host(
+                master,
+                model,
+                prompt,
+                max_tokens,
+                listen,
+                HostOptions {
+                    once,
+                    raw_prompt,
+                    min_workers,
+                    timeout_secs,
+                    events_jsonl,
+                    memory_mib,
+                    coordinator_only,
+                },
+            )
+            .await
+        }
         Some(Command::Join {
             master_addr,
             model,
             code,
-        }) => join(master_addr, model, code).await,
-        Some(Command::Connect { model, code }) => join(None, model, code).await,
+            memory_mib,
+            events_jsonl,
+            listen,
+        }) => join(master_addr, model, code, memory_mib, events_jsonl, listen).await,
+        Some(Command::Connect { model, code }) => {
+            join(None, model, code, None, None, "0.0.0.0:0".into()).await
+        }
         Some(Command::Relay { listen }) => relay_server(listen).await,
         Some(Command::Peers) => {
             let identity = NodeIdentity::load_or_create().context("failed to load identity")?;
@@ -157,9 +233,91 @@ async fn main() -> Result<()> {
             prompt,
             max_tokens,
         }) => demo(model, prompt, max_tokens).await,
+        Some(Command::Infer {
+            model_dir,
+            prompt,
+            max_tokens,
+            events_jsonl,
+        }) => infer_local(model_dir, prompt, max_tokens, events_jsonl),
         Some(Command::Id) => show_identity(),
+        Some(Command::Doctor {
+            model_dir,
+            config_dir,
+        }) => doctor(model_dir, config_dir, cli.identity_path.as_deref()),
         None => onboarding_gateway().await,
     }
+}
+
+fn doctor(
+    model_dir: Option<PathBuf>,
+    config_dir: PathBuf,
+    identity_path: Option<&str>,
+) -> Result<()> {
+    let mut checks = Vec::new();
+    let mut failed = false;
+    let mut check = |name: &str, result: Result<serde_json::Value>| match result {
+        Ok(details) => {
+            checks.push(serde_json::json!({"name":name,"status":"passed","details":details}))
+        }
+        Err(error) => {
+            failed = true;
+            checks
+                .push(serde_json::json!({"name":name,"status":"failed","error":error.to_string()}));
+        }
+    };
+    check("network_config", synapse_core::NetConfig::load_strict(&config_dir).map(|net| {
+        serde_json::json!({"bootstrap_peers":net.bootstrap.len(),"relay_peers":net.relays.len(),
+            "pinned_discovery_peers":net.discovery.allowed_peers.len(),
+            "lan_discovery":net.discovery.allow_lan_discovery,"dht_discovery":net.discovery.allow_dht_discovery})
+    }).map_err(Into::into));
+    check(
+        "loopback_tcp",
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .map(|_| serde_json::json!({"bind":"available"}))
+            .map_err(Into::into),
+    );
+    check(
+        "loopback_udp",
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .map(|_| serde_json::json!({"bind":"available"}))
+            .map_err(Into::into),
+    );
+    if let Some(path) = identity_path {
+        check(
+            "existing_identity",
+            NodeIdentity::load_from_path(std::path::Path::new(path))
+                .map(|identity| serde_json::json!({"peer_id":identity.peer_id().to_string()}))
+                .map_err(Into::into),
+        );
+    }
+    if let Some(directory) = model_dir {
+        check(
+            "model_integrity",
+            (|| {
+                let files =
+                    synapse_core::inference::model_loader::ModelFiles::from_directory(&directory)?;
+                let config = ToyLlamaConfig::from_file(&files.config)?;
+                Ok(
+                    serde_json::json!({"model_id":files.manifest.model_id,"revision":files.manifest.revision,
+                "manifest_digest":files.manifest.digest()?,"layers":config.num_hidden_layers,
+                "context":config.max_position_embeddings,"artifacts":files.manifest.artifacts.len()}),
+                )
+            })(),
+        );
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version":1,"ready_for_local_checks":!failed,
+            "platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,
+            "hardware":synapse_core::HardwareProbe::detect(),"checks":checks,
+            "not_tested":["remote reachability","multicast discovery","physical device sharding","WAN"]
+        }))?
+    );
+    if failed {
+        bail!("readiness checks failed; resolve the named failures before starting")
+    }
+    Ok(())
 }
 
 fn show_identity() -> Result<()> {
@@ -189,11 +347,6 @@ fn truncate_hex(hex: &str, show_bytes: usize) -> String {
 /// Interpret C-style escape sequences in prompt strings.
 fn unescape_prompt(s: &str) -> String {
     s.replace("\\n", "\n").replace("\\t", "\t")
-}
-
-/// Wrap user input in SmolLM2's chat template.
-fn format_instruct_prompt(user_input: &str) -> String {
-    format!("<|im_start|>user\n{user_input}<|im_end|>\n<|im_start|>assistant\n")
 }
 
 const SYNAPSE_ASCII_LOGO: &str = r#"   _____
@@ -274,20 +427,28 @@ async fn onboarding_gateway() -> Result<()> {
             let prompt = prompt_optional("Initial prompt (optional, press Enter to skip)")?;
             let max_tokens = prompt_usize_default("Max tokens", 200)?;
             let listen = prompt_default("Listen address", "0.0.0.0:0")?;
-            host(true, model, prompt, max_tokens, listen).await
+            host(
+                true,
+                model,
+                prompt,
+                max_tokens,
+                listen,
+                HostOptions::default(),
+            )
+            .await
         }
         1 => {
             println!("\n[info] join requires pairing code from an active host session");
             let model = prompt_model_choice(&cached_models)?;
             let master_addr = prompt_optional("Master address (optional, press Enter for mDNS)")?;
             let code = prompt_required("Pairing code (shown by host)")?;
-            join(master_addr, model, code).await
+            join(master_addr, model, code, None, None, "0.0.0.0:0".into()).await
         }
         2 => {
             println!("\n[info] connect discovers master via DHT");
             let model = prompt_model_choice(&cached_models)?;
             let code = prompt_required("Pairing code (shown by host)")?;
-            join(None, model, code).await
+            join(None, model, code, None, None, "0.0.0.0:0".into()).await
         }
         3 => {
             let model = prompt_model_choice(&cached_models)?;
@@ -417,6 +578,76 @@ fn prompt_line(label: &str) -> Result<String> {
     Ok(input.trim().to_owned())
 }
 
+#[derive(Debug)]
+struct HostOptions {
+    once: bool,
+    raw_prompt: bool,
+    min_workers: usize,
+    timeout_secs: u64,
+    events_jsonl: Option<PathBuf>,
+    memory_mib: Option<u64>,
+    coordinator_only: bool,
+}
+impl Default for HostOptions {
+    fn default() -> Self {
+        Self {
+            once: false,
+            raw_prompt: false,
+            min_workers: 1,
+            timeout_secs: 120,
+            events_jsonl: None,
+            memory_mib: None,
+            coordinator_only: false,
+        }
+    }
+}
+
+struct EventLog {
+    file: Option<std::fs::File>,
+    started: Instant,
+}
+impl EventLog {
+    fn new(path: Option<&PathBuf>) -> Result<Self> {
+        let file = path
+            .map(|path| {
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                options.open(path)
+            })
+            .transpose()?;
+        Ok(Self {
+            file,
+            started: Instant::now(),
+        })
+    }
+    fn record(&mut self, event: &str, value: serde_json::Value) -> Result<()> {
+        if let Some(file) = &mut self.file {
+            serde_json::to_writer(
+                &mut *file,
+                &serde_json::json!({"event":event,"elapsed_us":self.started.elapsed().as_micros(),"data":value}),
+            )?;
+            writeln!(file)?;
+            file.flush()?;
+        }
+        Ok(())
+    }
+}
+
+fn inference_budget(mib: Option<u64>) -> Result<Option<u64>> {
+    mib.map(|value| {
+        value
+            .checked_mul(1024 * 1024)
+            .filter(|bytes| *bytes > 0)
+            .context("memory limit must be positive and must not overflow")
+    })
+    .transpose()
+}
+
 // ─── Host (Master) ───────────────────────────────────────────────────────────
 
 async fn host(
@@ -425,11 +656,35 @@ async fn host(
     prompt: Option<String>,
     max_tokens: usize,
     listen: String,
+    options: HostOptions,
 ) -> Result<()> {
     if !master {
         bail!("phase 1 only supports `synapse host --master`");
     }
 
+    if !(1..=64).contains(&options.min_workers)
+        || options.timeout_secs == 0
+        || !(1..=4096).contains(&max_tokens)
+    {
+        bail!("workers must be 1..64, max tokens 1..4096, and timeout positive");
+    }
+    let prompt_model_id = if std::path::Path::new(&model).is_dir() {
+        synapse_core::inference::model_loader::ModelFiles::from_directory(std::path::Path::new(
+            &model,
+        ))?
+        .manifest
+        .model_id
+    } else {
+        model.clone()
+    };
+    let format_prompt = |text: &str| {
+        synapse_core::inference::prompt_format::format_prompt_for_model(
+            &prompt_model_id,
+            text,
+            options.raw_prompt,
+        )
+    };
+    let mut events = EventLog::new(options.events_jsonl.as_ref())?;
     let model = ModelIdentity::new(model);
     model.validate()?;
 
@@ -460,8 +715,14 @@ async fn host(
     )
     .await?;
 
+    if let Some(bytes) = inference_budget(options.memory_mib)? {
+        node.set_memory_limit_bytes(bytes)?;
+    }
+    node.set_coordinator_only(options.coordinator_only)?;
     node.load_model().await?;
-    println!("[ok] model loaded\n");
+    println!("[ok] model metadata verified\n");
+    let mut status_rx = node.status_receiver();
+    events.record("node_started", serde_json::json!({"peer_id":node.local_peer_id().to_string(),"model":prompt_model_id,"min_workers":options.min_workers,"memory_mib":options.memory_mib,"coordinator_only":options.coordinator_only}))?;
 
     // Set up interactive chat channels
     let (prompt_tx, mut event_rx) = node.chat_channels();
@@ -472,18 +733,24 @@ async fn host(
     // Spawn the swarm event loop in a background task
     let node_handle = tokio::spawn(async move { node.run().await });
 
-    // Wait for the worker to connect
-    loop {
-        match event_rx.recv().await {
-            Some(ChatEvent::WorkerConnected) => break,
-            Some(other) => {
-                debug!(?other, "unexpected event before worker connected");
-            }
-            None => {
-                bail!("node shut down before worker connected");
+    // A first connection does not mean the requested topology is ready.
+    let ready = tokio::time::timeout(Duration::from_secs(options.timeout_secs), async {
+        loop {
+            if status_rx.borrow().authenticated_count >= options.min_workers { break Ok::<(), anyhow::Error>(()); }
+            tokio::select! {
+                changed = status_rx.changed() => { changed.context("node status channel closed")?; }
+                event = event_rx.recv() => { if event.is_none() { bail!("node stopped before worker authentication"); } }
             }
         }
+    }).await;
+    if !matches!(ready, Ok(Ok(()))) {
+        node_handle.abort();
+        bail!("workers did not authenticate within the configured deadline");
     }
+    events.record(
+        "workers_authenticated",
+        serde_json::to_value(status_rx.borrow().clone())?,
+    )?;
 
     // ─── Interactive REPL ────────────────────────────────────────────────
     print_panel(
@@ -502,7 +769,11 @@ async fn host(
 
     if let Some(ref first) = first_prompt {
         println!("[you] {first}");
-        let formatted = format_instruct_prompt(first);
+        let formatted = format_prompt(first)?;
+        events.record(
+            "request_started",
+            serde_json::json!({"max_tokens":max_tokens}),
+        )?;
         if let Err(error) = prompt_tx.try_send(formatted) {
             bail!("failed to send initial prompt to node: {error}");
         }
@@ -539,7 +810,11 @@ async fn host(
                         let _ = io::stdout().flush();
                         continue;
                     }
-                    let formatted = format_instruct_prompt(trimmed);
+                    let formatted = format_prompt(trimmed)?;
+                    events.record(
+                        "request_started",
+                        serde_json::json!({"max_tokens":max_tokens}),
+                    )?;
                     if let Err(error) = prompt_tx.try_send(formatted) {
                         eprintln!("\n[error] failed to send prompt to node: {error}");
                         continue;
@@ -553,42 +828,42 @@ async fn host(
             }
         }
 
-        // Stream generation output
+        // Stream every real generated token and retain exact completion counts.
         print!("\n[assistant] ");
         let _ = io::stdout().flush();
-
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(options.timeout_secs);
+        let mut generation_failed = false;
         loop {
-            match event_rx.recv().await {
-                Some(ChatEvent::Token(token)) => {
-                    print!("{token}");
-                    let _ = io::stdout().flush();
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    events.record("generation_timeout", serde_json::json!({}))?;
+                    node_handle.abort(); bail!("generation deadline exceeded");
                 }
-                Some(ChatEvent::GenerationDone {
-                    tokens_generated,
-                    reason,
-                }) => {
-                    println!(); // newline after streaming
-                    match reason {
-                        StopReason::Eos => {
-                            debug!(tokens_generated, "generation stopped: EOS");
-                        }
-                        StopReason::MaxTokens => {
-                            println!("  [max tokens reached]");
-                        }
-                        StopReason::Error => {
-                            println!("  [generation stopped due to error]");
-                        }
+                changed = status_rx.changed() => {
+                    if changed.is_ok() { events.record("status", serde_json::to_value(status_rx.borrow().clone())?)?; }
+                }
+                event = event_rx.recv() => match event {
+                    Some(ChatEvent::TokenGenerated { token_id, position }) => {
+                        events.record("token", serde_json::json!({"token_id":token_id,"position":position}))?;
                     }
-                    break;
-                }
-                Some(ChatEvent::WorkerConnected) => {
-                    // Ignore duplicate
-                }
-                None => {
-                    eprintln!("\n[error] connection to node lost");
-                    return Ok(());
+                    Some(ChatEvent::Token(text)) => { print!("{text}"); let _ = io::stdout().flush(); }
+                    Some(ChatEvent::GenerationDone { tokens_generated, reason }) => {
+                        let reason = match reason { StopReason::Eos => "eos", StopReason::MaxTokens => "length", StopReason::Error => { generation_failed = true; "error" } };
+                        events.record("generation_done", serde_json::json!({"tokens_generated":tokens_generated,"reason":reason}))?;
+                        println!("\n[complete] tokens={tokens_generated} reason={reason}");
+                        break;
+                    }
+                    Some(ChatEvent::WorkerConnected) => {}
+                    None => { generation_failed = true; break; }
                 }
             }
+        }
+        if generation_failed {
+            node_handle.abort();
+            bail!("distributed generation failed; see retained node logs");
+        }
+        if options.once {
+            break;
         }
 
         // After generation, always readline next
@@ -597,8 +872,13 @@ async fn host(
 
     // Node will shut down when prompt_tx is dropped
     drop(prompt_tx);
-    if let Err(error) = node_handle.await {
-        eprintln!("node task panicked: {error}");
+    let mut node_handle = node_handle;
+    if tokio::time::timeout(Duration::from_secs(3), &mut node_handle)
+        .await
+        .is_err()
+    {
+        node_handle.abort();
+        let _ = node_handle.await;
     }
 
     Ok(())
@@ -606,7 +886,14 @@ async fn host(
 
 // ─── Join (Worker) ───────────────────────────────────────────────────────────
 
-async fn join(master_addr: Option<String>, model: String, code: String) -> Result<()> {
+async fn join(
+    master_addr: Option<String>,
+    model: String,
+    code: String,
+    memory_mib: Option<u64>,
+    events_jsonl: Option<PathBuf>,
+    listen: String,
+) -> Result<()> {
     validate_pairing_code(&code).context("pairing code format validation failed")?;
 
     let model = ModelIdentity::new(model);
@@ -639,16 +926,34 @@ async fn join(master_addr: Option<String>, model: String, code: String) -> Resul
             manual_master,
         },
         model,
-        default_listen_addr(),
+        parse_listen_addr(&listen).map_err(|error| anyhow!(error))?,
     )
     .await?;
 
+    if let Some(bytes) = inference_budget(memory_mib)? {
+        node.set_memory_limit_bytes(bytes)?;
+    }
     node.load_model().await?;
     println!("[ok] model loaded\n");
 
     println!("peer id: {}", node.local_peer_id());
     println!("[status] searching for master via mDNS...\n");
-    node.run().await?;
+    let mut status = node.status_receiver();
+    let mut events = EventLog::new(events_jsonl.as_ref())?;
+    events.record(
+        "node_started",
+        serde_json::json!({"peer_id":node.local_peer_id().to_string(),"memory_mib":memory_mib}),
+    )?;
+    let monitor = tokio::spawn(async move {
+        while status.changed().await.is_ok() {
+            if let Ok(value) = serde_json::to_value(status.borrow().clone()) {
+                let _ = events.record("status", value);
+            }
+        }
+    });
+    let result = node.run().await;
+    monitor.abort();
+    result?;
 
     Ok(())
 }
@@ -696,7 +1001,13 @@ async fn demo(model: String, prompt: String, max_tokens: usize) -> Result<()> {
 
     // Download model
     println!("\n[status] downloading model...");
-    let files = download_model(&model).await?;
+    let files = if std::path::Path::new(&model).is_dir() {
+        synapse_core::inference::model_loader::ModelFiles::from_directory(std::path::Path::new(
+            &model,
+        ))?
+    } else {
+        download_model(&model).await?
+    };
     println!("[ok] model downloaded\n");
 
     // Load config, weights, and tokenizer
@@ -772,6 +1083,39 @@ async fn demo(model: String, prompt: String, max_tokens: usize) -> Result<()> {
         ],
     );
 
+    Ok(())
+}
+
+fn infer_local(
+    directory: PathBuf,
+    prompt: String,
+    max_tokens: usize,
+    event_path: Option<PathBuf>,
+) -> Result<()> {
+    use synapse_core::backend::{BackendLimits, Cancellation, CandleBackend, PromptFormat};
+    let files = synapse_core::inference::model_loader::ModelFiles::from_directory(&directory)?;
+    let mut backend = CandleBackend::load(
+        files.manifest.model_id.clone(),
+        &files,
+        BackendLimits::default(),
+        PromptFormat::Raw,
+    )?;
+    let mut log = EventLog::new(event_path.as_ref())?;
+    log.record("request_started", serde_json::json!({"model_digest":files.manifest.digest()?,"max_tokens":max_tokens,"topology":"local"}))?;
+    let usage = backend.generate(&prompt, max_tokens, &Cancellation::default(), |token| {
+        log.record(
+            "token",
+            serde_json::json!({"token_id":token.token_id,"position":token.position}),
+        )?;
+        print!("{}", token.text);
+        io::stdout().flush()?;
+        Ok(true)
+    })?;
+    log.record(
+        "generation_done",
+        serde_json::json!({"tokens_generated":usage.output_tokens,"reason":usage.finish_reason}),
+    )?;
+    println!();
     Ok(())
 }
 

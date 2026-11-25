@@ -30,9 +30,11 @@ and returning success. CI also runs for stacked PR bases.
 
 ## Evidence limits
 
-This package establishes local build/lint repairs. Test-suite results and
-GitHub check URLs are recorded in the final implementation evidence after
-integration. Model-network tests are migrated to deterministic original
+The repaired foundation passed 138 tests locally (113 core unit tests, 22
+core integration tests, and three GUI tests); all tests and doc tests completed
+with no failures. The locked workspace build and strict all-targets Clippy
+passed. Remote CI is not claimed: automatic publication approval has not been
+granted. Later integration results are recorded separately. Model-network tests are migrated to deterministic original
 fixtures in PR-40; that is separate from pretending a network download passed.
 No physical-device, WAN, performance, production or release acceptance is
 implied by this foundation repair.

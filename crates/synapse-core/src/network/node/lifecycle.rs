@@ -81,7 +81,10 @@ impl SynapseNode {
                 let ping = ping::Behaviour::new(ping::Config::default());
 
                 // mDNS — LAN fast-path discovery.
-                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
+                let mdns = Toggle::from(match mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id) {
+                    Ok(behaviour) => Some(behaviour),
+                    Err(error) => { warn!(%error, "LAN multicast discovery unavailable; explicit authenticated addresses remain available"); None }
+                });
 
                 // Request-response — the core Synapse protocol.
                 let request_response = request_response::Behaviour::with_codec(
@@ -92,7 +95,7 @@ impl SynapseNode {
                         .with_max_concurrent_streams(128), // Increased for pipelining support
                 );
 
-                Ok(SynapseBehaviour {
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(SynapseBehaviour {
                     identify,
                     relay,
                     relay_server,
