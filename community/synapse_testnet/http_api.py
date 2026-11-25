@@ -22,6 +22,8 @@ ROUTES={
  'GET /v1/worker/assignments': ('assignments', ()),
  'POST /v1/devices/challenge': ('device_challenge', ('device',)),
  'POST /v1/devices/prove': ('prove_device', ('body','signature')),
+ 'POST /v1/devices/heartbeat': ('heartbeat', ('body','signature')),
+ 'POST /v1/worker/control': ('worker_control', ('device','action')),
  'POST /v1/receipts': ('receipt', ('body','signature')),
  'GET /v1/verifier/pending': ('pending', ()),
  'POST /v1/verifier/validate': ('validate', ('assignment','receipt_digest','accepted','observed_output','observed_evidence')),

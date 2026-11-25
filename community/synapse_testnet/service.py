@@ -134,8 +134,36 @@ class Service(Ledger):
             expected={'device':d['id'],'owner':a['id'],'pool':a['pool'],'nonce':d['challenge'],'expires':d['challenge_expires']}
             require(body==expected and d['challenge'] and self.clock()<d['challenge_expires'],'EXPIRED_OR_REPLAYED_PROOF',403)
             verify_sig(d['pubkey'],body,signature,b'synapse-testnet-device-v1\0')
-            db.execute('UPDATE devices SET proved=1,challenge=NULL,challenge_expires=NULL WHERE id=?',(d['id'],))
+            db.execute("UPDATE devices SET proved=1,challenge=NULL,challenge_expires=NULL,mode='ready',ready_until=? WHERE id=?",(self.clock()+60,d['id']))
             self.audit(db,a['pool'],a['id'],'device_proved',d['id'])
+            return {'heartbeat_sequence':d['heartbeat_seq'],'ready_until':self.clock()+60}
+
+    def heartbeat(self, token, body, signature):
+        require(isinstance(body,dict) and set(body)=={'device','sequence','issued'},'INVALID_HEARTBEAT')
+        ident(body['device']); integer(body['sequence'],1,CAP); integer(body['issued'],1,2**62)
+        with self.tx() as db:
+            a=self.actor(db,token,{'worker'},True)
+            d=self.row(db,'SELECT * FROM devices WHERE id=? AND owner=? AND enabled=1 AND proved=1',(body['device'],a['id']))
+            require(abs(self.clock()-body['issued'])<=15 and body['sequence']>d['heartbeat_seq'],'STALE_HEARTBEAT',409)
+            verify_sig(d['pubkey'],body,signature,b'synapse-testnet-heartbeat-v1\0')
+            require(d['mode']!='stopped','DEVICE_STOPPED',409)
+            db.execute('UPDATE devices SET ready_until=?,heartbeat_seq=? WHERE id=?',(self.clock()+60,body['sequence'],d['id']))
+            return {'mode':d['mode'],'ready_until':self.clock()+60}
+
+    def worker_control(self, token, device, action):
+        require(action in ('pause','resume','drain','stop'),'INVALID_ACTION')
+        with self.tx() as db:
+            a=self.actor(db,token,{'worker'},True)
+            d=self.row(db,'SELECT * FROM devices WHERE id=? AND owner=? AND enabled=1 AND proved=1',(device,a['id']))
+            mode={'pause':'paused','resume':'ready','drain':'draining','stop':'stopped'}[action]
+            if action=='resume':
+                require(d['mode']!='stopped' and d['ready_until']>self.clock(),'FRESH_DEVICE_PROOF_REQUIRED',409)
+            db.execute('UPDATE devices SET mode=? WHERE id=?',(mode,device))
+            if action=='stop':
+                jobs=db.execute("SELECT j.* FROM jobs j JOIN assignments s ON j.id=s.job WHERE s.device=? AND j.state='running'",(device,)).fetchall()
+                for j in jobs: self._refund(db,j,'failed')
+            self.audit(db,a['pool'],a['id'],'worker_'+action,device)
+            return {'mode':mode}
 
     def revoke(self, token, target, kind):
         with self.tx() as db:
@@ -171,7 +199,7 @@ class Service(Ledger):
     def _route(self, db, a, q):
         model=self.row(db,'SELECT * FROM models WHERE pool=? AND digest=? AND enabled=1',(a['pool'],q['model']))
         # One worker device per stage; full-model preferred, then fewest stages.
-        rows=db.execute("SELECT d.* FROM devices d JOIN members m ON d.owner=m.id WHERE m.pool=? AND m.enabled=1 AND m.consent=? AND d.enabled=1 AND d.proved=1 AND d.model=? AND m.id!=? AND (SELECT COUNT(*) FROM assignments s JOIN jobs j ON s.job=j.id WHERE s.device=d.id AND j.state='running')<d.max_jobs ORDER BY d.id LIMIT 128",(a['pool'],a['consent_version'],q['model'],a['id'])).fetchall()
+        rows=db.execute("SELECT d.* FROM devices d JOIN members m ON d.owner=m.id WHERE m.pool=? AND m.enabled=1 AND m.consent=? AND d.enabled=1 AND d.proved=1 AND d.mode='ready' AND d.ready_until>? AND d.model=? AND m.id!=? AND (SELECT COUNT(*) FROM assignments s JOIN jobs j ON s.job=j.id WHERE s.device=d.id AND j.state='running')<d.max_jobs ORDER BY d.id LIMIT 128",(a['pool'],a['consent_version'],self.clock(),q['model'],a['id'])).fetchall()
         routes={0: []}
         for start in range(model['layers']):
             if start not in routes or len(routes[start])>=4: continue
@@ -217,7 +245,7 @@ class Service(Ledger):
     def assignments(self, token):
         with self.read() as db:
             a=self.actor(db,token,{'worker'},True)
-            return [dict(r) for r in db.execute("SELECT s.id AS assignment,s.job,s.device,s.epoch,s.first_layer,s.end_layer,q.model,q.input_units,q.max_output,j.expires FROM assignments s JOIN devices d ON s.device=d.id JOIN jobs j ON s.job=j.id JOIN quotes q ON j.quote=q.id WHERE d.owner=? AND d.enabled=1 AND j.state='running' AND j.expires>? ORDER BY j.id,s.first_layer",(a['id'],self.clock()))]
+            return [dict(r) for r in db.execute("SELECT s.id AS assignment,s.job,s.device,s.epoch,s.first_layer,s.end_layer,q.model,q.input_units,q.max_output,j.expires FROM assignments s JOIN devices d ON s.device=d.id JOIN jobs j ON s.job=j.id JOIN quotes q ON j.quote=q.id WHERE d.owner=? AND d.enabled=1 AND d.ready_until>? AND j.state='running' AND j.expires>? ORDER BY j.id,s.first_layer",(a['id'],self.clock(),self.clock()))]
 
     def receipt(self, token, body, signature):
         require(isinstance(body,dict) and set(body)==RECEIPT_FIELDS,'INVALID_RECEIPT')
@@ -225,14 +253,14 @@ class Service(Ledger):
         digest(body['model']); digest(body['evidence']); integer(body['epoch'],1,1); integer(body['input_units'],1,32768); integer(body['output_units'],1,32768)
         with self.tx() as db:
             a=self.actor(db,token,{'worker'},True)
-            r=self.row(db,'SELECT s.*,d.pubkey,d.enabled,j.expires,j.state,q.model,q.input_units,q.max_output FROM assignments s JOIN devices d ON s.device=d.id JOIN jobs j ON s.job=j.id JOIN quotes q ON j.quote=q.id WHERE s.id=? AND d.owner=?',(body['assignment'],a['id']))
+            r=self.row(db,'SELECT s.*,d.pubkey,d.enabled,d.ready_until,j.expires,j.state,q.model,q.input_units,q.max_output FROM assignments s JOIN devices d ON s.device=d.id JOIN jobs j ON s.job=j.id JOIN quotes q ON j.quote=q.id WHERE s.id=? AND d.owner=?',(body['assignment'],a['id']))
             require(r['enabled'] and body['job']==r['job'] and body['model']==r['model'] and body['epoch']==r['epoch'] and body['input_units']==r['input_units'] and body['output_units']<=r['max_output'],'RECEIPT_SCOPE',403)
             verify_sig(r['pubkey'],body,signature,b'synapse-testnet-receipt-v1\0')
             rh=sha(canonical(body)); prev=db.execute('SELECT * FROM receipts WHERE assignment=?',(r['id'],)).fetchone()
             if prev:
                 require(prev['digest']==rh and prev['signature']==signature,'RECEIPT_CONFLICT',409)
                 return {'status':prev['status'],'digest':rh}
-            require(r['state']=='running' and r['expires']>self.clock(),'LEASE_EXPIRED',409)
+            require(r['state']=='running' and min(r['expires'],r['ready_until'])>self.clock(),'LEASE_EXPIRED',409)
             db.execute("INSERT INTO receipts(assignment,body,signature,digest,output_units,input_units,status) VALUES(?,?,?,?,?,?,'pending')",(r['id'],canonical(body).decode(),signature,rh,body['output_units'],body['input_units']))
             self.audit(db,a['pool'],a['id'],'receipt_pending',r['id']); self.event(db,a['pool'],'receipt_pending',r['id'])
             return {'status':'pending','digest':rh}
@@ -267,8 +295,8 @@ class Service(Ledger):
             if j['state']=='settled': return self._job_view(db,j)
             require(j['state']=='running' and j['expires']>self.clock(),'LEASE_EXPIRED',409)
             q=self.row(db,'SELECT * FROM quotes WHERE id=?',(j['quote'],))
-            rows=db.execute('SELECT s.*,d.owner,r.status,r.output_units,r.verifier,m.enabled AS owner_enabled,d.enabled AS device_enabled,v.enabled AS verifier_enabled FROM assignments s JOIN devices d ON s.device=d.id JOIN members m ON d.owner=m.id LEFT JOIN receipts r ON s.id=r.assignment LEFT JOIN members v ON r.verifier=v.id WHERE s.job=? ORDER BY s.first_layer',(job,)).fetchall()
-            require(rows and all(r['status']=='verified' and r['owner_enabled'] and r['device_enabled'] and r['verifier_enabled'] for r in rows),'WORK_NOT_VERIFIED',409)
+            rows=db.execute('SELECT s.*,d.owner,r.status,r.output_units,r.verifier,m.enabled AS owner_enabled,d.enabled AS device_enabled,d.ready_until,v.enabled AS verifier_enabled FROM assignments s JOIN devices d ON s.device=d.id JOIN members m ON d.owner=m.id LEFT JOIN receipts r ON s.id=r.assignment LEFT JOIN members v ON r.verifier=v.id WHERE s.job=? ORDER BY s.first_layer',(job,)).fetchall()
+            require(rows and all(r['status']=='verified' and r['owner_enabled'] and r['device_enabled'] and r['ready_until']>self.clock() and r['verifier_enabled'] for r in rows),'WORK_NOT_VERIFIED',409)
             counts={r['output_units'] for r in rows}; require(len(counts)==1,'INCONSISTENT_DELIVERY',409)
             count=counts.pop(); t=self.row(db,'SELECT * FROM tariffs WHERE pool=? AND version=?',(j['pool'],q['tariff']))
             cost=integer(t['base']+t['prefill']*q['input_units']+t['decode']*count,1,q['maximum'])
@@ -299,8 +327,8 @@ class Service(Ledger):
 
     def sweep(self):
         with self.tx() as db:
-            jobs=db.execute("SELECT * FROM jobs WHERE state='running' AND expires<=?",(self.clock(),)).fetchall()
-            for j in jobs: self._refund(db,j,'expired')
+            jobs=db.execute("SELECT DISTINCT j.* FROM jobs j JOIN assignments a ON a.job=j.id JOIN devices d ON d.id=a.device WHERE j.state='running' AND (j.expires<=? OR d.ready_until<=?)",(self.clock(),self.clock())).fetchall()
+            for j in jobs: self._refund(db,j,'expired' if j['expires']<=self.clock() else 'failed')
             return len(jobs)
 
     def balance(self, token):
