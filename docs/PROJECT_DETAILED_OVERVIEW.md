@@ -1,3 +1,5 @@
+> **Historical source overview:** This document predates the v2 execution plan. Its implementation and performance claims are not current acceptance evidence. Use [the master plan](MASTER_PLAN.md), [status](IMPLEMENTATION_STATUS.md) and revision-specific test artifacts.
+
 # Synapse Project Deep Dive
 
 ## 1. What Synapse Is

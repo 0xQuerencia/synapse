@@ -1,51 +1,60 @@
-# synapse
+# Synapse
 
-Run one language model across many computers, as if they were one computer.
+**Your devices. One AI.**
 
-Synapse cuts a model into layers and hands the pieces out over a peer to peer network. Your laptop holds the bottom of the network, a desktop across the room holds the top, and tokens flow between them while you chat. No cluster to rent, no cloud bill, no weights leaving your machines.
+Synapse is an experimental Rust project for cooperative inference with open-weight language models. The goal is to run a model locally, split its layers across trusted computers when one device cannot fit it, and eventually let approved contributors exchange useful compute for noncash usage credits.
 
-## how it works
+The repository contains an inference runtime built with Candle, libp2p networking, a CLI and a local web interface. **Code presence is not evidence of a validated public network.** Physical two-device memory savings, separate-network reliability, supported hardware and community accounting each have their own acceptance gates.
 
-1. The master owns the embedding, the first chunk of layers, and the output head. It runs the show: pairing codes, routing, sampling.
-2. Workers take the rest of the layers. A token hops from the master through each worker and back, one hidden state at a time.
-3. An optional relay on a public machine lets people behind home routers find each other. It relays encrypted traffic and seeds discovery.
+## Start here
 
-Peers find each other three ways. On one network, multicast DNS just works. Across the internet, a DHT keyed by model id locates masters serving the model you want. When both sides sit behind NAT, relay circuits plus hole punching connect them.
+- [Master plan: architecture, 56 proposed work packages and acceptance gates](docs/MASTER_PLAN.md)
+- [Implementation and evidence status](docs/IMPLEMENTATION_STATUS.md)
+- [Developer quickstart](docs/quickstart.md)
+- [Trust and privacy](SECURITY.md)
+- [License and provenance record](docs/upstream-provenance.md)
 
-## getting started
+## What is being built
 
-```
-git clone <repo url>
+| Mode | Purpose | Release condition |
+| --- | --- | --- |
+| Solo | Run one compatible model on your own machine | Reproducible local model parity |
+| Private cluster | Run across explicitly trusted devices, on LAN or internet | Real placement, memory and network evidence |
+| Approved community hosts | Send a bounded request to an approved full-model host | Security, consent, accounting and pilot gates |
+| Community layer sharding | Split a request across approved contributors | Separate correctness, recovery and settlement review |
+| Open public swarm | Research into untrusted global participation | Not an enabled product promise |
+
+Model distribution and inference are different operations. Sharing verified model files does not execute a model. Layer sharding also needs compatible weights, exact coverage, session state and a usable network path. A remote device that fits the entire model can be a better route than a chain of distant workers.
+
+## Build and inspect
+
+Initial target: Linux CPU. Use the repository toolchain file when available; workspace metadata declares the minimum supported Rust version. Native compiler/linker and dependency prerequisites are described in the quickstart.
+
+```sh
+git clone https://github.com/0xQuerencia/synapse.git
 cd synapse
-cargo build
+cargo build --release --locked --bin synapse
+./target/release/synapse --help
 ```
 
-Rust is the only requirement. Candle does the math, libp2p does the networking, and everything is tuned for the cpu you build on, so a plain build is already quick.
+These are reproduction commands, not a claim that your platform has been tested. Check the recorded command results for the exact revision you build. First-time model downloads additionally require network access and disk space.
 
-## running a session
-
-```
-synapse host
-synapse join
-synapse demo
+```sh
+./target/release/synapse demo \
+  --model hf-internal-testing/tiny-random-LlamaForCausalLM \
+  --prompt "Hello" --max-tokens 8
 ```
 
-Host starts a master and prints a pairing code. Join connects a worker to that master with the code. Demo runs the whole thing on one machine with no network, which is the fastest way to check a build.
+The tiny random model tests mechanics; its output is not meaningful language. Only use model revisions, formats and templates that have actually passed compatibility tests. See [quickstart](docs/quickstart.md) for trusted two-process experiments and local GUI instructions.
 
-Each command takes options. The useful ones: the model option points at any small llama model on Hugging Face, join wants the code the host printed, and the prompt option skips typing. Pass the help flag for the full list.
+## Contribute compute, use compute
 
-## the gui
+The proposed community loop is: accept eligible work, validate it, earn credits, then spend those credits on available community inference. Credits are planned noncash usage accounting. They are not cryptocurrency, transferable money, a guaranteed reward or a guarantee that a model will be available. Private inference must not depend on a hosted account or credit service.
 
-There is also a local web interface in the gui crate. Build it, run the binary it produces, and it prints a local url. You get the console, a live network map, per node hardware stats, and a connect by code panel. A contribute page exists too, for handing friends a pre filled join link.
+Contribution must be explicit, with resource caps and visible pause/stop controls. Transport encryption protects traffic in transit; computing peers may see prompts or infer information from activations. Use trusted devices and appropriate data. Local mode must never silently fall back to external compute.
 
-## config
+## Development
 
-Relay and bootstrap addresses live in toml files under config. Entries must be full multiaddrs ending in the peer id. Placeholders are skipped at load.
+Read [contributing](CONTRIBUTING.md) before modifying the runtime. Work-package IDs in commit messages map to the master plan. Build, test and benchmark outcomes belong to a specific revision and environment; report missing evidence rather than assuming success.
 
-## security
-
-Every peer is untrusted by default. Wire payloads are validated, tensor shapes and dtypes are checked, channels are bounded, and pairing codes never show up in logs after auth. Remote model paths are never accepted for execution.
-
-## status
-
-Working today: sharded inference on LAN and internet, self healing routes when a worker drops, speculative decoding, continuous batching, live telemetry. Next: true batched forward passes and smarter multi worker scheduling.
+The root [LICENSE](LICENSE) contains MIT terms. Workspace package metadata currently says Apache-2.0. That discrepancy is explicitly unresolved; this implementation does not choose a new license or assert rights over prior contributions. See the [provenance record](docs/upstream-provenance.md) before distributing packages or importing upstream code.
