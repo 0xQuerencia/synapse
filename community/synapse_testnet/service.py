@@ -70,11 +70,15 @@ class Service(Ledger):
     def approve_model(self, token, model, layers, max_context, synthetic_only):
         digest(model); integer(layers,1,256); integer(max_context,2,32768)
         require(synthetic_only is True and model==MODEL and layers==4 and max_context<=256,'TESTNET_SYNTHETIC_MODELS_ONLY',403)
+        self._approve_fixture_model(token,model,layers,max_context,'synthetic_model_approved')
+
+    def _approve_fixture_model(self,token,model,layers,max_context,event):
+        # Private trusted-fixture helper, never exposed as an HTTP operation.
         with self.tx() as db:
             a=self.actor(db,token,{'operator'})
             require(not db.execute('SELECT 1 FROM models WHERE pool=? AND digest=?',(a['pool'],model)).fetchone(),'MODEL_EXISTS',409)
             db.execute('INSERT INTO models VALUES(?,?,?,?,1)',(a['pool'],model,layers,max_context))
-            self.audit(db,a['pool'],a['id'],'synthetic_model_approved',model)
+            self.audit(db,a['pool'],a['id'],event,model)
 
     def disable_model(self, token, model):
         with self.tx() as db:
@@ -275,6 +279,10 @@ class Service(Ledger):
             a=self.actor(db,token,{'verifier'},True)
             return [dict(r) for r in db.execute("SELECT r.assignment,r.digest,r.body,s.first_layer,s.end_layer FROM receipts r JOIN assignments s ON s.id=r.assignment JOIN jobs j ON j.id=s.job WHERE j.pool=? AND j.state='running' AND r.status='pending' AND j.expires>? ORDER BY r.assignment LIMIT 100",(a['pool'],self.clock()))]
 
+    def _reference_evidence(self,body,stage):
+        require(body['model']==MODEL,'TESTNET_SYNTHETIC_MODELS_ONLY',403)
+        return observed({**body,'first_layer':stage['first_layer'],'end_layer':stage['end_layer']},stage['output_units'])
+
     def validate(self, token, assignment, receipt_digest, accepted, observed_output, observed_evidence):
         digest(receipt_digest); digest(observed_evidence); integer(observed_output,0,32768); require(type(accepted) is bool,'INVALID_BOOLEAN')
         with self.tx() as db:
@@ -282,7 +290,7 @@ class Service(Ledger):
             r=self.row(db,'SELECT r.*,s.job,s.first_layer,s.end_layer,j.state,j.expires FROM receipts r JOIN assignments s ON s.id=r.assignment JOIN jobs j ON j.id=s.job WHERE r.assignment=? AND j.pool=?',(assignment,a['pool']))
             require(r['digest']==receipt_digest,'RECEIPT_CONFLICT',409)
             body=json.loads(r['body'])
-            reference=observed({**body,'first_layer':r['first_layer'],'end_layer':r['end_layer']},r['output_units'])
+            reference=self._reference_evidence(body,r)
             status='verified' if accepted and observed_output==r['output_units'] and observed_evidence==body['evidence']==reference else 'rejected'
             if r['status']!='pending':
                 require(r['status']==status and r['verifier']==a['id'],'VALIDATION_CONFLICT',409)

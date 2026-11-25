@@ -50,6 +50,13 @@ jobs:
         run: |
           python3 scripts/gui_smoke.py --binary target/debug/synapse-gui \
             --require-websocket --source-revision "$GITHUB_SHA" --out artifacts/gui-smoke
+      - name: Exercise actual native CPU metering and disposable fake-credit settlement
+        run: |
+          python3 -m venv "$RUNNER_TEMP/synapse-native-lab"
+          "$RUNNER_TEMP/synapse-native-lab/bin/python" -m pip install -r community/requirements.txt
+          "$RUNNER_TEMP/synapse-native-lab/bin/python" scripts/native_accounting_lab.py \
+            --binary target/debug/synapse-gui --source-revision "$GITHUB_SHA" \
+            --out artifacts/native-accounting-lab
       - name: Preserve synthetic redacted evidence, including failed runs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
