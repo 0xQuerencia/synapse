@@ -250,7 +250,7 @@ mod tests {
 
         // Position 0 matches (3), position 1 mismatch (predict 6 instead of 5)
         let mut logits_data = vec![0.0_f32; draft_len * vocab_size];
-        logits_data[0 * vocab_size + 3] = 10.0; // position 0 → 3 ✓
+        logits_data[3] = 10.0; // position 0 → 3 ✓
         logits_data[vocab_size + 6] = 10.0; // position 1 → 6 ✗ (draft said 5)
         logits_data[2 * vocab_size + 7] = 10.0; // position 2 → 7 (not checked)
 

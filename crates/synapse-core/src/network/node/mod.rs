@@ -206,15 +206,6 @@ impl WorkerRegistry {
             .and_then(|entry| entry.wire_capability.clone())
     }
 
-    /// Update the structured capability for a peer. Used by the
-    /// `CapabilityPing` heartbeat path.
-    pub fn update_capability(&mut self, peer_id: PeerId, cap: crate::WorkerCapability) {
-        if let Some(entry) = self.entries.get_mut(&peer_id) {
-            entry.wire_capability = Some(cap);
-            entry.last_seen_at = Instant::now();
-        }
-    }
-
     /// Phase 4: record live per-device telemetry for a worker from the
     /// generation step that just completed. No-op if the peer isn't
     /// registered (e.g. it disconnected mid-step).

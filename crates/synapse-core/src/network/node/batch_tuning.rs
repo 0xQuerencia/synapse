@@ -1,10 +1,6 @@
-use libp2p::PeerId;
-use std::time::Instant;
-
 /// Batch size calibration state for a single worker.
 #[derive(Clone, Debug)]
 pub struct BatchCalibration {
-    pub peer_id: PeerId,
     /// Batch sizes to test: [1, 4, 8, 16, 32].
     pub test_sizes: Vec<usize>,
     /// Current test index in `test_sizes`.
@@ -21,9 +17,8 @@ pub struct BatchCalibration {
 
 impl BatchCalibration {
     /// Start a new calibration for a worker.
-    pub fn new(peer_id: PeerId) -> Self {
+    pub fn new() -> Self {
         Self {
-            peer_id,
             test_sizes: vec![1, 4, 8, 16, 32],
             current_test_index: 0,
             measured_throughput: Vec::new(),
@@ -34,6 +29,7 @@ impl BatchCalibration {
     }
 
     /// Get the current test batch size.
+    #[cfg(test)]
     pub fn current_batch_size(&self) -> usize {
         self.test_sizes
             .get(self.current_test_index)
@@ -65,6 +61,7 @@ impl BatchCalibration {
     }
 
     /// Get the optimal batch size and throughput after calibration completes.
+    #[cfg(test)]
     pub fn optimal_result(&self) -> Option<(usize, f32)> {
         if self.measured_throughput.len() != self.test_sizes.len() {
             return None;
@@ -90,7 +87,7 @@ mod tests {
 
     #[test]
     fn batch_calibration_collects_samples_across_sizes() {
-        let mut cal = BatchCalibration::new(PeerId::random());
+        let mut cal = BatchCalibration::new();
         assert_eq!(cal.current_batch_size(), 1);
 
         // Collect 5 samples for batch size 1
@@ -122,7 +119,7 @@ mod tests {
 
     #[test]
     fn batch_calibration_finds_optimal_batch_size() {
-        let mut cal = BatchCalibration::new(PeerId::random());
+        let mut cal = BatchCalibration::new();
 
         // Simulate measurements: batch 16 has best throughput
         let measurements = vec![

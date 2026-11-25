@@ -30,7 +30,7 @@ pub const MODEL_LAYER_FOOTPRINT_MB: u64 = 50;
 /// 2. `gpu_factor` = if GPU present:
 ///    `max(estimated_fp16_tflops / 10.0, 1.5)` — a slow GPU still
 ///    gets a 1.5× bonus over CPU; a 4090 (165 TFLOPS) gets ~16.5×.
-///  else: `1.0`.
+///    else: `1.0`.
 ///
 /// 3. `blended = measured * ram_factor * gpu_factor`
 ///

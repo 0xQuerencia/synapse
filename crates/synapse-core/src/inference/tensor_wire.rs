@@ -379,7 +379,7 @@ mod tests {
     /// within bf16's ~3-decimal-digit precision.
     #[test]
     fn bf16_wire_roundtrip_shrinks_payload_within_precision_budget() {
-        let original = Tensor::new(&[1.0_f32, -2.5, 3.14159, 100.25], &Device::Cpu)
+        let original = Tensor::new(&[1.0_f32, -2.5, std::f32::consts::PI, 100.25], &Device::Cpu)
             .unwrap()
             .reshape((2, 2))
             .unwrap();

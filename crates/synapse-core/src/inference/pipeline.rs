@@ -527,7 +527,7 @@ fn apply_causal_mask(attn: &Tensor, seq_len: usize, past_len: usize) -> Result<T
     let key_len = attn.dim(3)?;
     let mut mask = Vec::with_capacity(seq_len * key_len);
     for i in 0..seq_len {
-        mask.extend(std::iter::repeat(0.0_f32).take(key_len.min(past_len)));
+        mask.extend(std::iter::repeat_n(0.0_f32, key_len.min(past_len)));
         mask.extend((past_len..key_len).map(|j| {
             if j <= past_len + i {
                 0.0_f32

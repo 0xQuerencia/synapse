@@ -1370,7 +1370,7 @@ impl SynapseNode {
                     let recalibrated = self
                         .batch_profiles
                         .entry(peer)
-                        .or_insert_with(|| super::batch_tuning::BatchCalibration::new(peer))
+                        .or_insert_with(super::batch_tuning::BatchCalibration::new)
                         .record_sample(throughput);
                     if recalibrated {
                         info!(%peer, throughput, "batch calibration updated");
