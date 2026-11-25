@@ -2485,7 +2485,7 @@ impl ShardedModel for ToyLlamaGGUF {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::download_model;
+    use crate::inference::model_loader::test_model_files;
 
     #[test]
     fn invalid_config_fails_before_tensor_allocation() {
@@ -2498,7 +2498,8 @@ mod tests {
         let config = ToyLlamaConfig::from_file(&path).unwrap();
         assert!(
             ToyLlama::load_range(&config, Path::new("missing.safetensors"), 1..3)
-                .unwrap_err()
+                .err()
+                .unwrap()
                 .to_string()
                 .contains("range")
         );
@@ -2529,9 +2530,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_forward_pass() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
 
@@ -2546,14 +2545,12 @@ mod tests {
             .forward_full(&token_ids)
             .expect("forward pass should succeed");
 
-        assert_eq!(logits.dims(), &[1, 3, 32000]);
+        assert_eq!(logits.dims(), &[1, 3, config.vocab_size]);
     }
 
     #[tokio::test]
     async fn sharded_forward_matches_full() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
 
@@ -2590,9 +2587,7 @@ mod tests {
 
     #[tokio::test]
     async fn kv_cache_lifecycle_roundtrip() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
         let model = ToyLlama::load(&config, &files.weights).expect("model should load");
@@ -2639,9 +2634,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefill_then_decode_matches_full_last_token() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
         let model = ToyLlama::load(&config, &files.weights).expect("model should load");
@@ -2706,9 +2699,7 @@ mod tests {
 
     #[tokio::test]
     async fn decode_path_rejects_multi_token_hidden() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
         let model = ToyLlama::load(&config, &files.weights).expect("model should load");
@@ -2733,9 +2724,7 @@ mod tests {
 
     #[tokio::test]
     async fn sharded_prefill_decode_ranges_match_full_last_token() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
         let model = ToyLlama::load(&config, &files.weights).expect("model should load");
@@ -2828,9 +2817,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_kv_cache_range_only_resets_target_layers() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
         let model = ToyLlama::load(&config, &files.weights).expect("model should load");
@@ -2879,9 +2866,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_decode_rejects_multi_token_input_ids() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
         let model = ToyLlama::load(&config, &files.weights).expect("model should load");

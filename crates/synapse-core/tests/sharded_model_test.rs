@@ -11,11 +11,11 @@ use std::path::Path;
 use candle_core::{Device, Tensor};
 use synapse_core::{
     ToyLlama, ToyLlamaConfig,
-    inference::{ShardedModel, download_model, shard_files},
+    inference::{ShardedModel, shard_files},
 };
 
 /// The tiny checkpoint used across the repo's tests (2 layers, single-file).
-const TINY_MODEL: &str = "hf-internal-testing/tiny-random-LlamaForCausalLM";
+mod support;
 
 fn token_ids() -> Tensor {
     Tensor::new(&[1_u32, 2, 3], &Device::Cpu)
@@ -38,9 +38,7 @@ fn assert_logits_equal(full: &Tensor, sharded: &Tensor, what: &str) {
 
 #[tokio::test]
 async fn sharded_slices_match_full_forward() {
-    let files = download_model(TINY_MODEL)
-        .await
-        .expect("download should succeed");
+    let files = support::fixture_files();
     let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
 
     let full = ToyLlama::load(&config, &files.weights).expect("full model should load");
@@ -67,9 +65,7 @@ async fn sharded_slices_match_full_forward() {
 
 #[tokio::test]
 async fn sharded_head_last_token_matches_full() {
-    let files = download_model(TINY_MODEL)
-        .await
-        .expect("download should succeed");
+    let files = support::fixture_files();
     let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
 
     let full = ToyLlama::load(&config, &files.weights).expect("full model should load");
@@ -109,9 +105,7 @@ async fn sharded_head_last_token_matches_full() {
 
 #[tokio::test]
 async fn local_layer_index_validates_slice_window() {
-    let files = download_model(TINY_MODEL)
-        .await
-        .expect("download should succeed");
+    let files = support::fixture_files();
     let config = ToyLlamaConfig::from_file(&files.config).expect("config should parse");
 
     let master = ToyLlama::load_range(&config, &files.weights, 0..1).expect("slice should load");

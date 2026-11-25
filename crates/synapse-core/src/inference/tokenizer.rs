@@ -98,13 +98,11 @@ impl SimpleTokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::download_model;
+    use crate::inference::model_loader::test_model_files;
 
     #[tokio::test]
     async fn tokenizer_roundtrip() {
-        let files = download_model("hf-internal-testing/tiny-random-LlamaForCausalLM")
-            .await
-            .expect("download should succeed");
+        let files = test_model_files().expect("offline fixture should verify");
 
         let tokenizer =
             SimpleTokenizer::from_file(&files.tokenizer).expect("tokenizer should load");

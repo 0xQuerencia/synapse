@@ -398,6 +398,13 @@ impl ModelFiles {
 }
 
 #[cfg(test)]
+pub(crate) fn test_model_files() -> Result<ModelFiles> {
+    ModelFiles::from_directory(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-llama"),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
