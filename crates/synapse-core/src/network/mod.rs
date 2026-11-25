@@ -1,5 +1,6 @@
 mod codec;
 mod connection_pool;
+pub mod connectivity;
 mod messages;
 mod node;
 mod peer_cache;
