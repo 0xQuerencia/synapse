@@ -1,0 +1,46 @@
+name: Product and package checks
+on:
+  pull_request:
+    paths:
+      - 'scripts/release/**'
+      - 'web/landing/**'
+      - 'docs/**'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/workflows/package.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/release/**'
+      - 'web/landing/**'
+      - 'docs/**'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/workflows/package.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Exercise signature, archive, update and uninstall boundaries
+        run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+  static-product:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build complete static artifact
+        run: node web/landing/scripts/build.mjs
+      - name: Exercise resource model and semantic accessibility
+        run: |
+          node --test web/landing/scripts/simulator.test.mjs
+          node web/landing/scripts/check.mjs
+          python3 docs/evidence/check_gates.py
