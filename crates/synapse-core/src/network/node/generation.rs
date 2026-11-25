@@ -207,7 +207,13 @@ impl SynapseNode {
             self.total_layers,
             self.local_capability
                 .as_ref()
-                .and_then(WorkerCapabilitySnapshot::planner_capability),
+                .and_then(WorkerCapabilitySnapshot::planner_capability)
+                .map(|mut capability| {
+                    if self.coordinator_only {
+                        capability.available_ram_mb = 0;
+                    }
+                    capability
+                }),
             &workers_for_generation,
         ) {
             Ok(plan) => plan,
@@ -643,6 +649,10 @@ impl SynapseNode {
                 format!("<tok:{next_token}>")
             }
         };
+        self.emit(ChatEvent::TokenGenerated {
+            token_id: next_token,
+            position: self.tokens_generated,
+        });
         self.emit(ChatEvent::Token(decoded));
 
         // Feed the N-gram draft cache for speculative decoding.
@@ -782,6 +792,10 @@ impl SynapseNode {
                     format!("<tok:{token}>")
                 }
             };
+            self.emit(ChatEvent::TokenGenerated {
+                token_id: token,
+                position: self.tokens_generated,
+            });
             self.emit(ChatEvent::Token(decoded));
 
             self.token_ids.push(token);

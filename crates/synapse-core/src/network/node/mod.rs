@@ -61,6 +61,9 @@ pub enum ChatEvent {
     WorkerConnected,
     /// A single decoded token was generated.
     Token(String),
+    /// Exact accepted token, including EOS/special tokens. Position is zero
+    /// based within generated output, independently of decoded text chunks.
+    TokenGenerated { token_id: u32, position: usize },
     /// One generation round is complete.
     GenerationDone {
         tokens_generated: usize,
@@ -168,6 +171,18 @@ struct WorkerRegistry {
 }
 
 impl WorkerRegistry {
+    fn update_capability(&mut self, peer_id: PeerId, capability: crate::WorkerCapability) {
+        if let Some(entry) = self.entries.get_mut(&peer_id)
+            && entry.state == WorkerConnectionState::Authenticated
+        {
+            entry.capability = Some(WorkerCapabilitySnapshot {
+                compute_score: Some(capability.compute_score),
+                available_ram_mb: Some(capability.available_ram_mb),
+            });
+            entry.wire_capability = Some(capability);
+            entry.last_seen_at = Instant::now();
+        }
+    }
     fn mark_connected(&mut self, peer_id: PeerId) {
         self.upsert(peer_id, WorkerConnectionState::Connected, None);
     }
@@ -301,6 +316,10 @@ pub struct RouteHopView {
 /// Options); the `watch` channel only ever retains the latest value.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct NodeStatusSnapshot {
+    pub resident_weight_bytes: Option<u64>,
+    pub owned_layer_range: Option<Range<usize>>,
+    pub memory_budget_bytes: u64,
+    pub model_digest: Option<String>,
     /// Every worker the registry knows about, with connection state.
     pub peers: Vec<PeerSummary>,
     /// Number of workers that have fully authenticated (challenge-response).
@@ -418,6 +437,7 @@ pub struct SynapseNode {
     worker_assignment: Option<assignments::WorkerAssignment>,
     route_epoch: u64,
     memory_limit_bytes: u64,
+    coordinator_only: bool,
     role: SynapseRole,
     model: ModelIdentity,
     swarm: Swarm<SynapseBehaviour>,
@@ -670,8 +690,22 @@ impl SynapseNode {
     /// Build a snapshot of the current networking state.
     fn build_status_snapshot(&self) -> NodeStatusSnapshot {
         NodeStatusSnapshot {
+            resident_weight_bytes: self
+                .pipeline
+                .as_ref()
+                .map(|model| model.resident_weight_bytes()),
+            owned_layer_range: self
+                .pipeline
+                .as_ref()
+                .map(|model| model.layer_offset()..model.layer_offset() + model.owned_layers()),
+            memory_budget_bytes: self.memory_limit_bytes,
+            model_digest: self.model.sha256.clone(),
             peers: self.peers(),
-            authenticated_count: self.authenticated_workers.len(),
+            authenticated_count: if matches!(self.role, SynapseRole::Master { .. }) {
+                self.worker_peers.len()
+            } else {
+                self.authenticated_workers.len()
+            },
             route_plan: self.route_plan(),
             redial: match self.role {
                 SynapseRole::Worker { .. } => Some(self.redial_status()),

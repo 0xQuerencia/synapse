@@ -34,6 +34,24 @@ fn quantized_bytes(matrix: &QMatMul) -> u64 {
     }
 }
 
+/// Non-transformer tensor roles are assigned explicitly. A worker holds only
+/// its transformer slice; the coordinator owns token embedding and output head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TensorRoles {
+    pub input: bool,
+    pub output: bool,
+}
+impl TensorRoles {
+    pub const COORDINATOR: Self = Self {
+        input: true,
+        output: true,
+    };
+    pub const WORKER: Self = Self {
+        input: false,
+        output: false,
+    };
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 /// Configuration parsed from the model's `config.json`.
@@ -888,10 +906,12 @@ impl LlamaLayer {
 
 /// The Llama model for sharded inference (supports SmolLM2 and tiny-random).
 pub struct ToyLlama {
-    embed_tokens: Tensor,
+    embed_tokens: Option<Tensor>,
+    device: Device,
+    dtype: DType,
     layers: Vec<LlamaLayer>,
-    norm: RmsNorm,
-    lm_head: Tensor,
+    norm: Option<RmsNorm>,
+    lm_head: Option<Tensor>,
     rope: RotaryEmbedding,
     /// Global index of the first owned transformer block (0 for full loads).
     layer_offset: usize,
@@ -902,16 +922,18 @@ impl ToyLlama {
     /// Tensor storage actually owned by this backend, excluding KV/scratch and
     /// allocator overhead. Process RSS is measured separately by benchmarks.
     pub fn resident_weight_bytes(&self) -> u64 {
-        let mut bytes = [
-            &self.embed_tokens,
-            &self.lm_head,
-            &self.norm.weight,
-            &self.rope.cos,
-            &self.rope.sin,
-        ]
-        .into_iter()
-        .map(tensor_bytes)
-        .sum::<u64>();
+        let mut bytes = self
+            .embed_tokens
+            .iter()
+            .chain(self.lm_head.iter())
+            .map(tensor_bytes)
+            .sum::<u64>()
+            + self
+                .norm
+                .as_ref()
+                .map_or(0, |norm| tensor_bytes(&norm.weight))
+            + tensor_bytes(&self.rope.cos)
+            + tensor_bytes(&self.rope.sin);
         for layer in &self.layers {
             bytes += [
                 &layer.input_layernorm.weight,
@@ -949,6 +971,15 @@ impl ToyLlama {
         weights_path: &Path,
         range: Range<usize>,
     ) -> Result<Self> {
+        Self::load_range_with_roles(config, weights_path, range, TensorRoles::COORDINATOR)
+    }
+
+    pub fn load_range_with_roles(
+        config: &ToyLlamaConfig,
+        weights_path: &Path,
+        range: Range<usize>,
+        roles: TensorRoles,
+    ) -> Result<Self> {
         config.validate()?;
         anyhow::ensure!(
             range.start <= range.end && range.end <= config.num_hidden_layers,
@@ -966,15 +997,21 @@ impl ToyLlama {
             "float16" | "half" => DType::F16,
             _ => DType::F32,
         };
-        let shards = shard_files(weights_path)?;
+        let shards =
+            shard_files_for_assignment(weights_path, &range, roles, config.tie_word_embeddings)?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&shards, dtype, &device)? };
 
-        let embed_tokens = vb
-            .get(
-                (config.vocab_size, config.hidden_size),
-                "model.embed_tokens.weight",
+        let embed_tokens = if roles.input {
+            Some(
+                vb.get(
+                    (config.vocab_size, config.hidden_size),
+                    "model.embed_tokens.weight",
+                )
+                .context("failed to load embedding")?,
             )
-            .context("failed to load embed_tokens")?;
+        } else {
+            None
+        };
 
         let mut layers = Vec::with_capacity(range.end.saturating_sub(range.start));
         for i in range.clone() {
@@ -1086,19 +1123,31 @@ impl ToyLlama {
             });
         }
 
-        let norm_w = vb
-            .get(config.hidden_size, "model.norm.weight")
-            .context("failed to load final norm")?;
-
-        // Handle tied word embeddings: SmolLM2 doesn't have a separate lm_head
-        let lm_head = if config.tie_word_embeddings {
-            info!("using tied embeddings for lm_head");
-            embed_tokens.t()?.contiguous()?
+        let norm = if roles.output {
+            Some(RmsNorm {
+                weight: vb.get(config.hidden_size, "model.norm.weight")?,
+                eps: config.rms_norm_eps,
+            })
         } else {
-            vb.get((config.vocab_size, config.hidden_size), "lm_head.weight")
-                .context("failed to load lm_head")?
-                .t()?
-                .contiguous()?
+            None
+        };
+        let lm_head = if roles.output {
+            Some(if config.tie_word_embeddings {
+                let embedding = match &embed_tokens {
+                    Some(embedding) => embedding.clone(),
+                    None => vb.get(
+                        (config.vocab_size, config.hidden_size),
+                        "model.embed_tokens.weight",
+                    )?,
+                };
+                embedding.t()?.contiguous()?
+            } else {
+                vb.get((config.vocab_size, config.hidden_size), "lm_head.weight")?
+                    .t()?
+                    .contiguous()?
+            })
+        } else {
+            None
         };
 
         let rope = RotaryEmbedding::new(
@@ -1119,10 +1168,9 @@ impl ToyLlama {
         Ok(Self {
             embed_tokens,
             layers,
-            norm: RmsNorm {
-                weight: norm_w,
-                eps: config.rms_norm_eps,
-            },
+            norm,
+            device,
+            dtype,
             lm_head,
             rope,
             layer_offset: range.start,
@@ -1131,7 +1179,7 @@ impl ToyLlama {
     }
 
     fn model_device(&self) -> &Device {
-        self.embed_tokens.device()
+        &self.device
     }
 
     fn to_model_device(&self, tensor: &Tensor, tensor_name: &str) -> Result<Tensor> {
@@ -1157,7 +1205,11 @@ impl ToyLlama {
             token_ids.clone()
         };
 
-        let flat_hidden = self.embed_tokens.embedding(&flat_ids)?;
+        let flat_hidden = self
+            .embed_tokens
+            .as_ref()
+            .context("assignment has no input embedding role")?
+            .embedding(&flat_ids)?;
 
         let hidden = if dims.len() > 1 {
             let batch = dims[0];
@@ -1364,8 +1416,16 @@ impl ToyLlama {
     /// Output shape: [batch, seq_len, vocab_size].
     pub fn head(&self, hidden: &Tensor) -> Result<Tensor> {
         let hidden = self.to_model_device(hidden, "lm_head hidden state")?;
-        let normed = self.norm.forward(&hidden)?;
-        let logits = normed.broadcast_matmul(&self.lm_head)?;
+        let normed = self
+            .norm
+            .as_ref()
+            .context("assignment has no output head role")?
+            .forward(&hidden)?;
+        let logits = normed.broadcast_matmul(
+            self.lm_head
+                .as_ref()
+                .context("assignment has no output head role")?,
+        )?;
         info!(shape = ?logits.dims(), "lm_head complete");
         Ok(logits)
     }
@@ -1387,8 +1447,16 @@ impl ToyLlama {
         let seq_len = hidden.dim(1)?;
         anyhow::ensure!(seq_len > 0, "cannot compute a head for an empty sequence");
         let last_hidden = hidden.narrow(1, seq_len - 1, 1)?;
-        let normed = self.norm.forward(&last_hidden)?;
-        let logits = normed.broadcast_matmul(&self.lm_head)?;
+        let normed = self
+            .norm
+            .as_ref()
+            .context("assignment has no output head role")?
+            .forward(&last_hidden)?;
+        let logits = normed.broadcast_matmul(
+            self.lm_head
+                .as_ref()
+                .context("assignment has no output head role")?,
+        )?;
         trace!(shape = ?logits.dims(), "lm_head (last-token) complete");
         Ok(logits)
     }
@@ -1619,6 +1687,60 @@ pub fn shard_files(weights_path: &Path) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
+/// Select only checkpoint files containing assigned tensors. A single-file
+/// checkpoint is mapped while loading but unassigned tensors are never read.
+pub fn shard_files_for_assignment(
+    weights_path: &Path,
+    range: &Range<usize>,
+    roles: TensorRoles,
+    tied_embeddings: bool,
+) -> Result<Vec<PathBuf>> {
+    let index_path = weights_path.with_file_name("model.safetensors.index.json");
+    if !index_path.exists() {
+        return shard_files(weights_path);
+    }
+    // Validate every filename before considering only the selected tensors.
+    super::model_loader::read_safetensors_index(&index_path)?;
+    let index: serde_json::Value = serde_json::from_slice(&std::fs::read(&index_path)?)?;
+    let map = index
+        .get("weight_map")
+        .and_then(|value| value.as_object())
+        .context("missing weight_map")?;
+    let mut filenames = std::collections::BTreeSet::new();
+    for (tensor, filename) in map {
+        let layer_selected = tensor
+            .strip_prefix("model.layers.")
+            .and_then(|suffix| suffix.split('.').next())
+            .and_then(|number| number.parse::<usize>().ok())
+            .is_some_and(|layer| range.contains(&layer));
+        let input_selected = (roles.input || (roles.output && tied_embeddings))
+            && tensor == "model.embed_tokens.weight";
+        let output_selected =
+            roles.output && matches!(tensor.as_str(), "model.norm.weight" | "lm_head.weight");
+        if layer_selected || input_selected || output_selected {
+            filenames.insert(
+                filename
+                    .as_str()
+                    .context("non-string checkpoint filename")?
+                    .to_owned(),
+            );
+        }
+    }
+    anyhow::ensure!(
+        !filenames.is_empty(),
+        "no tensors found for requested assignment"
+    );
+    let directory = weights_path.parent().unwrap_or_else(|| Path::new("."));
+    filenames
+        .into_iter()
+        .map(|name| {
+            let path = directory.join(name);
+            anyhow::ensure!(path.is_file(), "missing selected checkpoint shard");
+            Ok(path)
+        })
+        .collect()
+}
+
 // ─── ShardedModel trait ─────────────────────────────────────────────────────
 
 /// Common inference surface shared by every model backend (safetensors
@@ -1674,7 +1796,7 @@ pub trait ShardedModel: Send + Sync {
 
 impl ShardedModel for ToyLlama {
     fn model_dtype(&self) -> DType {
-        self.embed_tokens.dtype()
+        self.dtype
     }
     fn resident_weight_bytes(&self) -> u64 {
         self.resident_weight_bytes()
@@ -2031,10 +2153,12 @@ impl GGUFLlamaLayer {
 /// matmuls (Q4_K_M, Q8_0, ...) stay compressed in RAM and dequantize on the
 /// fly. KV cache activations are plain f32 tensors.
 pub struct ToyLlamaGGUF {
-    embed_tokens: Tensor,
+    embed_tokens: Option<Tensor>,
+    device: Device,
+    shared_head_embedding: bool,
     layers: Vec<GGUFLlamaLayer>,
-    norm: RmsNorm,
-    lm_head: QMatMul,
+    norm: Option<RmsNorm>,
+    lm_head: Option<QMatMul>,
     rope: RotaryEmbedding,
     /// Global index of the first owned transformer block (0 for full loads).
     layer_offset: usize,
@@ -2080,16 +2204,18 @@ fn gguf_f64_or(content: &gguf_file::Content, key: &str, default: f64) -> f64 {
 
 impl ToyLlamaGGUF {
     pub fn resident_weight_bytes(&self) -> u64 {
-        let mut bytes = [
-            &self.embed_tokens,
-            &self.norm.weight,
-            &self.rope.cos,
-            &self.rope.sin,
-        ]
-        .into_iter()
-        .map(tensor_bytes)
-        .sum::<u64>()
-            + quantized_bytes(&self.lm_head);
+        let mut bytes = self.embed_tokens.iter().map(tensor_bytes).sum::<u64>()
+            + self
+                .norm
+                .as_ref()
+                .map_or(0, |norm| tensor_bytes(&norm.weight))
+            + tensor_bytes(&self.rope.cos)
+            + tensor_bytes(&self.rope.sin)
+            + if self.shared_head_embedding {
+                0
+            } else {
+                self.lm_head.as_ref().map_or(0, quantized_bytes)
+            };
         for layer in &self.layers {
             bytes += tensor_bytes(&layer.input_layernorm.weight)
                 + tensor_bytes(&layer.post_attention_layernorm.weight);
@@ -2122,6 +2248,15 @@ impl ToyLlamaGGUF {
     /// Slice-only construction of a quantized GGUF llama: loads the embed,
     /// final norm, LM head and only the transformer blocks in `range`.
     pub fn load_range(path: &Path, range: Range<usize>, device: &Device) -> Result<Self> {
+        Self::load_range_with_roles(path, range, device, TensorRoles::COORDINATOR)
+    }
+
+    pub fn load_range_with_roles(
+        path: &Path,
+        range: Range<usize>,
+        device: &Device,
+        roles: TensorRoles,
+    ) -> Result<Self> {
         info!(?path, ?range, "loading quantized GGUF llama weights");
         let mut file =
             File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -2178,15 +2313,18 @@ impl ToyLlamaGGUF {
         };
         config.validate()?;
 
-        let embed_tokens = content
-            .tensor(&mut file, "token_embd.weight", device)?
-            .dequantize(device)?;
-        if embed_tokens.dims() != [vocab, hidden] {
-            bail!(
-                "token_embd.weight shape {:?} != [{vocab}, {hidden}]",
-                embed_tokens.dims()
+        let embed_tokens = if roles.input {
+            let embedding = content
+                .tensor(&mut file, "token_embd.weight", device)?
+                .dequantize(device)?;
+            anyhow::ensure!(
+                embedding.dims() == [vocab, hidden],
+                "embedding dimensions mismatch"
             );
-        }
+            Some(embedding)
+        } else {
+            None
+        };
 
         let mut layers = Vec::with_capacity(range.end.saturating_sub(range.start));
         for i in range.clone() {
@@ -2254,18 +2392,32 @@ impl ToyLlamaGGUF {
             });
         }
 
-        let norm = RmsNorm {
-            weight: content
-                .tensor(&mut file, "output_norm.weight", device)?
-                .dequantize(device)?,
-            eps,
+        let norm = if roles.output {
+            Some(RmsNorm {
+                weight: content
+                    .tensor(&mut file, "output_norm.weight", device)?
+                    .dequantize(device)?,
+                eps,
+            })
+        } else {
+            None
         };
-
-        // `output.weight` may be absent when the LM head is tied to the
-        // embeddings; fall back to the dequantized embed matrix.
-        let lm_head = match content.tensor(&mut file, "output.weight", device) {
-            Ok(qt) => QMatMul::from_qtensor(qt)?,
-            Err(_) => QMatMul::Tensor(embed_tokens.clone()),
+        let shared_head_embedding =
+            roles.input && roles.output && !content.tensor_infos.contains_key("output.weight");
+        let lm_head = if roles.output {
+            Some(if content.tensor_infos.contains_key("output.weight") {
+                QMatMul::from_qtensor(content.tensor(&mut file, "output.weight", device)?)?
+            } else {
+                let embedding = match &embed_tokens {
+                    Some(embedding) => embedding.clone(),
+                    None => content
+                        .tensor(&mut file, "token_embd.weight", device)?
+                        .dequantize(device)?,
+                };
+                QMatMul::Tensor(embedding)
+            })
+        } else {
+            None
         };
 
         let rope = RotaryEmbedding::new(head_dim, max_pos.min(4096), rope_theta, device)?;
@@ -2276,6 +2428,8 @@ impl ToyLlamaGGUF {
         );
         Ok(ToyLlamaGGUF {
             embed_tokens,
+            device: device.clone(),
+            shared_head_embedding,
             layers,
             norm,
             lm_head,
@@ -2286,7 +2440,7 @@ impl ToyLlamaGGUF {
     }
 
     fn model_device(&self) -> &Device {
-        self.embed_tokens.device()
+        &self.device
     }
 
     fn to_model_device(&self, tensor: &Tensor, tensor_name: &str) -> Result<Tensor> {
@@ -2329,7 +2483,11 @@ impl ToyLlamaGGUF {
         } else {
             token_ids.clone()
         };
-        let flat_hidden = self.embed_tokens.embedding(&flat_ids)?;
+        let flat_hidden = self
+            .embed_tokens
+            .as_ref()
+            .context("assignment has no input embedding role")?
+            .embedding(&flat_ids)?;
         let hidden = if dims.len() > 1 {
             let batch = dims[0];
             let seq_len = dims[1];
@@ -2382,8 +2540,16 @@ impl ToyLlamaGGUF {
 
     pub fn head(&self, hidden: &Tensor) -> Result<Tensor> {
         let hidden = self.to_model_device(hidden, "lm_head hidden state")?;
-        let normed = self.norm.forward(&hidden)?;
-        let logits = self.lm_head.forward(&normed)?;
+        let normed = self
+            .norm
+            .as_ref()
+            .context("assignment has no output head role")?
+            .forward(&hidden)?;
+        let logits = self
+            .lm_head
+            .as_ref()
+            .context("assignment has no output head role")?
+            .forward(&normed)?;
         trace!(shape = ?logits.dims(), "GGUF lm_head complete");
         Ok(logits)
     }
@@ -2392,8 +2558,16 @@ impl ToyLlamaGGUF {
         let hidden = self.to_model_device(hidden, "lm_head hidden state")?;
         let seq_len = hidden.dim(1)?;
         let last_hidden = hidden.narrow(1, seq_len - 1, 1)?;
-        let normed = self.norm.forward(&last_hidden)?;
-        let logits = self.lm_head.forward(&normed)?;
+        let normed = self
+            .norm
+            .as_ref()
+            .context("assignment has no output head role")?
+            .forward(&last_hidden)?;
+        let logits = self
+            .lm_head
+            .as_ref()
+            .context("assignment has no output head role")?
+            .forward(&normed)?;
         trace!(shape = ?logits.dims(), "GGUF lm_head (last-token) complete");
         Ok(logits)
     }

@@ -143,6 +143,7 @@ impl SynapseNode {
             worker_assignment: None,
             route_epoch: 0,
             memory_limit_bytes,
+            coordinator_only: false,
             role,
             model,
             swarm,
@@ -312,6 +313,16 @@ impl SynapseNode {
         Ok(())
     }
 
+    pub fn set_coordinator_only(&mut self, enabled: bool) -> Result<(), NetworkError> {
+        if self.generation_active || !matches!(self.role, SynapseRole::Master { .. }) {
+            return Err(NetworkError::Inference(
+                "coordinator-only mode is a pre-run host setting".into(),
+            ));
+        }
+        self.coordinator_only = enabled;
+        Ok(())
+    }
+
     pub(super) fn load_assigned_range(
         &mut self,
         range: std::ops::Range<usize>,
@@ -331,19 +342,30 @@ impl SynapseNode {
         // Release old storage before loading a replacement, avoiding a hidden
         // second copy during replanning.
         self.pipeline = None;
+        let roles = if matches!(self.role, SynapseRole::Master { .. }) {
+            crate::inference::pipeline::TensorRoles::COORDINATOR
+        } else {
+            crate::inference::pipeline::TensorRoles::WORKER
+        };
         let model: std::sync::Arc<dyn ShardedModel> = if files
             .weights
             .extension()
             .is_some_and(|extension| extension == "gguf")
         {
             let device = crate::inference::get_best_device()?;
-            std::sync::Arc::new(ToyLlamaGGUF::load_range(
+            std::sync::Arc::new(ToyLlamaGGUF::load_range_with_roles(
                 &files.weights,
                 range.clone(),
                 &device,
+                roles,
             )?)
         } else {
-            std::sync::Arc::new(ToyLlama::load_range(config, &files.weights, range.clone())?)
+            std::sync::Arc::new(ToyLlama::load_range_with_roles(
+                config,
+                &files.weights,
+                range.clone(),
+                roles,
+            )?)
         };
         anyhow::ensure!(
             model.layer_offset() == range.start && model.owned_layers() == range.len(),

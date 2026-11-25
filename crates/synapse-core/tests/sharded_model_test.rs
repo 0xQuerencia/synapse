@@ -17,6 +17,53 @@ use synapse_core::{
 /// The tiny checkpoint used across the repo's tests (2 layers, single-file).
 mod support;
 
+#[test]
+fn worker_loads_only_assigned_layers_and_coordinator_can_be_compute_free() {
+    use synapse_core::inference::pipeline::TensorRoles;
+    let files = support::fixture_files();
+    let config = ToyLlamaConfig::from_file(&files.config).unwrap();
+    let full = ToyLlama::load(&config, &files.weights).unwrap();
+    let coordinator =
+        ToyLlama::load_range_with_roles(&config, &files.weights, 0..0, TensorRoles::COORDINATOR)
+            .unwrap();
+    let first = ToyLlama::load_range_with_roles(&config, &files.weights, 0..1, TensorRoles::WORKER)
+        .unwrap();
+    let second =
+        ToyLlama::load_range_with_roles(&config, &files.weights, 1..2, TensorRoles::WORKER)
+            .unwrap();
+    assert_eq!(coordinator.owned_layers(), 0);
+    assert_eq!(first.owned_layers(), 1);
+    assert_eq!(second.owned_layers(), 1);
+    assert!(first.resident_weight_bytes() < full.resident_weight_bytes());
+    assert!(first.embed(&token_ids()).is_err());
+    let hidden = coordinator.embed(&token_ids()).unwrap();
+    assert!(first.head(&hidden).is_err());
+    let hidden = first.forward_layers_prefill(&hidden, 0..1).unwrap();
+    let hidden = second.forward_layers_prefill(&hidden, 1..2).unwrap();
+    let actual = coordinator.head(&hidden).unwrap();
+    let expected = full.forward_prefill(&token_ids()).unwrap();
+    assert_logits_equal(&expected, &actual, "compute-free coordinator");
+    // Each isolated slice rejects an attempt to execute an unassigned layer.
+    assert!(first.forward_layers_prefill(&hidden, 0..2).is_err());
+    assert!(second.forward_layers_prefill(&hidden, 0..1).is_err());
+}
+
+#[test]
+fn assignment_selects_only_relevant_checkpoint_files() {
+    use synapse_core::inference::pipeline::{TensorRoles, shard_files_for_assignment};
+    let directory = tempfile::tempdir().unwrap();
+    let index = directory.path().join("model.safetensors.index.json");
+    std::fs::write(&index,r#"{"weight_map":{"model.embed_tokens.weight":"io.safetensors","model.norm.weight":"io.safetensors","lm_head.weight":"io.safetensors","model.layers.0.self_attn.q_proj.weight":"lower.safetensors","model.layers.1.self_attn.q_proj.weight":"upper.safetensors"}}"#).unwrap();
+    for name in ["io.safetensors", "lower.safetensors", "upper.safetensors"] {
+        std::fs::write(directory.path().join(name), b"test index fixture").unwrap();
+    }
+    let selected = shard_files_for_assignment(&index, &(1..2), TensorRoles::WORKER, false).unwrap();
+    assert_eq!(selected, vec![directory.path().join("upper.safetensors")]);
+    let selected =
+        shard_files_for_assignment(&index, &(0..0), TensorRoles::COORDINATOR, false).unwrap();
+    assert_eq!(selected, vec![directory.path().join("io.safetensors")]);
+}
+
 fn token_ids() -> Tensor {
     Tensor::new(&[1_u32, 2, 3], &Device::Cpu)
         .unwrap()
