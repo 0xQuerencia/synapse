@@ -54,6 +54,7 @@ impl SynapseNode {
                 }
                 info!(%peer_id, ?cause, "connection closed");
                 self.transport_peer_disconnected(peer_id);
+                self.ready_registry.remove_peer(peer_id);
                 if matches!(self.role, SynapseRole::Worker { .. }) {
                     let was_authenticated = self.authenticated_workers.remove(&peer_id);
                     let was_greeted = self.greeted_peers.remove(&peer_id);
@@ -88,6 +89,16 @@ impl SynapseNode {
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 warn!(?peer_id, %error, "outgoing connection failed");
+                if let SynapseRole::Worker {
+                    manual_master: Some(addr),
+                    ..
+                } = &self.role
+                    && peer_id
+                        .is_none_or(|peer| super::helpers::extract_peer_id(addr) == Some(peer))
+                    && self.next_redial_at.is_none()
+                {
+                    self.next_redial_at = Some(Instant::now() + Duration::from_secs(1));
+                }
             }
             SwarmEvent::IncomingConnectionError { error, .. } => {
                 warn!(%error, "incoming connection failed");

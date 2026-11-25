@@ -530,6 +530,15 @@ impl SynapseNode {
             self.fail_generation("missing session lease");
             return;
         };
+        if !self.ready_registry.contains(
+            hop.peer_id,
+            key,
+            &hop.layer_range,
+            super::assignments::unix_now(),
+        ) {
+            self.fail_generation("assigned range is no longer signed, ready and unexpired");
+            return;
+        }
         let trace_id = format!("{}g{}h{}", key.trace_prefix(), sequence_position, hop_index);
         match activation_pass {
             ActivationPass::Prefill => {

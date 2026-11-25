@@ -14,6 +14,9 @@
     "max_tensor_bytes": 67108864,
     "max_frame_payload_bytes": 67112960,
     "max_dimensions": 8,
-    "max_sequence_len": 4096
+    "max_sequence_len": 4096,
+    "max_control_payload_bytes": 65536,
+    "max_aggregate_decode_bytes": 134225920,
+    "frame_timeout_seconds": 15
   }
 }

@@ -241,6 +241,19 @@ impl WorkerRegistry {
         capability: Option<WorkerCapabilitySnapshot>,
     ) {
         let now = Instant::now();
+        if !self.entries.contains_key(&peer_id) && self.entries.len() >= 64 {
+            let stale = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.state != WorkerConnectionState::Authenticated)
+                .min_by_key(|(_, entry)| entry.last_seen_at)
+                .map(|(peer, _)| *peer);
+            if let Some(stale) = stale {
+                self.entries.remove(&stale);
+            } else {
+                return;
+            }
+        }
         let entry = self
             .entries
             .entry(peer_id)
@@ -316,6 +329,9 @@ pub struct NodeStatusSnapshot {
     pub memory_budget_bytes: u64,
     pub model_digest: Option<String>,
     pub memory_estimate: Option<crate::inference::memory::MemoryEstimate>,
+    pub ready_ranges: Vec<crate::inference::registry::SignedAvailability>,
+    pub listen_addresses: Vec<String>,
+    pub worker_state: Option<crate::network::worker::WorkerSnapshot>,
     /// Every worker the registry knows about, with connection state.
     pub peers: Vec<PeerSummary>,
     /// Number of workers that have fully authenticated (challenge-response).
@@ -444,6 +460,7 @@ pub struct SynapseNode {
     coordinator_only: bool,
     memory_profile: Option<crate::inference::memory::ModelMemoryProfile>,
     active_memory_estimate: Option<crate::inference::memory::MemoryEstimate>,
+    ready_registry: crate::inference::registry::ReadyRegistry,
     role: SynapseRole,
     model: ModelIdentity,
     swarm: Swarm<SynapseBehaviour>,
@@ -705,7 +722,14 @@ impl SynapseNode {
                 .as_ref()
                 .map(|model| model.layer_offset()..model.layer_offset() + model.owned_layers()),
             memory_budget_bytes: self.memory_limit_bytes,
+            listen_addresses: self.swarm.listeners().map(ToString::to_string).collect(),
+            worker_state: matches!(self.role, SynapseRole::Worker { .. })
+                .then(|| self.worker_snapshot()),
             memory_estimate: self.active_memory_estimate.clone(),
+            ready_ranges: self.ready_registry.ranges(
+                self.model.sha256.as_deref().unwrap_or(""),
+                assignments::unix_now(),
+            ),
             model_digest: self.model.sha256.clone(),
             peers: self.peers(),
             authenticated_count: if matches!(self.role, SynapseRole::Master { .. }) {
@@ -861,5 +885,44 @@ mod tests {
         registry.update_telemetry(peer_id, 4, 25.0, 62.5);
 
         assert!(registry.get(&peer_id).is_none());
+    }
+}
+
+#[cfg(test)]
+mod registry_bounds_tests {
+    use super::*;
+    #[test]
+    fn disconnected_peer_churn_keeps_worker_history_bounded() {
+        let mut registry = WorkerRegistry::default();
+        for _ in 0..500 {
+            let peer = PeerId::random();
+            registry.mark_connected(peer);
+            registry.mark_disconnected(peer);
+        }
+        assert_eq!(registry.entries.len(), 64);
+    }
+    #[test]
+    fn exact_byte_budget_survives_legacy_heartbeat_rounding() {
+        let peer = PeerId::random();
+        let mut registry = WorkerRegistry::default();
+        registry.mark_authenticated(
+            peer,
+            Some(WorkerCapabilitySnapshot {
+                compute_score: Some(100),
+                available_ram_mb: Some(1),
+                available_memory_bytes: Some(45000),
+            }),
+        );
+        let mut cap =
+            crate::WorkerCapability::from_probe(&crate::hardware::HardwareProbe::detect());
+        cap.available_ram_mb = 999999;
+        registry.update_capability(peer, cap);
+        assert_eq!(
+            registry
+                .capability_for(&peer)
+                .unwrap()
+                .available_memory_bytes,
+            Some(45000)
+        );
     }
 }

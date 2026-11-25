@@ -8,6 +8,9 @@ The initial v2 roadmap's `/synapse/control/1.0` and separate inference streams a
 | --- | --- | --- |
 | Verified artifact manifest | `inference/model_loader.rs`: `ModelManifest`, `ModelArtifact` | [manifest schema](../../schemas/model-manifest-v1.schema.json) |
 | Half-open layer slice | `protocol.rs`: `ShardPlan` | [shard schema](../../schemas/shard-plan-v0.4.schema.json) |
+| Worker admission lease | `inference/assignment.rs`: `ShardAssignment`, `LeaseKey` | [assignment schema](../../schemas/shard-assignment-v1.schema.json) |
+| Worker readiness | `inference/assignment.rs`: `ShardReady` | [readiness schema](../../schemas/shard-ready-v1.schema.json) |
+| Signed resident range | `inference/registry.rs`: `SignedAvailability` | [availability schema](../../schemas/signed-availability-v1.schema.json) |
 | Tensor representation | `protocol.rs`: `TensorPayload` | [tensor schema](../../schemas/tensor-v0.4.schema.json) |
 | Runtime framing | `network/codec.rs`, `network/messages.rs` | [wire vectors](../../schemas/fixtures/wire-v0.4.json) |
 | Evidence record | Package/test/release reporting | [evidence schema](../../schemas/evidence-v1.schema.json) |
@@ -20,7 +23,7 @@ The manifest includes all input artifacts, including tokenizer/configuration. Ve
 
 A request/response frame is marker `0xff`, a four-byte unsigned little-endian body length, then fixed-integer little-endian bincode 1 serialization. Unsupported markers, trailing bytes, oversized frames and malicious declared collection lengths must be rejected by the decoder. Enum order is part of this version: adding/reordering variants or changing field encoding requires an explicit compatibility decision and golden-vector update.
 
-The existing bounds retained by this contract are 64 MiB tensor bytes, at most 8 dimensions, and 4,096 sequence positions; the frame bound is 64 MiB plus 4,096 bytes. These are upper bounds, not a per-connection memory entitlement. Aggregate in-flight limits, concurrency and admission must independently constrain allocation. The first golden `HealthPing` vector has enum index 7 and full frame `ff0400000007000000`.
+The bounds are 64 MiB tensor bytes, at most 8 dimensions, and 4,096 sequence positions. Data request variant 1 and data response variants 1/5 permit a payload up to 64 MiB plus 4,096 bytes. All other control payloads are limited to 64 KiB. Frames have a 15-second read/write deadline; shared encoded-plus-decoded reservations are capped at 128 MiB plus 8,192 bytes. These are upper bounds, not a per-connection memory entitlement. Admission still constrains worker reservations. LZ4's embedded uncompressed size must match tensor metadata; Zstd decompression is bounded to the expected size plus one detection byte and window log 26. The golden `HealthPing` vector has enum index 7 and full frame `ff0400000007000000`; the Rust codec test independently pins the same bytes.
 
 ## Authentication and lifecycle
 
@@ -28,7 +31,9 @@ Transport authenticates peer identity; pool membership and assignment authority 
 
 Signed invitations use a distinct `synapse:private-invite:v1\0` signing domain, version as big-endian u16, length-prefixed pool/issuer/recipient/nonce and big-endian u64 issue/expiry times. They are recipient-bound, one-use and valid for at most 24 hours. A valid signature does not override revocation or pool policy. Helpers and tests must not be described as CLI/node integration until the actual handlers use them.
 
-Prepare/ready/release messages must bind the assignment to a session, model digest, range and route epoch. All stages must be ready before generation. Budget admission is atomic; cancellation/expiry frees resources. No signed capability advertisement reserves memory. Full lifecycle type schemas are added when their integrated Rust field layout is stable; the roadmap's illustrative field names must not silently replace the implemented protocol.
+Prepare/ready/release messages bind each assignment to a 16-hex session ID, nonzero route epoch and 64-hex model manifest digest. Ranges are half-open, total layers are capped at 1,024, context at 4,096 tokens and lease TTL at 1–300 seconds. The coordinator owns embeddings, output head and sampling; workers execute assigned transformer layers. The all-worker barrier requires each expected authenticated peer to echo its exact assignment. Duplicate acknowledgements do not advance it. A resident weight count must be positive and within its memory budget.
+
+`ShardReady.availability` is nullable in the serde data shape for construction and unit tests, but the real coordinator handler requires a matching signed record. Availability signatures cover the domain `synapse-ready-range-v1\0` followed by the fixed-order JSON struct with an empty signature array. They bind peer, lease key, resident range/bytes, backend, sequence and issue/expiry times. Lifetime is at most 300 seconds with five seconds of allowed future skew. The registry retains replay sequence watermarks across disconnects and is bounded to 64 peers. Neither a JSON-schema-valid record nor an advertisement alone authorizes compute or reserves memory. Peer ID parsing, signature verification, current-time checks, membership, replay protection and admission remain mandatory runtime checks.
 
 ## Checks
 

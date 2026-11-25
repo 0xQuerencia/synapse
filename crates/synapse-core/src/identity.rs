@@ -27,7 +27,7 @@ pub enum IdentityError {
     InvalidKey(String),
     #[error("home directory not found")]
     NoHomeDir,
-    #[error("identity file must be a regular, private file (Unix mode 0600)")]
+    #[error("file has an unsafe type, owner, permissions, or size")]
     UnsafeFile,
 }
 
@@ -228,6 +228,14 @@ fn open_private_file(path: &Path) -> Result<File, IdentityError> {
 }
 
 fn open_private_file_bounded(path: &Path, max_bytes: u64) -> Result<File, IdentityError> {
+    open_owned_file_bounded(path, max_bytes, 0o077)
+}
+
+fn open_owned_file_bounded(
+    path: &Path,
+    max_bytes: u64,
+    forbidden_mode: u32,
+) -> Result<File, IdentityError> {
     let before = fs::symlink_metadata(path)?;
     if !before.file_type().is_file() || before.len() > max_bytes {
         return Err(IdentityError::UnsafeFile);
@@ -247,17 +255,22 @@ fn open_private_file_bounded(path: &Path, max_bytes: u64) -> Result<File, Identi
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if metadata.permissions().mode() & 0o077 != 0
+        if metadata.permissions().mode() & forbidden_mode != 0
             // SAFETY: geteuid has no arguments or pointer preconditions.
             || metadata.uid() != unsafe { libc::geteuid() }
         {
             return Err(IdentityError::UnsafeFile);
         }
     }
+    #[cfg(not(unix))]
+    let _ = forbidden_mode;
     Ok(file)
 }
 
-pub(crate) fn read_private_state(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+/// Read an owned, regular private file without following its final symlink.
+/// The caller selects a trusted parent directory and an explicit byte limit.
+/// On Unix, group/other access and a different owner are rejected.
+pub fn read_private_state(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     let file = open_private_file_bounded(path, max_bytes).map_err(|error| match error {
         IdentityError::Io(error) => error,
         error => std::io::Error::other(error),
@@ -271,12 +284,33 @@ pub(crate) fn read_private_state(path: &Path, max_bytes: u64) -> std::io::Result
     Ok(bytes)
 }
 
-fn publish_private_state_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Read a bounded non-secret configuration file. Unlike secret state, it may
+/// be readable by other users, but must be owned, regular and not writable by
+/// other users on Unix. The final path component is never followed as a symlink.
+pub fn read_owned_config(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let file = open_owned_file_bounded(path, max_bytes, 0o022).map_err(|error| match error {
+        IdentityError::Io(error) => error,
+        error => std::io::Error::other(error),
+    })?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::other("configuration exceeds size limit"));
+    }
+    Ok(bytes)
+}
+
+/// Atomically publish a new private file without replacing an existing name.
+/// The caller selects the path and bounds `bytes`; existing parent directories
+/// must be trusted. Concurrent creators either publish or get AlreadyExists.
+pub fn publish_private_state_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use rand::RngCore;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+    create_private_dir(parent)?;
     let mut nonce = [0_u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let name: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
@@ -298,7 +332,9 @@ fn publish_private_state_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Atomically replace a small private state file in the same directory.
 /// Temp files use exclusive creation, mode 0600 and an unpredictable name.
-pub(crate) fn write_private_state(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// The caller must choose a trusted parent, bound `bytes`, and serialize
+/// read/modify/write operations when multiple writers share application state.
+pub fn write_private_state(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use rand::RngCore;
     let parent = path
         .parent()
@@ -330,6 +366,31 @@ pub(crate) fn write_private_state(path: &Path, bytes: &[u8]) -> std::io::Result<
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// Require a real directory owned by this process's effective user. On Unix,
+/// another user must not be able to replace names inside it. Read/execute access
+/// is permitted; files created by the private-state helpers remain mode 0600.
+pub fn validate_owned_directory(path: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::other(
+            "configuration parent must be a real directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o022 != 0
+            // SAFETY: geteuid has no arguments or pointer preconditions.
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(std::io::Error::other(
+                "configuration parent must be owned and not writable by others",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Serialize read/modify/write of a state file across processes. The lock file

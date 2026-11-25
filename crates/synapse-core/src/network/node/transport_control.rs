@@ -289,6 +289,11 @@ impl SynapseNode {
         let unix_now = super::assignments::unix_now();
         self.pending_coordinator_challenges
             .retain(|_, challenge| challenge.validate_at(unix_now).is_ok());
+        if self.authenticated_workers.is_empty()
+            && self.next_redial_at.is_some_and(|deadline| now >= deadline)
+        {
+            self.redial_manual_master();
+        }
         let active_jobs = usize::from(self.worker_assignment.is_some());
         if let Some(effect) = self.worker_controller.tick(active_jobs, now) {
             if effect.release_active {

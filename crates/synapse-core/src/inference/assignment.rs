@@ -88,11 +88,19 @@ impl ShardAssignment {
 pub struct ShardReady {
     pub assignment: ShardAssignment,
     pub resident_weight_bytes: u64,
+    pub availability: Option<super::registry::SignedAvailability>,
 }
 
 impl ShardReady {
     pub fn validate(&self) -> Result<()> {
         self.assignment.validate()?;
+        if let Some(record) = &self.availability {
+            record.validate()?;
+            ensure!(
+                record.matches_ready(self),
+                "signed availability differs from ready shard"
+            );
+        }
         ensure!(
             self.resident_weight_bytes > 0
                 && self.resident_weight_bytes <= self.assignment.memory_limit_bytes,
@@ -185,6 +193,7 @@ mod tests {
         let ready = ShardReady {
             assignment: assignment(),
             resident_weight_bytes: 512,
+            availability: None,
         };
         assert!(!barrier.acknowledge("a", &ready, now).unwrap());
         assert!(!barrier.acknowledge("a", &ready, now).unwrap());
@@ -207,6 +216,7 @@ mod tests {
         let mut ready = ShardReady {
             assignment: assignment(),
             resident_weight_bytes: 2048,
+            availability: None,
         };
         assert!(barrier.acknowledge("a", &ready, now).is_err());
         ready.resident_weight_bytes = 512;

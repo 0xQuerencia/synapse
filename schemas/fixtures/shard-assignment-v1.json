@@ -1,0 +1,14 @@
+{
+  "protocol_version": 1,
+  "key": {
+    "session_id": "0123456789abcdef",
+    "route_epoch": 1,
+    "model_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "layer_start": 2,
+  "layer_end": 6,
+  "total_layers": 8,
+  "context_tokens": 512,
+  "memory_limit_bytes": 536870912,
+  "ttl_ms": 60000
+}

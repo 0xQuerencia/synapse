@@ -172,6 +172,7 @@ impl SynapseNode {
             coordinator_only: false,
             memory_profile: None,
             active_memory_estimate: None,
+            ready_registry: Default::default(),
             role,
             model,
             swarm,

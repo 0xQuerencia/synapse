@@ -1,11 +1,5 @@
 //! Local authentication with a private token file and same-origin browser access.
-use std::{
-    collections::BTreeSet,
-    io::{Read, Write},
-    net::SocketAddr,
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeSet, net::SocketAddr, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -33,12 +27,7 @@ impl LocalAuth {
                 "the admin/API server must bind a loopback address; use an authenticated encrypted tunnel for private remote access"
             );
         }
-        if token.len() < 32
-            || token.len() > 256
-            || !token
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-        {
+        if !valid_token_format(&token) {
             bail!(
                 "access token must contain 32..256 ASCII letters, digits, underscores or hyphens"
             );
@@ -89,60 +78,56 @@ impl LocalAuth {
     }
 }
 
-/// Read or create an owner-only random secret. Never print the secret or put it
-/// in an URL. Existing files are opened without following a final symlink.
+fn valid_token_format(token: &str) -> bool {
+    (32..=256).contains(&token.len())
+        && token
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+}
+
+fn read_token(path: &Path) -> Result<String> {
+    let bytes = synapse_core::identity::read_private_state(path, 257)?;
+    let token = String::from_utf8(bytes).context("token file must be UTF-8")?;
+    let token = token.trim();
+    if !valid_token_format(token) {
+        bail!("invalid access-token file format");
+    }
+    Ok(token.to_owned())
+}
+
+/// Read or atomically create an owner-only random secret. Concurrent processes
+/// never observe a partially written token. Existing unsafe files fail closed.
+/// The token is never logged or placed in a URL.
 pub fn token_file(path: &Path) -> Result<String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut directory = std::fs::DirBuilder::new();
+    directory.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        use std::os::unix::fs::DirBuilderExt;
+        directory.mode(0o700);
     }
-    let mut file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut random = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut random);
-            let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-            let mut create = std::fs::OpenOptions::new();
-            create.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                create.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-            }
-            match create.open(path) {
-                Ok(mut file) => {
-                    file.write_all(token.as_bytes())?;
-                    file.sync_all()?;
-                    return Ok(token);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    options.open(path)?
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > 257 {
-        bail!("invalid token file");
+    directory.create(parent)?;
+    synapse_core::identity::validate_owned_directory(parent)?;
+    match read_token(path) {
+        Ok(token) => return Ok(token),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+        Err(error) => return Err(error),
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            bail!("token file must have owner-only permissions (chmod 600)");
-        }
+    let mut random = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut random);
+    let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    match synapse_core::identity::publish_private_state_new(path, token.as_bytes()) {
+        Ok(()) => Ok(token),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_token(path),
+        Err(error) => Err(error.into()),
     }
-    let mut token = String::new();
-    file.read_to_string(&mut token).context("read token file")?;
-    Ok(token.trim().to_owned())
 }
 
 pub async fn guard(State(state): State<AppState>, request: Request, next: Next) -> Response {
@@ -259,6 +244,82 @@ pub async fn page() -> Html<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct TokenDirectory(std::path::PathBuf);
+    impl TokenDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("synapse-auth-test-{:032x}", rand::random::<u128>()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TokenDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn concurrent_token_creators_observe_one_complete_secret() {
+        let directory = TokenDirectory::new();
+        let path = directory.0.join("access.token");
+        let barrier = std::sync::Barrier::new(8);
+        let tokens = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        token_file(&path).unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            tokens
+                .iter()
+                .all(|token| token.len() == 64 && token == &tokens[0])
+        );
+        assert_eq!(token_file(&path).unwrap(), tokens[0]);
+    }
+
+    #[test]
+    fn invalid_or_oversized_token_file_is_never_replaced() {
+        let directory = TokenDirectory::new();
+        let path = directory.0.join("access.token");
+        for invalid in [
+            "short".to_owned(),
+            "x".repeat(258),
+            format!("{}\nheader", "x".repeat(32)),
+        ] {
+            synapse_core::identity::write_private_state(&path, invalid.as_bytes()).unwrap();
+            assert!(token_file(&path).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_files_reject_symlinks_and_shared_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = TokenDirectory::new();
+        let target = directory.0.join("real.token");
+        let original = token_file(&target).unwrap();
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let link = directory.0.join("link.token");
+        symlink(&target, &link).unwrap();
+        assert!(token_file(&link).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(token_file(&target).is_err());
+    }
+
     #[test]
     fn local_auth_rejects_remote_bind_and_header_injection() {
         assert!(LocalAuth::new("a".repeat(32), "0.0.0.0:8080".parse().unwrap()).is_err());

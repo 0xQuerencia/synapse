@@ -112,7 +112,48 @@ impl SynapseNode {
     ) {
         let result = self.prepare_worker_shard(peer, assignment.clone());
         match result {
-            Ok(ready) => self.send_response(channel, ResponseMessage::ShardReady(ready)),
+            Ok(mut ready) => {
+                let signed = (|| -> Result<_> {
+                    let model = self
+                        .pipeline
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("resident shard missing"))?;
+                    let active = self
+                        .worker_assignment
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("active lease missing"))?;
+                    let now = unix_now();
+                    let remaining = active
+                        .expires_at
+                        .saturating_duration_since(Instant::now())
+                        .as_secs();
+                    ensure!(remaining > 0, "lease expired while loading");
+                    let sequence = crate::network::session::EpochCounter::advance(
+                        &self
+                            .identity
+                            .key_path()
+                            .with_extension("availability-sequence.json"),
+                    )?;
+                    crate::inference::registry::SignedAvailability::sign(
+                        &self.identity,
+                        &ready,
+                        model.name(),
+                        sequence,
+                        now,
+                        now + remaining,
+                    )
+                })();
+                match signed {
+                    Ok(record) => {
+                        ready.availability = Some(record);
+                        self.send_response(channel, ResponseMessage::ShardReady(ready));
+                    }
+                    Err(error) => {
+                        self.release_worker_assignment();
+                        self.reject(channel, &format!("cannot attest readiness: {error}"));
+                    }
+                }
+            }
             Err(error) => {
                 warn!(%peer,%error,"shard preparation rejected");
                 self.reject(channel, &error.to_string());
@@ -171,6 +212,7 @@ impl SynapseNode {
             if active.assignment == assignment {
                 return Ok(ShardReady {
                     assignment,
+                    availability: None,
                     resident_weight_bytes: self
                         .pipeline
                         .as_ref()
@@ -240,12 +282,32 @@ impl SynapseNode {
             layer_start=assignment.layer_start,layer_end=assignment.layer_end,resident_weight_bytes=bytes,"shard ready");
         Ok(ShardReady {
             assignment,
+            availability: None,
             resident_weight_bytes: bytes,
         })
     }
 
     pub(super) fn handle_shard_ready(&mut self, peer: PeerId, ready: ShardReady) {
         if !self.authenticated_workers.contains(&peer) || !self.generation_active {
+            return;
+        }
+        let Some(record) = ready.availability.clone() else {
+            self.fail_generation("worker did not sign its resident range");
+            return;
+        };
+        if !record.matches_ready(&ready)
+            || self
+                .ready_registry
+                .accept(
+                    peer,
+                    record,
+                    self.authenticated_workers.contains(&peer) && !self.revocations.contains(&peer),
+                    self.model.sha256.as_deref().unwrap_or(""),
+                    unix_now(),
+                )
+                .is_err()
+        {
+            self.fail_generation("invalid, stale or unauthorized ready range");
             return;
         }
         let Some(barrier) = &mut self.shard_readiness else {
@@ -304,6 +366,7 @@ impl SynapseNode {
 
     pub(super) fn release_generation_assignments(&mut self) {
         if let Some(key) = self.generation_lease.take() {
+            self.ready_registry.release(&key);
             if let Some(admission) = &self.admission {
                 let _ = admission.release(&key, &self.local_peer_id().to_string());
             }
@@ -329,6 +392,7 @@ impl SynapseNode {
     }
 
     pub(super) fn expire_assignments(&mut self) {
+        self.ready_registry.expire(unix_now());
         let now = Instant::now();
         let expired = self
             .admission
@@ -371,6 +435,7 @@ impl SynapseNode {
             )
             .map_err(|error| NetworkError::Transport(error.to_string()))?;
         self.authenticated_workers.remove(&peer);
+        self.ready_registry.remove_peer(peer);
         self.pending_coordinator_challenges.remove(&peer);
         if self.peer_required_for_active_generation(peer) {
             self.fail_generation("assigned peer revoked");

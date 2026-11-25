@@ -54,9 +54,23 @@ def validate(name, value):
                 raise ValueError('unapproved artifact format')
         if not value['weights'].endswith(('.safetensors', '.gguf')) and value['weights'] != 'model.safetensors.index.json':
             raise ValueError('weights must name a supported checkpoint or index')
-    elif name == 'shard-plan-v0.4':
+    elif name in {'shard-plan-v0.4', 'shard-assignment-v1', 'signed-availability-v1'}:
         if not value['layer_start'] < value['layer_end'] <= value['total_layers']:
             raise ValueError('invalid half-open layer interval')
+        if name == 'signed-availability-v1' and not 0 < value['expires_at_unix'] - value['issued_at_unix'] <= 300:
+            raise ValueError('invalid signed availability lifetime')
+    elif name == 'shard-ready-v1':
+        validate('shard-assignment-v1', value['assignment'])
+        if value['resident_weight_bytes'] > value['assignment']['memory_limit_bytes']:
+            raise ValueError('resident weights exceed assigned memory')
+        if value['availability'] is not None:
+            record = value['availability']
+            validate('signed-availability-v1', record)
+            for key in ['key', 'layer_start', 'layer_end', 'total_layers']:
+                if record[key] != value['assignment'][key]:
+                    raise ValueError('availability does not match assignment')
+            if record['resident_weight_bytes'] != value['resident_weight_bytes']:
+                raise ValueError('availability does not match residency')
     elif name == 'tensor-v0.4':
         width = {'F32': 4, 'F16': 2, 'BF16': 2, 'I64': 8}[value['dtype']]
         if math.prod(value['shape']) * width != value['original_size']:
@@ -92,10 +106,13 @@ def rust_fields(source, name):
 def source_shapes(root):
     model = (root / 'crates/synapse-core/src/inference/model_loader.rs').read_text()
     protocol = (root / 'crates/synapse-core/src/protocol.rs').read_text()
-    pairs = [('ModelManifest', model, 'model-manifest-v1'), ('ShardPlan', protocol, 'shard-plan-v0.4'), ('TensorPayload', protocol, 'tensor-v0.4')]
+    assignment = (root / 'crates/synapse-core/src/inference/assignment.rs').read_text()
+    registry = (root / 'crates/synapse-core/src/inference/registry.rs').read_text()
+    pairs = [('ModelManifest', model, 'model-manifest-v1'), ('ShardPlan', protocol, 'shard-plan-v0.4'), ('TensorPayload', protocol, 'tensor-v0.4'), ('ShardAssignment', assignment, 'shard-assignment-v1'), ('ShardReady', assignment, 'shard-ready-v1'), ('SignedAvailability', registry, 'signed-availability-v1')]
     for struct_name, source, contract in pairs:
         assert rust_fields(source, struct_name) == list(load(contract + '.schema.json')['properties']), f'field drift in {struct_name}'
     assert rust_fields(model, 'ModelArtifact') == ['filename', 'size_bytes', 'sha256']
+    assert rust_fields(assignment, 'LeaseKey') == ['session_id', 'route_epoch', 'model_digest']
 
 
 def main():
@@ -105,7 +122,7 @@ def main():
     args = parser.parse_args()
     for path in HERE.glob('*.schema.json'):
         Draft202012Validator.check_schema(json.loads(path.read_text()))
-    for name in ['model-manifest-v1', 'shard-plan-v0.4', 'tensor-v0.4']:
+    for name in ['model-manifest-v1', 'shard-plan-v0.4', 'tensor-v0.4', 'shard-assignment-v1', 'shard-ready-v1']:
         validate(name, load('fixtures/' + name + '.json'))
     manifest = load('fixtures/model-manifest-v1.json')
     golden = load('fixtures/model-manifest-digest-v1.json')
@@ -129,6 +146,22 @@ def main():
     for patch in [{'shape': [1, 1, 3]}, {'data': [0]}, {'original_size': 67108865}, {'compression': 'unknown'}, {'data': [256] * 8}]:
         rejected('tensor-v0.4', {**load('fixtures/tensor-v0.4.json'), **patch})
         negatives += 1
+    assignment = load('fixtures/shard-assignment-v1.json')
+    for patch in [{'protocol_version': 2}, {'layer_end': 9}, {'total_layers': 1025}, {'context_tokens': 4097}, {'memory_limit_bytes': 0}, {'ttl_ms': 999}, {'ttl_ms': 300001}, {'key': {**assignment['key'], 'route_epoch': 0}}, {'key': {**assignment['key'], 'session_id': 'bad'}}]:
+        rejected('shard-assignment-v1', {**assignment, **patch})
+        negatives += 1
+    ready = load('fixtures/shard-ready-v1.json')
+    rejected('shard-ready-v1', {**ready, 'resident_weight_bytes': assignment['memory_limit_bytes'] + 1})
+    negatives += 1
+    # These bytes are shape-only test data, deliberately not valid identity or
+    # signature evidence. Cryptographic verification is the Rust handler's job.
+    availability = {'schema_version': 1, 'peer_id': 'shape-only', 'key': assignment['key'], 'layer_start': 2, 'layer_end': 6, 'total_layers': 8, 'backend': 'llama-safetensors', 'resident_weight_bytes': ready['resident_weight_bytes'], 'sequence': 1, 'issued_at_unix': 1000, 'expires_at_unix': 1060, 'public_key': [0], 'signature': [0] * 64}
+    validate('shard-ready-v1', {**ready, 'availability': availability})
+    for patch in [{'expires_at_unix': 1301}, {'expires_at_unix': 1000}, {'sequence': 0}, {'backend': 'unknown'}, {'signature': [0]}]:
+        rejected('signed-availability-v1', {**availability, **patch})
+        negatives += 1
+    rejected('shard-ready-v1', {**ready, 'availability': {**availability, 'layer_start': 1}})
+    negatives += 1
     evidence = {'schema_version': 1, 'package': 'PR-39', 'status': 'proposed', 'source_revision': None, 'dirty_worktree': True, 'environment': 'synthetic contract example', 'topology': 'none', 'commands': [], 'limitations': ['Fixture only'], 'reviewer': None, 'release_artifact': None}
     validate('evidence-v1', evidence)
     for status in ['locally_tested', 'accepted', 'released']:

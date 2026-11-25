@@ -30,6 +30,10 @@ pub struct InferenceService {
 }
 
 impl InferenceService {
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
     pub fn new(backend: CandleBackend) -> Self {
         Self {
             model_id: backend.model_id().to_owned(),
@@ -77,7 +81,7 @@ async fn models(State(state): State<AppState>) -> Json<Value> {
         .inference
         .as_ref()
         .map(|service| {
-            vec![json!({"id":service.model_id,"object":"model","created":0,"owned_by":"local"})]
+            vec![json!({"id":service.model_id(),"object":"model","created":0,"owned_by":"local"})]
         })
         .unwrap_or_default();
     Json(json!({"object":"list","data":data}))
@@ -126,6 +130,29 @@ fn send_event(
             }
         }
     }
+}
+
+/// Queue terminal status before the completion marker. A short fresh deadline
+/// lets a recovering slow client observe the error that ended generation.
+/// If status cannot be delivered, closing the stream is safer than sending a
+/// completion marker that makes an interrupted response look successful.
+fn finish_stream(
+    sender: &mpsc::Sender<Event>,
+    terminal_events: Vec<Event>,
+    cancellation: &Cancellation,
+) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    for event in terminal_events {
+        if !send_event(sender, event, cancellation, deadline) {
+            return;
+        }
+    }
+    let _ = send_event(
+        sender,
+        Event::default().data("[DONE]"),
+        cancellation,
+        deadline,
+    );
 }
 
 async fn chat(
@@ -246,47 +273,22 @@ async fn chat(
                         ))
                     })
                 });
-            match result {
+            let terminal = match result {
                 Ok(usage)
-                    if !matches!(
-                        usage.finish_reason,
-                        FinishReason::Deadline | FinishReason::Cancelled
-                    ) =>
+                    if !matches!(usage.finish_reason, FinishReason::Deadline | FinishReason::Cancelled) =>
                 {
-                    let reason = if usage.finish_reason == FinishReason::Eos {
-                        "stop"
-                    } else {
-                        "length"
-                    };
-                    let _ = send_event(
-                        &sender,
-                        Event::default().data(chunk(json!({}), json!(reason))),
-                        &worker_cancel,
-                        deadline,
-                    );
+                    let reason = if usage.finish_reason == FinishReason::Eos { "stop" } else { "length" };
+                    let mut events = vec![Event::default().data(chunk(json!({}), json!(reason)))];
                     if include_usage {
                         let value = json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[],"usage":{"prompt_tokens":usage.input_tokens,"completion_tokens":usage.output_tokens,"total_tokens":usage.input_tokens + usage.output_tokens}});
-                        let _ = send_event(
-                            &sender,
-                            Event::default().data(value.to_string()),
-                            &worker_cancel,
-                            deadline,
-                        );
+                        events.push(Event::default().data(value.to_string()));
                     }
+                    events
                 }
-                Ok(_) => {
-                    let _ = sender.try_send(Event::default().event("error").data(json!({"error":{"code":"generation_interrupted","message":"generation exceeded its deadline or the stream stopped accepting output"}}).to_string()));
-                }
-                Err(_) => {
-                    let _ = sender.try_send(Event::default().event("error").data(json!({"error":{"code":"generation_failed","message":"inference failed"}}).to_string()));
-                }
-            }
-            let _ = send_event(
-                &sender,
-                Event::default().data("[DONE]"),
-                &worker_cancel,
-                deadline + Duration::from_secs(1),
-            );
+                Ok(_) => vec![Event::default().event("error").data(json!({"error":{"code":"generation_interrupted","message":"generation exceeded its deadline or the stream stopped accepting output"}}).to_string())],
+                Err(_) => vec![Event::default().event("error").data(json!({"error":{"code":"generation_failed","message":"inference failed"}}).to_string())],
+            };
+            finish_stream(&sender, terminal, &worker_cancel);
         });
         Sse::new(TokenStream {
             receiver,
@@ -345,6 +347,67 @@ mod tests {
         http::Request,
     };
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn slow_consumer_receives_terminal_error_before_done() {
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .try_send(Event::default().data("partial token"))
+            .unwrap();
+        let cancellation = Cancellation::default();
+        let worker_cancel = cancellation.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            finish_stream(
+                &sender,
+                vec![
+                    Event::default()
+                        .event("error")
+                        .data("generation_interrupted"),
+                ],
+                &worker_cancel,
+            );
+        });
+        // Keep the queue full long enough for the terminal sender to encounter
+        // backpressure, then resume consuming within its bounded grace period.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let response = Sse::new(TokenStream {
+            receiver,
+            cancellation,
+        })
+        .into_response();
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        task.await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let error_position = body
+            .find("generation_interrupted")
+            .expect("terminal failure must survive backpressure");
+        let done_position = body.find("[DONE]").expect("terminal marker");
+        assert!(body.find("partial token").unwrap() < error_position);
+        assert!(error_position < done_position);
+    }
+
+    #[tokio::test]
+    async fn cancellation_does_not_append_a_false_completion_marker() {
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .try_send(Event::default().data("partial token"))
+            .unwrap();
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        finish_stream(
+            &sender,
+            vec![Event::default().event("error").data("cancelled")],
+            &cancellation,
+        );
+        drop(sender);
+        let response = Sse::new(TokenStream {
+            receiver,
+            cancellation,
+        })
+        .into_response();
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert!(!String::from_utf8(body.to_vec()).unwrap().contains("[DONE]"));
+    }
 
     fn application() -> (axum::Router, InferenceService) {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
