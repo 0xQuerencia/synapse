@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'community'))
 from synapse_testnet.native_lab import Endpoint, run_lab, verify_fixture
+from synapse_testnet.fixture_transfer import deliver_fixture
 from gui_smoke import GuiServer, digest, require
 
 
@@ -37,8 +38,9 @@ def main():
         with tempfile.TemporaryDirectory(prefix='synapse-native-credit-lab-') as temporary:
             root=Path(temporary)
             try:
-                for label in ('candidate','reference'):
-                    server=GuiServer(label,binary,fixture,root);servers.append(server);server.ready()
+                delivered,result['artifact_delivery']=deliver_fixture(fixture,root/'delivery')
+                for label,model_path in (('candidate',delivered),('reference',fixture)):
+                    server=GuiServer(label,binary,model_path,root);servers.append(server);server.ready()
                 endpoints=[Endpoint(urlparse(s.base_url).port,s.token_path) for s in servers]
                 result['experiment']=run_lab(root/'ledger.db',*endpoints)
                 require(result['experiment']['parity'],'native reference mismatch; fake-credit reservation refunded')

@@ -49,3 +49,42 @@ class ArtifactTests(unittest.TestCase):
     def test_corrupt_chunk_not_published(self):
         with self.assertRaisesRegex(Denied,'CHUNK_HASH_MISMATCH'): self.target.put(self.m['chunks'][0],b'bad')
         self.assertEqual(self.target.bytes(),0)
+    def test_pin_and_shared_chunk_prevent_eviction(self):
+        initial=self.source.bytes()
+        with self.source.pin(self.p,self.m):
+            with self.source.pin(self.p,self.m):
+                with self.assertRaisesRegex(Denied,'CACHE_PINNED'):self.source.prune(0)
+            with self.assertRaisesRegex(Denied,'CACHE_PINNED'):self.source.prune(0)
+            self.assertEqual(self.source.bytes(),initial)
+        self.assertEqual(self.source.prune(0)['after_bytes'],0)
+
+    def test_recency_and_deterministic_prune(self):
+        for data in (b'a',b'b',b'c'):self.target.put(sha(data),data)
+        self.target.get(sha(b'a'))
+        result=self.target.prune(2)
+        self.assertEqual(result['evicted'],[sha(b'b')]);self.assertEqual(result['after_bytes'],2)
+        self.assertEqual(self.target.get(sha(b'a')),b'a');self.assertIsNone(self.target.get(sha(b'b')))
+
+    def test_seeder_holds_pin_until_closed(self):
+        with self.seeder():
+            with self.assertRaisesRegex(Denied,'CACHE_PINNED'):self.source.prune(0)
+        self.assertEqual(self.source.prune(0)['after_bytes'],0)
+
+    def test_atomic_export_and_no_overwrite(self):
+        target=Path(self.tmp.name)/'out';target.mkdir(mode=0o700);file=target/'model.bin'
+        result=self.source.export(self.p,self.m,file)
+        self.assertEqual(result,{'artifact':self.m['artifact'],'bytes':len(self.data)})
+        self.assertEqual(file.read_bytes(),self.data)
+        with self.assertRaisesRegex(Denied,'EXPORT_EXISTS'):self.source.export(self.p,self.m,file)
+        self.assertEqual(list(target.iterdir()),[file])
+        (self.source.root/self.m['chunks'][0]).write_bytes(b'wrong')
+        with self.assertRaisesRegex(Denied,'CACHE_CORRUPT'):self.source.export(self.p,self.m,target/'broken')
+        self.assertEqual(list(target.iterdir()),[file])
+
+    def test_revoked_or_missing_export_never_publishes(self):
+        target=Path(self.tmp.name)/'out';target.mkdir(mode=0o700);file=target/'model.bin'
+        with self.assertRaisesRegex(Denied,'CHUNK_MISSING'):self.target.export(self.p,self.m,file)
+        self.assertEqual(list(target.iterdir()),[])
+        self.p.revoked.add(self.m['artifact'])
+        with self.assertRaisesRegex(Denied,'UNTRUSTED_OR_REVOKED'):self.source.export(self.p,self.m,file)
+        self.assertEqual(list(target.iterdir()),[])
