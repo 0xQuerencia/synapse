@@ -1,3 +1,4 @@
+pub mod backend;
 pub mod compute_score;
 pub mod hardware;
 pub mod hash;
