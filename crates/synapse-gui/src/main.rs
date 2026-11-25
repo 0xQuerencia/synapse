@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
     init_tracing(cli.verbose);
 
     // Route the identity-path override through synapse-core's
-    // thread-local setter so we never need `unsafe { set_var }`
+    // process-wide setter so we never need `unsafe { set_var }`
     // (which is unsafe in Rust 2024) and the GUI crate stays
     // `forbid(unsafe_code)`.
     if let Some(p) = &cli.identity_path {

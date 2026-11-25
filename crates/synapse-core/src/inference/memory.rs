@@ -4,6 +4,9 @@ use super::pipeline::{TensorRoles, ToyLlamaConfig};
 use anyhow::{Result, ensure};
 use serde::Serialize;
 
+/// Maximum local speculative verification block, including its first token.
+pub const MAX_VERIFICATION_TOKENS: usize = 4;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct MemoryEstimate {
     pub weights_bytes: u64,
@@ -102,7 +105,7 @@ impl ModelMemoryProfile {
             0
         };
         let head_scratch = if roles.output {
-            product(&[v, 4, 2])?
+            product(&[t.min(MAX_VERIFICATION_TOKENS as u64), v, 4, 2])?
         } else {
             0
         };
@@ -214,5 +217,18 @@ mod tests {
         assert_eq!(a.kv_bytes, 2 * 10 * 2 * 4 * 4);
         assert_eq!(b.kv_bytes, 4 * a.kv_bytes);
         assert!(b.total_bytes > a.total_bytes);
+    }
+    #[test]
+    fn high_vocab_short_hidden_model_reserves_all_verification_logits() {
+        let (_, _, mut c) = profile();
+        c.hidden_size = 2;
+        c.intermediate_size = 4;
+        c.num_attention_heads = 1;
+        c.num_key_value_heads = 1;
+        c.vocab_size = 100_000;
+        let profile = ModelMemoryProfile::new(&c, false).unwrap();
+        let estimate = profile.estimate(0, 8, TensorRoles::COORDINATOR).unwrap();
+        assert!(estimate.scratch_bytes >= MAX_VERIFICATION_TOKENS as u64 * 100_000 * 4 * 2);
+        assert!(estimate.total_bytes > estimate.weights_bytes + estimate.load_scratch_bytes);
     }
 }

@@ -34,12 +34,17 @@ def read_events(path: Path) -> list[dict]:
     if not path.exists():
         return []
     events = []
-    for line in path.read_text().splitlines():
+    contents = path.read_text()
+    lines = contents.splitlines()
+    for index, line in enumerate(lines):
         try:
             events.append(json.loads(line))
         except json.JSONDecodeError:
-            # An active writer may have not completed its last line yet.
-            continue
+            # Only an active writer's unfinished final line may be ignored.
+            # A malformed completed record must never become success evidence.
+            if index == len(lines) - 1 and not contents.endswith("\n"):
+                continue
+            raise
     return events
 
 
@@ -117,6 +122,8 @@ def run(args: argparse.Namespace) -> dict:
     processes: dict[str, subprocess.Popen] = {}
     handles = []
     pairing_code = None
+    proxy = None
+    interrupted = False
     started = time.monotonic()
     environment = os.environ.copy()
     environment.update({"NO_COLOR": "1", "RUST_LOG": "warn,synapse_core=info"})
@@ -182,10 +189,15 @@ def run(args: argparse.Namespace) -> dict:
                 return next((record["data"]["peer_id"] for record in records if record["event"] == "node_started"), None) if pairing_code else None
 
             host_peer = wait_for(host_ready, time.monotonic() + args.timeout, host)
+            worker_address = address
+            if args.proxy_delay_ms or args.proxy_jitter_ms or args.proxy_bytes_per_second:
+                from tcp_impairment import TcpProxy
+                proxy = TcpProxy(port, args.proxy_delay_ms, args.proxy_jitter_ms, args.proxy_bytes_per_second)
+                worker_address = f"/ip4/127.0.0.1/tcp/{proxy.port}"
             for index in range(args.workers):
                 name = f"worker-{index + 1}"
                 command = [str(binary), "--identity-path", str(Path(identity_dir) / f"{name}.key"), "join",
-                    address + "/p2p/" + host_peer, "--model", str(directory), "--code", pairing_code,
+                    worker_address + "/p2p/" + host_peer, "--model", str(directory), "--code", pairing_code,
                     "--events-jsonl", str(output / f"{name}.jsonl"), "--listen", "127.0.0.1:0"]
                 if args.memory_mib is not None:
                     command.extend(["--memory-mib", str(args.memory_mib)])
@@ -193,10 +205,17 @@ def run(args: argparse.Namespace) -> dict:
                     command.extend(["--memory-bytes", str(args.worker_memory_bytes)])
                 spawn(name, command)
             def host_completed():
+                nonlocal interrupted
+                if args.interrupt_worker_after_token is not None and not interrupted:
+                    count = sum(event["event"] == "token" for event in read_events(output / "host.jsonl"))
+                    if count >= args.interrupt_worker_after_token:
+                        os.killpg(processes["worker-1"].pid, signal.SIGTERM)
+                        interrupted = True
+                        run_record["injected_fault"] = {"kind": "worker_terminated", "after_output_tokens": count}
                 if host.poll() is not None:
                     return True
                 for name, process in processes.items():
-                    if name.startswith("worker-") and process.poll() is not None:
+                    if name.startswith("worker-") and process.poll() is not None and not (interrupted and name == "worker-1"):
                         raise RuntimeError(f"{name} exited before generation completed ({process.returncode})")
                 return False
             wait_for(host_completed, time.monotonic() + args.timeout + 5)
@@ -221,6 +240,11 @@ def run(args: argparse.Namespace) -> dict:
                 "token_ids": actual, "peer_ids": peer_ids})
     except Exception as error:
         run_record["error"] = f"{type(error).__name__}: {error}"
+        host_events = read_events(output / "host.jsonl")
+        token_positions = [event["data"]["position"] for event in host_events if event["event"] == "token"]
+        run_record["partial_output_positions"] = token_positions
+        run_record["partial_output_contiguous"] = token_positions == list(range(len(token_positions)))
+        run_record["terminal_events"] = [event["data"] for event in host_events if event["event"] == "generation_done"]
     finally:
         sample()
         for process in processes.values():
@@ -231,6 +255,8 @@ def run(args: argparse.Namespace) -> dict:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL); process.wait(timeout=5)
+        if proxy is not None:
+            run_record["impairment"] = proxy.close()
         for handle in handles:
             handle.close()
         for path in output.glob("*.log"):
@@ -258,12 +284,20 @@ def main() -> int:
     parser.add_argument("--memory-mib", type=int)
     parser.add_argument("--host-memory-bytes", type=int)
     parser.add_argument("--worker-memory-bytes", type=int)
+    parser.add_argument("--proxy-delay-ms", type=float, default=0)
+    parser.add_argument("--proxy-jitter-ms", type=float, default=0)
+    parser.add_argument("--proxy-bytes-per-second", type=int, default=0)
+    parser.add_argument("--interrupt-worker-after-token", type=int)
     parser.add_argument("--output", default=str(ROOT / "artifacts" / f"local-cluster-{time.time_ns()}"))
     args = parser.parse_args()
     if args.timeout <= 0 or args.tokens <= 0:
         parser.error("timeout and token limit must be positive")
     if args.memory_mib is not None and (args.host_memory_bytes is not None or args.worker_memory_bytes is not None):
         parser.error("choose MiB or exact per-role byte limits, not both")
+    if (args.proxy_delay_ms or args.proxy_jitter_ms or args.proxy_bytes_per_second) and args.transport != "tcp":
+        parser.error("the chunk proxy supports TCP only; QUIC impairment requires an external network controller")
+    if args.interrupt_worker_after_token is not None and not 1 <= args.interrupt_worker_after_token < args.tokens:
+        parser.error("worker interruption must follow at least one token and precede the output limit")
     result = run(args)
     print(json.dumps({"success": result["success"], "output": str(Path(args.output).resolve()), "error": result.get("error")}))
     return 0 if result["success"] else 1

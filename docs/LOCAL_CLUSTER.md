@@ -11,8 +11,8 @@ two-physical-device or WAN acceptance gates.
 ```sh
 cargo build --locked -p synapse-cli
 cargo run --locked -p synapse-cli -- doctor --model-dir crates/synapse-core/tests/fixtures/tiny-llama
-python3 scripts/local_cluster.py --workers 1 --transport quic
-python3 scripts/local_cluster.py --workers 2 --coordinator-only --transport tcp
+python3 scripts/local_cluster.py --workers 1 --transport quic --host-memory-bytes 52000 --worker-memory-bytes 45000
+python3 scripts/local_cluster.py --workers 2 --coordinator-only --transport tcp --host-memory-bytes 16000 --worker-memory-bytes 45000
 ```
 
 The fixture is original deterministic test data, not a useful language model.
@@ -21,6 +21,11 @@ It requires no Hub download. `--binary` selects a separately built executable;
 an explicitly chosen compatible real model to use the same validation path.
 For such a model, choose a raw prompt that matches its template, and retain
 its full manifest and license evidence.
+
+Without constrained budgets, the production planner may correctly choose a local
+full-model route and the distributed-only harness rejects that run. The limits
+above are calibrated for this exact fixture and eight output tokens. They are
+inference reservations, not process RSS limits.
 
 Each run creates a new private directory under `artifacts/`. It retains source
 commit/dirty state, executable hash, complete model manifest, transport, actual

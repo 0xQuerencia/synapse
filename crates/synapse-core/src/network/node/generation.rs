@@ -9,7 +9,7 @@ use super::{
     WorkerRouteHop,
 };
 use crate::inference::{ToyLlama, payload_to_tensor, tensor_to_payload};
-use crate::network::node::speculation::MAX_DRAFT_LEN;
+use crate::network::node::speculation::draft_budget;
 #[cfg(test)]
 use crate::{WeightedShardParticipant, plan_weighted_shards};
 
@@ -537,7 +537,11 @@ impl SynapseNode {
             return None;
         }
 
-        let draft_tokens = self.draft_cache.draft(&self.token_ids, MAX_DRAFT_LEN);
+        let budget = draft_budget(
+            self.current_max_tokens()
+                .saturating_sub(self.tokens_generated),
+        );
+        let draft_tokens = self.draft_cache.draft(&self.token_ids, budget);
         if draft_tokens.is_empty() {
             return None;
         }

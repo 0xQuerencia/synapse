@@ -129,6 +129,9 @@ enum Command {
         model_dir: Option<PathBuf>,
         #[arg(long, default_value = "config")]
         config_dir: PathBuf,
+        /// Total input plus output context used for the inference reservation report.
+        #[arg(long, default_value_t = 32)]
+        context_tokens: usize,
     },
     /// Connect to a model swarm via DHT (alias for join without manual address).
     Connect {
@@ -158,7 +161,7 @@ async fn main() -> Result<()> {
     init_tracing(cli.verbose);
 
     // Route the identity-path override through synapse-core's
-    // thread-local setter so the CLI doesn't have to call unsafe
+    // process-wide setter so the CLI doesn't have to call unsafe
     // `set_var` (unsafe in Rust 2024) just to swap the key path.
     if let Some(p) = &cli.identity_path {
         synapse_core::set_identity_path_override(Some(std::path::Path::new(p)));
@@ -269,7 +272,13 @@ async fn main() -> Result<()> {
         Some(Command::Doctor {
             model_dir,
             config_dir,
-        }) => doctor(model_dir, config_dir, cli.identity_path.as_deref()),
+            context_tokens,
+        }) => doctor(
+            model_dir,
+            config_dir,
+            cli.identity_path.as_deref(),
+            context_tokens,
+        ),
         None => onboarding_gateway().await,
     }
 }
@@ -278,6 +287,7 @@ fn doctor(
     model_dir: Option<PathBuf>,
     config_dir: PathBuf,
     identity_path: Option<&str>,
+    context_tokens: usize,
 ) -> Result<()> {
     let mut checks = Vec::new();
     let mut failed = false;
@@ -323,10 +333,26 @@ fn doctor(
                 let files =
                     synapse_core::inference::model_loader::ModelFiles::from_directory(&directory)?;
                 let config = ToyLlamaConfig::from_file(&files.config)?;
+                let profile = synapse_core::inference::memory::ModelMemoryProfile::new(
+                    &config,
+                    files.weights.extension().is_some_and(|ext| ext == "gguf"),
+                )?;
+                let full = profile.estimate(
+                    config.num_hidden_layers,
+                    context_tokens,
+                    synapse_core::inference::pipeline::TensorRoles::COORDINATOR,
+                )?;
+                let one_worker = profile.estimate(
+                    1,
+                    context_tokens,
+                    synapse_core::inference::pipeline::TensorRoles::WORKER,
+                )?;
                 Ok(
                     serde_json::json!({"model_id":files.manifest.model_id,"revision":files.manifest.revision,
                 "manifest_digest":files.manifest.digest()?,"layers":config.num_hidden_layers,
-                "context":config.max_position_embeddings,"artifacts":files.manifest.artifacts.len()}),
+                "context":config.max_position_embeddings,"artifacts":files.manifest.artifacts.len(),
+                "reservation_context_tokens":context_tokens,"full_model_reservation":full,
+                "one_layer_worker_reservation":one_worker,"reservation_is_process_rss":false}),
                 )
             })(),
         );

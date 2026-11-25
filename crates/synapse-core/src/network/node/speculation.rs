@@ -10,7 +10,11 @@ use candle_core::Tensor;
 use tracing::info;
 
 /// Maximum number of tokens to speculatively draft per round.
-pub const MAX_DRAFT_LEN: usize = 3;
+pub const MAX_DRAFT_LEN: usize = crate::inference::memory::MAX_VERIFICATION_TOKENS - 1;
+
+pub(super) fn draft_budget(remaining_output_tokens: usize) -> usize {
+    MAX_DRAFT_LEN.min(remaining_output_tokens.saturating_sub(1))
+}
 
 /// N-gram context size for the draft cache.
 const DEFAULT_NGRAM_SIZE: usize = 3;
@@ -262,5 +266,21 @@ mod tests {
         let result = verify_draft(&draft_tokens, &logits).expect("verification should work");
         assert_eq!(result.accepted_count, 1);
         assert_eq!(result.correction_token, Some(6));
+    }
+}
+
+#[cfg(test)]
+mod context_budget_tests {
+    #[test]
+    fn verification_never_allocates_past_remaining_output_context() {
+        for remaining in 0usize..4096 {
+            let drafts = super::draft_budget(remaining);
+            assert!(drafts <= super::MAX_DRAFT_LEN);
+            if drafts > 0 {
+                assert!(drafts < remaining);
+            } else {
+                assert!(remaining <= 1 || super::MAX_DRAFT_LEN == 0);
+            }
+        }
     }
 }

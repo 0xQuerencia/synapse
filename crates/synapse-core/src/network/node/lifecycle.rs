@@ -547,10 +547,10 @@ impl SynapseNode {
                         "no cached providers, searching DHT for masters serving model {}",
                         self.model.id
                     );
-                    if net_config.discovery.allow_dht_discovery {
-                        if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
-                            kad.get_providers(model_key);
-                        }
+                    if net_config.discovery.allow_dht_discovery
+                        && let Some(kad) = self.swarm.behaviour_mut().kad.as_mut()
+                    {
+                        kad.get_providers(model_key);
                     }
                 }
             }
