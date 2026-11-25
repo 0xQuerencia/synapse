@@ -10,6 +10,8 @@ const MAX_REJECTED_REASON_LEN: usize = 512;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RequestMessage {
+    PrepareShard(crate::inference::assignment::ShardAssignment),
+    ReleaseShard(crate::inference::assignment::LeaseKey),
     NodeHello {
         hello: NodeHello,
         /// Pairing code is now sent as a SHA-256 hash (never plaintext after Phase 4).
@@ -37,6 +39,9 @@ pub enum RequestMessage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ResponseMessage {
+    ShardReady(crate::inference::assignment::ShardReady),
+    ShardReleased(crate::inference::assignment::LeaseKey),
+    PairingAccepted(crate::pairing::CoordinatorProof),
     Authenticated,
     ActivationResponse(ActivationResponse),
     ClearCacheAck(ClearCache),

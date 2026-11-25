@@ -33,6 +33,7 @@ const WORKER_HOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the run loop checks for worker timeouts.
 const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
+mod assignments;
 mod generation;
 mod handlers;
 mod helpers;
@@ -261,10 +262,10 @@ impl WorkerRegistry {
         }
     }
 
-    fn get_challenge(&self, peer_id: &PeerId) -> Option<crate::Challenge> {
+    fn take_challenge(&mut self, peer_id: &PeerId) -> Option<crate::Challenge> {
         self.entries
-            .get(peer_id)
-            .and_then(|e| e.pending_challenge.clone())
+            .get_mut(peer_id)
+            .and_then(|e| e.pending_challenge.take())
     }
 }
 
@@ -407,6 +408,16 @@ struct InFlightRequest {
 }
 
 pub struct SynapseNode {
+    identity: crate::NodeIdentity,
+    revocations: crate::identity::RevocationList,
+    pending_coordinator_challenges: HashMap<PeerId, crate::Challenge>,
+    model_files: Option<crate::inference::model_loader::ModelFiles>,
+    model_config: Option<crate::inference::ToyLlamaConfig>,
+    generation_lease: Option<crate::inference::assignment::LeaseKey>,
+    shard_readiness: Option<crate::inference::assignment::ReadinessBarrier>,
+    worker_assignment: Option<assignments::WorkerAssignment>,
+    route_epoch: u64,
+    memory_limit_bytes: u64,
     role: SynapseRole,
     model: ModelIdentity,
     swarm: Swarm<SynapseBehaviour>,

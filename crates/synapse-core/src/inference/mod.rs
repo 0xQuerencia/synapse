@@ -1,3 +1,4 @@
+pub mod assignment;
 pub mod cache;
 pub mod compression;
 pub mod kv_cache;

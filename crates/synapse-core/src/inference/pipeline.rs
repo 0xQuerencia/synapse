@@ -23,6 +23,17 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::Deserialize;
 use tracing::{info, trace, warn};
 
+fn tensor_bytes(tensor: &Tensor) -> u64 {
+    (tensor.elem_count() as u64).saturating_mul(tensor.dtype().size_in_bytes() as u64)
+}
+
+fn quantized_bytes(matrix: &QMatMul) -> u64 {
+    match matrix {
+        QMatMul::QTensor(tensor) => tensor.storage_size_in_bytes() as u64,
+        QMatMul::Tensor(tensor) | QMatMul::TensorF16(tensor) => tensor_bytes(tensor),
+    }
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 /// Configuration parsed from the model's `config.json`.
@@ -888,6 +899,37 @@ pub struct ToyLlama {
 }
 
 impl ToyLlama {
+    /// Tensor storage actually owned by this backend, excluding KV/scratch and
+    /// allocator overhead. Process RSS is measured separately by benchmarks.
+    pub fn resident_weight_bytes(&self) -> u64 {
+        let mut bytes = [
+            &self.embed_tokens,
+            &self.lm_head,
+            &self.norm.weight,
+            &self.rope.cos,
+            &self.rope.sin,
+        ]
+        .into_iter()
+        .map(tensor_bytes)
+        .sum::<u64>();
+        for layer in &self.layers {
+            bytes += [
+                &layer.input_layernorm.weight,
+                &layer.post_attention_layernorm.weight,
+                &layer.self_attn.q_proj,
+                &layer.self_attn.k_proj,
+                &layer.self_attn.v_proj,
+                &layer.self_attn.o_proj,
+                &layer.gate_proj,
+                &layer.up_proj,
+                &layer.down_proj,
+            ]
+            .into_iter()
+            .map(tensor_bytes)
+            .sum::<u64>();
+        }
+        bytes
+    }
     /// Load the full model from safetensors weights and config.
     pub fn load(config: &ToyLlamaConfig, weights_path: &Path) -> Result<Self> {
         Self::load_range(config, weights_path, 0..config.num_hidden_layers)
@@ -1626,9 +1668,17 @@ pub trait ShardedModel: Send + Sync {
     fn owned_layers(&self) -> usize;
     /// Device the weights live on.
     fn model_device(&self) -> &Device;
+    fn model_dtype(&self) -> DType;
+    fn resident_weight_bytes(&self) -> u64;
 }
 
 impl ShardedModel for ToyLlama {
+    fn model_dtype(&self) -> DType {
+        self.embed_tokens.dtype()
+    }
+    fn resident_weight_bytes(&self) -> u64 {
+        self.resident_weight_bytes()
+    }
     fn name(&self) -> &'static str {
         "llama-safetensors"
     }
@@ -2029,6 +2079,35 @@ fn gguf_f64_or(content: &gguf_file::Content, key: &str, default: f64) -> f64 {
 }
 
 impl ToyLlamaGGUF {
+    pub fn resident_weight_bytes(&self) -> u64 {
+        let mut bytes = [
+            &self.embed_tokens,
+            &self.norm.weight,
+            &self.rope.cos,
+            &self.rope.sin,
+        ]
+        .into_iter()
+        .map(tensor_bytes)
+        .sum::<u64>()
+            + quantized_bytes(&self.lm_head);
+        for layer in &self.layers {
+            bytes += tensor_bytes(&layer.input_layernorm.weight)
+                + tensor_bytes(&layer.post_attention_layernorm.weight);
+            bytes += [
+                &layer.attn_q,
+                &layer.attn_k,
+                &layer.attn_v,
+                &layer.attn_output,
+                &layer.ffn_gate,
+                &layer.ffn_up,
+                &layer.ffn_down,
+            ]
+            .into_iter()
+            .map(quantized_bytes)
+            .sum::<u64>();
+        }
+        bytes
+    }
     /// Load the full quantized model.
     pub fn load(path: &Path) -> Result<Self> {
         let device = get_best_device().context("failed to select inference device")?;
@@ -2413,6 +2492,12 @@ impl ToyLlamaGGUF {
 }
 
 impl ShardedModel for ToyLlamaGGUF {
+    fn model_dtype(&self) -> DType {
+        DType::F32
+    }
+    fn resident_weight_bytes(&self) -> u64 {
+        self.resident_weight_bytes()
+    }
     fn name(&self) -> &'static str {
         "llama-gguf"
     }

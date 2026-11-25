@@ -16,14 +16,10 @@ use super::{
         recv_batch_prompt, recv_prompt, select_best_relay,
     },
 };
-use crate::{ModelIdentity, NetConfig, NodeIdentity, PairingRateLimiter};
-use crate::{
-    compute_score::blend_compute_score,
-    inference::{
-        ShardedModel, SimpleTokenizer, ToyLlama, ToyLlamaConfig, ToyLlamaGGUF, download_model,
-        gguf_layer_count, verify_file_sha256,
-    },
+use crate::inference::{
+    ShardedModel, SimpleTokenizer, ToyLlama, ToyLlamaConfig, ToyLlamaGGUF, gguf_layer_count,
 };
+use crate::{ModelIdentity, NetConfig, NodeIdentity, PairingRateLimiter};
 use std::collections::VecDeque;
 
 impl SynapseNode {
@@ -126,7 +122,27 @@ impl SynapseNode {
         let (status_tx, _status_rx) =
             tokio::sync::watch::channel(super::NodeStatusSnapshot::default());
 
+        let revocations = crate::identity::RevocationList::load(
+            &identity.key_path().with_extension("revocations.json"),
+        )
+        .map_err(|error| NetworkError::Transport(error.to_string()))?;
+        let memory_limit_bytes = local_capability
+            .as_ref()
+            .and_then(|cap| cap.available_ram_mb)
+            .unwrap_or(0)
+            .saturating_mul(1024 * 1024)
+            / 2;
         Ok(Self {
+            identity,
+            revocations,
+            pending_coordinator_challenges: Default::default(),
+            model_files: None,
+            model_config: None,
+            generation_lease: None,
+            shard_readiness: None,
+            worker_assignment: None,
+            route_epoch: 0,
+            memory_limit_bytes,
             role,
             model,
             swarm,
@@ -210,112 +226,140 @@ impl SynapseNode {
         tx
     }
 
-    /// Load the model weights and tokenizer. Must be called before `run()`.
+    /// Resolve and verify a model, retaining metadata until a complete route
+    /// assigns a concrete range. This never loads a hidden full host model.
     pub async fn load_model(&mut self) -> Result<(), NetworkError> {
-        let files = download_model(&self.model.id)
-            .await
-            .map_err(|error| NetworkError::Inference(error.to_string()))?;
-
-        if let Some(expected_sha256) = &self.model.sha256 {
-            verify_file_sha256(&files.weights, expected_sha256).map_err(|error| {
-                NetworkError::Inference(format!("model weight verification failed: {error}"))
-            })?;
+        let selected_path = std::path::Path::new(&self.model.id);
+        let files = if selected_path.is_dir() {
+            crate::inference::model_loader::ModelFiles::from_directory(selected_path)
+        } else {
+            crate::inference::model_loader::download_model_revision(&self.model).await
         }
+        .map_err(|error| NetworkError::Inference(error.to_string()))?;
+        self.install_model_metadata(files)
+    }
 
-        let is_gguf = files.weights.extension().is_some_and(|ext| ext == "gguf");
-
-        // GGUF files carry all model metadata in their header; safetensors
-        // models use the HF `config.json`. Only the layer count is needed
-        // here to compute the static shard plan.
-        let config = if is_gguf {
-            None
-        } else {
-            Some(
-                ToyLlamaConfig::from_file(&files.config)
-                    .map_err(|error| NetworkError::Inference(error.to_string()))?,
-            )
-        };
-        let total = match &config {
-            Some(config) => config.num_hidden_layers,
-            None => gguf_layer_count(&files.weights)
-                .map_err(|error| NetworkError::Inference(error.to_string()))?,
-        };
-        // The master loads the full layer span. Generation replans shards
-        // dynamically (capability-weighted) as workers join and leave, so a
-        // fixed placeholder split here would leave the master holding fewer
-        // layers than a later route plan assigns it. A full-span load is
-        // valid for any plan; workers slice their own range on join.
-        let split = match &self.role {
-            SynapseRole::Master { .. } => total,
-            SynapseRole::Worker { .. } | SynapseRole::RelayServer => total,
-        };
-
-        let device = crate::inference::get_best_device()
+    pub fn load_model_from_directory(
+        &mut self,
+        directory: &std::path::Path,
+    ) -> Result<(), NetworkError> {
+        let files = crate::inference::model_loader::ModelFiles::from_directory(directory)
             .map_err(|error| NetworkError::Inference(error.to_string()))?;
+        self.install_model_metadata(files)
+    }
 
-        // Slice the model by role: the master holds embed + all layers +
-        // the LM head (full span, see note above); workers hold the upper
-        // layers. RelayServer never loads a model (empty range).
-        let layer_range = match &self.role {
-            SynapseRole::Master { .. } => 0..split,
-            SynapseRole::Worker { .. } => split..total,
-            SynapseRole::RelayServer => 0..0,
-        };
-
-        let model: std::sync::Arc<dyn ShardedModel> = if is_gguf {
-            std::sync::Arc::new(
-                ToyLlamaGGUF::load_range(&files.weights, layer_range, &device)
-                    .map_err(|error| NetworkError::Inference(error.to_string()))?,
-            )
+    fn install_model_metadata(
+        &mut self,
+        files: crate::inference::model_loader::ModelFiles,
+    ) -> Result<(), NetworkError> {
+        let config = ToyLlamaConfig::from_file(&files.config)
+            .map_err(|error| NetworkError::Inference(error.to_string()))?;
+        let is_gguf = files
+            .weights
+            .extension()
+            .is_some_and(|extension| extension == "gguf");
+        let total = if is_gguf {
+            gguf_layer_count(&files.weights)
+                .map_err(|error| NetworkError::Inference(error.to_string()))?
         } else {
-            std::sync::Arc::new(
-                ToyLlama::load_range(
-                    config.as_ref().expect("safetensors config loaded above"),
-                    &files.weights,
-                    layer_range,
-                )
-                .map_err(|error| NetworkError::Inference(error.to_string()))?,
-            )
+            config.num_hidden_layers
         };
-
         let tokenizer = SimpleTokenizer::from_file(&files.tokenizer)
             .map_err(|error| NetworkError::Inference(error.to_string()))?;
-
-        self.pipeline = Some(model);
+        let digest = files
+            .manifest
+            .digest()
+            .map_err(|error| NetworkError::Inference(error.to_string()))?;
+        self.model = ModelIdentity {
+            id: files.manifest.model_id.clone(),
+            revision: Some(files.manifest.revision.clone()),
+            sha256: Some(digest),
+        };
+        self.pipeline = None;
         self.tokenizer = Some(std::sync::Arc::new(tokenizer));
-        self.split_point = split;
         self.total_layers = total;
-
-        info!(
-            total_layers = total,
-            split_point = split,
-            "model and tokenizer loaded, shard plan computed"
-        );
-
-        // ─── Compute real compute score (Phase 1) ─────────────────
-        // Run the micro-benchmark once and cache the result so the
-        // worker advertises its real throughput, not cpu_threads*100.
-        let measured = crate::inference::run_micro_benchmark(&device);
-        let probe = crate::hardware::HardwareProbe::detect();
-        let ram_free_mb = super::helpers::detect_available_ram_mb().unwrap_or(0);
-        let score = blend_compute_score(measured, ram_free_mb, &probe);
+        self.model_config = Some(config);
+        self.model_files = Some(files);
+        let device = crate::inference::get_best_device()
+            .map_err(|error| NetworkError::Inference(error.to_string()))?;
+        let score = crate::inference::run_micro_benchmark(&device);
         self.measured_compute_score = Some(score);
-        info!(
-            measured,
-            ram_free_mb,
-            blended_score = score,
-            backend = %probe.backend.as_str(),
-            gpu = probe.has_accelerator,
-            "compute score set from real benchmark"
-        );
-
-        // Also update the local capability snapshot so the master's
-        // own peer view shows the measured score, not cpu_threads*100.
-        if let Some(snapshot) = self.local_capability.as_mut() {
-            snapshot.compute_score = Some(score);
-            snapshot.available_ram_mb = Some(ram_free_mb);
+        if let Some(capability) = self.local_capability.as_mut() {
+            capability.compute_score = Some(score);
+            capability.available_ram_mb = Some(self.memory_limit_bytes / (1024 * 1024));
         }
+        info!(total_layers=total, model_digest=?self.model.sha256, "model artifacts verified; awaiting shard assignment");
+        Ok(())
+    }
 
+    /// Set an explicit inference budget before run; zero/unknown memory fails
+    /// closed. The budget includes weights, cache and activation scratch.
+    pub fn set_memory_limit_bytes(&mut self, bytes: u64) -> Result<(), NetworkError> {
+        if bytes == 0 {
+            return Err(NetworkError::Inference(
+                "memory budget must be positive".into(),
+            ));
+        }
+        if self.generation_active || self.worker_assignment.is_some() {
+            return Err(NetworkError::Inference(
+                "cannot change budget during active work".into(),
+            ));
+        }
+        self.memory_limit_bytes = bytes;
+        if let Some(capability) = self.local_capability.as_mut() {
+            capability.available_ram_mb = Some(bytes / (1024 * 1024));
+        }
+        Ok(())
+    }
+
+    pub(super) fn load_assigned_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+    ) -> anyhow::Result<()> {
+        let files = self
+            .model_files
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("model metadata not loaded"))?;
+        let config = self
+            .model_config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("model config not loaded"))?;
+        anyhow::ensure!(
+            range.start <= range.end && range.end <= self.total_layers,
+            "invalid model range"
+        );
+        // Release old storage before loading a replacement, avoiding a hidden
+        // second copy during replanning.
+        self.pipeline = None;
+        let model: std::sync::Arc<dyn ShardedModel> = if files
+            .weights
+            .extension()
+            .is_some_and(|extension| extension == "gguf")
+        {
+            let device = crate::inference::get_best_device()?;
+            std::sync::Arc::new(ToyLlamaGGUF::load_range(
+                &files.weights,
+                range.clone(),
+                &device,
+            )?)
+        } else {
+            std::sync::Arc::new(ToyLlama::load_range(config, &files.weights, range.clone())?)
+        };
+        anyhow::ensure!(
+            model.layer_offset() == range.start && model.owned_layers() == range.len(),
+            "resident layer range differs from assignment"
+        );
+        anyhow::ensure!(
+            model.resident_weight_bytes() <= self.memory_limit_bytes,
+            "resident weights exceed memory cap"
+        );
+        info!(
+            layer_start = range.start,
+            layer_end = range.end,
+            resident_weight_bytes = model.resident_weight_bytes(),
+            "assigned shard resident"
+        );
+        self.pipeline = Some(model);
         Ok(())
     }
 

@@ -16,6 +16,7 @@ impl SynapseNode {
     }
 
     pub(super) fn fail_generation(&mut self, message: impl Into<String>) {
+        self.release_generation_assignments();
         let message = message.into();
         warn!(%message, "generation failed");
         self.emit(ChatEvent::Token(format!("[generation-error] {message}")));
@@ -44,7 +45,7 @@ impl SynapseNode {
     }
 
     pub(super) fn send_worker_hello(&mut self, peer: PeerId) {
-        let SynapseRole::Worker { pairing_code, .. } = &self.role else {
+        let SynapseRole::Worker { .. } = &self.role else {
             return;
         };
 
@@ -62,13 +63,18 @@ impl SynapseNode {
         if let Some(score) = self.measured_compute_score {
             hello.compute_score = Some(score);
         }
-        let hashed_code = crate::hash_pairing_code(pairing_code);
+        hello.available_ram_mb = Some(self.memory_limit_bytes / (1024 * 1024));
+        hello.memory_bytes = Some(self.memory_limit_bytes);
+        if let Some(capability) = hello.capability.as_mut() {
+            capability.compute_score = hello.compute_score.unwrap_or(1);
+            capability.available_ram_mb = hello.available_ram_mb.unwrap_or(0);
+        }
         info!(%peer, "worker sending NodeHello");
         self.swarm.behaviour_mut().request_response.send_request(
             &peer,
             super::super::RequestMessage::NodeHello {
                 hello,
-                pairing_code: hashed_code,
+                pairing_code: String::new(),
             },
         );
     }
