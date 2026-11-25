@@ -1,0 +1,42 @@
+name: Security and provenance
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  contracts-and-hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned contract validator
+        run: python3 -m pip install --disable-pip-version-check -r schemas/requirements.txt
+      - name: Validate contracts and negative fixtures
+        run: python3 schemas/check.py --source-root . --wire-root .
+      - name: Repository policy and tool regression tests
+        run: |
+          python3 scripts/security/check_repository.py
+          python3 -m unittest discover -s scripts/security -p 'test_*.py' -v
+  cargo-inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Inventory exact locked dependency graph
+        run: python3 scripts/release/generate_sbom.py --output artifacts/sbom.cdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cargo-sbom
+          path: artifacts/sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 14
