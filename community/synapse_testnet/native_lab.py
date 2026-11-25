@@ -5,6 +5,7 @@ are admitted. This is not a remote proof of computation, a hosted API, a real
 reward, an arbitrary model gateway, or a production settlement mechanism.
 """
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from .ledger import canonical, digest, require, sha
@@ -30,6 +31,14 @@ class Endpoint:
 
 def verify_fixture(directory):
     """Only allow the original fixture bytes; no download or third-party data."""
+    manifest_path=Path(directory)/'manifest.json'
+    require(manifest_path.is_file() and not manifest_path.is_symlink() and 0<manifest_path.stat().st_size<=4096,
+            'NATIVE_FIXTURE_MISMATCH')
+    expected_manifest={'schema_version':1,'model_id':'synapse/tiny-llama-fixture',
+                       'revision':'fixture-v1','weights':'model.safetensors',
+                       'artifacts':[{'filename':name,'size_bytes':size,'sha256':checksum}
+                                    for name,(size,checksum) in ARTIFACTS.items()]}
+    require(json.loads(manifest_path.read_bytes())==expected_manifest,'NATIVE_FIXTURE_MISMATCH')
     for name, (size, expected) in ARTIFACTS.items():
         path = Path(directory) / name
         require(path.is_file() and not path.is_symlink() and path.stat().st_size == size,
