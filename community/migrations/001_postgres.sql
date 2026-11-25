@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS grants(pool TEXT NOT NULL REFERENCES pools(id), membe
 CREATE TABLE IF NOT EXISTS events(seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, pool TEXT NOT NULL REFERENCES pools(id), actor TEXT NOT NULL, kind TEXT NOT NULL, subject TEXT NOT NULL, created BIGINT NOT NULL, detail TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY, pool TEXT NOT NULL REFERENCES pools(id), kind TEXT NOT NULL, subject TEXT NOT NULL, created BIGINT NOT NULL, delivered BIGINT NOT NULL DEFAULT 0 CHECK(delivered IN(0,1)));
 -- Apply only to a new isolated testnet schema with a restricted owner.
-CREATE OR REPLACE FUNCTION reject_mutation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'immutable accounting record'; END $$;
+CREATE OR REPLACE FUNCTION reject_mutation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'immutable accounting record'; END; $$;
 
 DROP TRIGGER IF EXISTS immutable_journal ON journal;
 CREATE TRIGGER immutable_journal BEFORE UPDATE OR DELETE ON journal FOR EACH ROW EXECUTE FUNCTION reject_mutation();
@@ -33,7 +33,7 @@ BEGIN
       INTO n,total,bad FROM entries e JOIN accounts a ON a.id=e.account JOIN journal j ON j.id=e.tx WHERE e.tx=transaction_id;
     IF n<2 OR total<>0 OR bad<>0 THEN RAISE EXCEPTION 'unbalanced or cross-pool journal'; END IF;
     RETURN NULL;
-END $$;
+END; $$;
 DROP TRIGGER IF EXISTS balanced_journal ON journal;
 CREATE CONSTRAINT TRIGGER balanced_journal AFTER INSERT ON journal DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION validate_journal_transaction();
 DROP TRIGGER IF EXISTS balanced_entries ON entries;
