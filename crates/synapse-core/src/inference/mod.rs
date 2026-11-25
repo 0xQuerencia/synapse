@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod assignment;
 pub mod cache;
 pub mod compression;

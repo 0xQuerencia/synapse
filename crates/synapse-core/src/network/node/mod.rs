@@ -38,6 +38,7 @@ mod generation;
 mod handlers;
 mod helpers;
 mod lifecycle;
+mod transport_control;
 pub(super) use speculation::NgramDraftCache;
 
 #[derive(Debug, Error)]
@@ -90,6 +91,7 @@ pub struct SynapseBehaviour {
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
     pub ping: ping::Behaviour,
     pub mdns: Toggle<mdns::tokio::Behaviour>,
+    pub connection_limits: libp2p::connection_limits::Behaviour,
     pub request_response: request_response::Behaviour<super::ProtocolCodec>,
 }
 
@@ -436,7 +438,15 @@ pub struct SynapseNode {
     shard_readiness: Option<crate::inference::assignment::ReadinessBarrier>,
     worker_assignment: Option<assignments::WorkerAssignment>,
     route_epoch: u64,
+    net_config: crate::NetConfig,
+    pending_requests: crate::network::stream::PendingRequests<request_response::OutboundRequestId>,
+    traffic_quota: crate::network::quota::TrafficQuota,
+    worker_controller: crate::network::worker::WorkerController,
+    worker_control_handle: Option<crate::network::worker::WorkerControlHandle>,
+    worker_control_rx: Option<mpsc::Receiver<crate::network::worker::WorkerControlRequest>>,
+    local_step_pending: bool,
     memory_limit_bytes: u64,
+    admission: Option<crate::inference::admission::CapacityPool>,
     coordinator_only: bool,
     role: SynapseRole,
     model: ModelIdentity,

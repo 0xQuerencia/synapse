@@ -45,6 +45,7 @@ impl SynapseNode {
             }
             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                 info!(%peer_id, ?cause, "connection closed");
+                self.transport_peer_disconnected(peer_id);
                 if matches!(self.role, SynapseRole::Worker { .. }) {
                     let was_active_master = self.authenticated_workers.remove(&peer_id)
                         || self.greeted_peers.remove(&peer_id);
@@ -55,8 +56,7 @@ impl SynapseNode {
                         .as_ref()
                         .is_some_and(|active| active.owner == peer_id)
                     {
-                        self.worker_assignment = None;
-                        self.pipeline = None;
+                        self.release_worker_assignment();
                     }
 
                     if was_active_master {
@@ -129,7 +129,12 @@ impl SynapseNode {
         match event {
             mdns::Event::Discovered(peers) => {
                 for (peer_id, address) in peers {
-                    if peer_id == self.local_peer_id() {
+                    if peer_id == self.local_peer_id()
+                        || !self
+                            .net_config
+                            .discovery
+                            .allows(&peer_id, crate::netconfig::DiscoverySource::Lan)
+                    {
                         continue;
                     }
 
@@ -170,8 +175,13 @@ impl SynapseNode {
                 RequestResponseMessage::Request {
                     request, channel, ..
                 } => self.handle_inbound_request(peer, request, channel),
-                RequestResponseMessage::Response { response, .. } => {
-                    self.handle_inbound_response(peer, response);
+                RequestResponseMessage::Response {
+                    request_id,
+                    response,
+                } => {
+                    if self.accept_tracked_response(request_id, peer, &response) {
+                        self.handle_inbound_response(peer, response);
+                    }
                 }
             },
             RequestResponseEvent::OutboundFailure {
@@ -181,11 +191,7 @@ impl SynapseNode {
                 ..
             } => {
                 warn!(%peer, %request_id, %error, "outbound request failed");
-                if matches!(self.role, SynapseRole::Master { .. }) && self.generation_active {
-                    self.fail_generation(format!(
-                        "outbound request {request_id} to {peer} failed: {error}"
-                    ));
-                }
+                self.handle_tracked_failure(request_id, peer);
             }
             RequestResponseEvent::InboundFailure {
                 peer,
@@ -257,7 +263,13 @@ impl SynapseNode {
                     // Dial discovered peers that run the same model.
                     // Dial discovered peers that run the same model.
                     for peer in providers {
-                        if peer != self.local_peer_id() && !self.dialed_peers.contains(&peer) {
+                        if peer != self.local_peer_id()
+                            && !self.dialed_peers.contains(&peer)
+                            && self
+                                .net_config
+                                .discovery
+                                .allows(&peer, crate::netconfig::DiscoverySource::Dht)
+                        {
                             info!(%peer, "DHT: dialing discovered peer");
                             if let Err(e) = self.swarm.dial(peer) {
                                 warn!(%peer, %e, "DHT: failed to dial peer");
@@ -310,6 +322,10 @@ impl SynapseNode {
         request: super::super::RequestMessage,
         channel: request_response::ResponseChannel<super::super::ResponseMessage>,
     ) {
+        if !self.charge_inbound_request(peer, &request) {
+            self.reject(channel, "peer traffic quota exceeded");
+            return;
+        }
         if self.revocations.contains(&peer) {
             self.reject(channel, "peer revoked");
             return;
@@ -558,20 +574,8 @@ impl SynapseNode {
     /// Notify connected workers and clean up state before shutdown.
     pub(super) fn shutdown_cleanup(&mut self) {
         self.release_generation_assignments();
-        self.worker_assignment = None;
+        self.release_worker_assignment();
         self.pipeline = None;
-        let trace_id = format!("shutdown-{}", std::process::id());
-        let clear = crate::ClearCache {
-            trace_id: trace_id.clone(),
-        };
-        for peer in &self.worker_peers {
-            info!(%peer, %trace_id, "sending shutdown ClearCache to worker");
-            let request = super::super::RequestMessage::ClearCache(clear.clone());
-            self.swarm
-                .behaviour_mut()
-                .request_response
-                .send_request(peer, request);
-        }
 
         if self.generation_active {
             self.fail_generation("master shutting down");

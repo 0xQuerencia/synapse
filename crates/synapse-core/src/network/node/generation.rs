@@ -223,6 +223,7 @@ impl SynapseNode {
             }
         };
         self.split_point = route_plan.master_layer_range.end;
+        self.speculative_enabled = route_plan.worker_hops.is_empty();
         self.generation_route_plan = Some(route_plan.clone());
 
         if let Err(error) = self.begin_route_preparation(&route_plan) {
@@ -251,12 +252,15 @@ impl SynapseNode {
 
         for peer in peers {
             info!(%peer, trace_id, "master requesting worker cache reset");
-            self.swarm.behaviour_mut().request_response.send_request(
-                peer,
+            if let Err(error) = self.send_tracked_request(
+                *peer,
                 super::super::RequestMessage::ClearCache(crate::ClearCache {
                     trace_id: trace_id.clone(),
                 }),
-            );
+            ) {
+                self.fail_generation(error.to_string());
+                return;
+            }
         }
     }
 
@@ -541,10 +545,12 @@ impl SynapseNode {
             pass: activation_pass,
         });
 
-        self.swarm.behaviour_mut().request_response.send_request(
-            &hop.peer_id,
+        if let Err(error) = self.send_tracked_request(
+            hop.peer_id,
             super::super::RequestMessage::ActivationRequest(request),
-        );
+        ) {
+            self.fail_generation(error.to_string());
+        }
     }
 
     /// Phase 4: publish live per-peer telemetry (layers handled, measured
@@ -654,6 +660,9 @@ impl SynapseNode {
             position: self.tokens_generated,
         });
         self.emit(ChatEvent::Token(decoded));
+        if !self.generation_active {
+            return;
+        }
 
         // Feed the N-gram draft cache for speculative decoding.
         if self.speculative_enabled && self.token_ids.len() >= 2 {
@@ -676,7 +685,7 @@ impl SynapseNode {
             };
             self.finish_generation(reason);
         } else {
-            self.send_next_activation();
+            self.local_step_pending = self.generation_active;
         }
     }
 
@@ -797,6 +806,9 @@ impl SynapseNode {
                 position: self.tokens_generated,
             });
             self.emit(ChatEvent::Token(decoded));
+            if !self.generation_active {
+                return;
+            }
 
             self.token_ids.push(token);
             self.tokens_generated += 1;
@@ -825,7 +837,7 @@ impl SynapseNode {
             return;
         }
 
-        self.send_next_activation();
+        self.local_step_pending = self.generation_active;
     }
 
     /// Shared end-of-turn bookkeeping for all generation paths.
@@ -874,7 +886,7 @@ impl SynapseNode {
             self.awaiting_truncate_ack = false;
             self.pending_truncate_trace_id = None;
             self.pending_truncate_peers.clear();
-            self.send_next_activation();
+            self.local_step_pending = self.generation_active;
             return;
         }
 
@@ -896,13 +908,16 @@ impl SynapseNode {
                 target_seq_len,
                 "master requesting worker KV truncation"
             );
-            self.swarm.behaviour_mut().request_response.send_request(
-                &peer,
+            if let Err(error) = self.send_tracked_request(
+                peer,
                 super::super::RequestMessage::KvTruncate(crate::KvTruncate {
                     trace_id: trace_id.clone(),
                     target_seq_len,
                 }),
-            );
+            ) {
+                self.fail_generation(error.to_string());
+                return;
+            }
         }
     }
 
@@ -1010,6 +1025,15 @@ impl SynapseNode {
             return;
         }
 
+        if let Err(error) = active.cursor.validate_step(
+            request.sequence_position,
+            activation_seq_len,
+            active.assignment.context_tokens as usize,
+        ) {
+            self.reject(channel, &error.to_string());
+            return;
+        }
+
         let result = match activation_pass {
             ActivationPass::Prefill => {
                 pipeline.forward_layers_prefill(&hidden, layer_start..layer_end)
@@ -1074,6 +1098,9 @@ impl SynapseNode {
             }
         }
 
+        if let Some(active) = self.worker_assignment.as_mut() {
+            active.cursor.commit_step(activation_seq_len);
+        }
         let response = crate::ActivationResponse {
             trace_id: request.trace_id,
             logits: payload,
@@ -1109,6 +1136,27 @@ impl SynapseNode {
         if let Err(error) = request.validate() {
             warn!(%peer, %error, "ClearCache validation failed");
             self.reject(channel, "invalid ClearCache request");
+            return;
+        }
+
+        let reset = match self
+            .worker_assignment
+            .as_mut()
+            .expect("authorized active lease")
+            .cursor
+            .reset(&request.trace_id)
+        {
+            Ok(reset) => reset,
+            Err(error) => {
+                self.reject(channel, &error.to_string());
+                return;
+            }
+        };
+        if !reset {
+            self.send_response(
+                channel,
+                super::super::ResponseMessage::ClearCacheAck(request),
+            );
             return;
         }
 
@@ -1148,49 +1196,12 @@ impl SynapseNode {
         channel: request_response::ResponseChannel<super::super::ResponseMessage>,
     ) {
         if !self.authorize_worker_trace(peer, &request.trace_id) {
-            self.reject(
-                channel,
-                "operation requires the active authenticated session lease",
-            );
+            self.reject(channel, "unauthorized cache rollback");
             return;
         }
-
-        if !matches!(self.role, SynapseRole::Worker { .. }) {
-            warn!(%peer, "master received KvTruncate request; rejecting");
-            self.reject(channel, "KvTruncate is handled by workers");
-            return;
-        }
-
-        if let Err(error) = request.validate() {
-            warn!(%peer, %error, "KvTruncate validation failed");
-            self.reject(channel, "invalid KvTruncate request");
-            return;
-        }
-
-        let pipeline = match &self.pipeline {
-            Some(pipeline) => Arc::clone(pipeline),
-            None => {
-                warn!(%peer, "model not loaded yet");
-                self.reject(channel, "model not loaded");
-                return;
-            }
-        };
-
-        if let Err(error) = pipeline.truncate_kv_cache(request.target_seq_len) {
-            warn!(%peer, %error, "worker failed to truncate KV cache");
-            self.reject(channel, "failed to truncate KV cache");
-            return;
-        }
-
-        info!(
-            %peer,
-            trace_id = %request.trace_id,
-            target_seq_len = request.target_seq_len,
-            "worker truncated KV cache and acknowledged request"
-        );
-        self.send_response(
+        self.reject(
             channel,
-            super::super::ResponseMessage::KvTruncateAck(request),
+            "distributed speculative rollback is not enabled for protocol v1 sessions",
         );
     }
 
@@ -1245,10 +1256,13 @@ impl SynapseNode {
                     }
                 };
                 self.pending_coordinator_challenges.insert(peer, challenge);
-                self.swarm.behaviour_mut().request_response.send_request(
-                    &peer,
+                if let Err(error) = self.send_tracked_request(
+                    peer,
                     super::super::RequestMessage::ChallengeResponse(response),
-                );
+                ) {
+                    warn!(%peer, %error, "pairing response not sent");
+                    self.pending_coordinator_challenges.remove(&peer);
+                }
             }
             super::super::ResponseMessage::PairingAccepted(proof) => {
                 let Some(challenge) = self.pending_coordinator_challenges.remove(&peer) else {
@@ -1279,10 +1293,12 @@ impl SynapseNode {
                     crate::WorkerCapability::from_probe(&crate::hardware::HardwareProbe::detect());
                 capability.compute_score = self.measured_compute_score.unwrap_or(1);
                 capability.available_ram_mb = self.memory_limit_bytes / (1024 * 1024);
-                self.swarm.behaviour_mut().request_response.send_request(
-                    &peer,
+                if let Err(error) = self.send_tracked_request(
+                    peer,
                     super::super::RequestMessage::CapabilityPing(capability),
-                );
+                ) {
+                    warn!(%peer, %error, "capability confirmation not sent");
+                }
             }
             super::super::ResponseMessage::ShardReady(ready) => {
                 self.handle_shard_ready(peer, ready)
@@ -1502,7 +1518,7 @@ impl SynapseNode {
                 if self.healing_in_progress {
                     self.complete_healing();
                 } else {
-                    self.send_next_activation();
+                    self.local_step_pending = self.generation_active;
                 }
             }
             super::super::ResponseMessage::KvTruncateAck(ack) => {
@@ -1564,7 +1580,7 @@ impl SynapseNode {
                     target_seq_len = ack.target_seq_len,
                     "KV truncation acknowledged — resuming generation"
                 );
-                self.send_next_activation();
+                self.local_step_pending = self.generation_active;
             }
             super::super::ResponseMessage::HealthPong(health) => {
                 info!(%peer, latency_ms = ?health.latency_ms, "connection pre-warmed with HealthPong");
@@ -1742,7 +1758,7 @@ impl SynapseNode {
             None => {
                 warn!("healing complete but no saved tokens — resuming normal generation");
                 self.healing_in_progress = false;
-                self.send_next_activation();
+                self.local_step_pending = self.generation_active;
                 return;
             }
         };
@@ -1761,7 +1777,7 @@ impl SynapseNode {
 
         // Resume normal generation — the first send_next_activation call
         // will do a prefill (tokens_generated == 0), rebuilding KV caches.
-        self.send_next_activation();
+        self.local_step_pending = self.generation_active;
     }
 }
 

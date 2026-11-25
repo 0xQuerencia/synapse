@@ -12,8 +12,8 @@ use super::{
     PROMPT_CHANNEL_CAPACITY, SynapseBehaviour, SynapseNode, SynapseRole, TIMEOUT_CHECK_INTERVAL,
     WorkerRegistry,
     helpers::{
-        extract_peer_id, local_worker_capability_snapshot, measure_relay_latencies,
-        recv_batch_prompt, recv_prompt, select_best_relay,
+        extract_peer_id, local_worker_capability_snapshot, queue_relay_connections,
+        recv_batch_prompt, recv_prompt,
     },
 };
 use crate::inference::{
@@ -33,6 +33,12 @@ impl SynapseNode {
         info!(peer_id = %identity.peer_id(), "node identity loaded");
 
         let is_relay_server = matches!(role, SynapseRole::RelayServer);
+        let net_config = NetConfig::load_strict_default()
+            .map_err(|error| NetworkError::Transport(error.to_string()))?;
+        let lan_discovery = net_config.discovery.allow_lan_discovery;
+        let relay_config = crate::network::connectivity::RelayLimits::default()
+            .to_libp2p_config()
+            .map_err(NetworkError::Transport)?;
         let mut swarm = SwarmBuilder::with_existing_identity(identity.keypair().clone())
             .with_tokio()
             .with_tcp(
@@ -42,13 +48,15 @@ impl SynapseNode {
             )
             .map_err(|error| NetworkError::Transport(error.to_string()))?
             .with_quic()
+            .with_dns()
+            .map_err(|error| NetworkError::Transport(error.to_string()))?
             // Relay client transport — REQUIRED for circuit dialing/listening.
             // Previously `relay::client::new()` was called and its transport
             // discarded, so circuits never routed. The builder wires the
             // transport in properly.
             .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)
             .map_err(|error| NetworkError::Transport(error.to_string()))?
-            .with_behaviour(|keypair, relay_client| {
+            .with_behaviour(move |keypair, relay_client| {
                 let local_peer_id = libp2p::PeerId::from(keypair.public());
 
                 // Identify — exchanges peer info, required by relay/DCUtR.
@@ -62,8 +70,7 @@ impl SynapseNode {
 
                 // Relay server — only active for a dedicated public relay node.
                 let relay_server = Toggle::from(
-                    is_relay_server
-                        .then(|| relay::Behaviour::new(local_peer_id, relay::Config::default())),
+                    is_relay_server.then(|| relay::Behaviour::new(local_peer_id, relay_config)),
                 );
 
                 // DCUtR — hole punches through NATs after relay connection.
@@ -81,9 +88,16 @@ impl SynapseNode {
                 let ping = ping::Behaviour::new(ping::Config::default());
 
                 // mDNS — LAN fast-path discovery.
-                let mdns = Toggle::from(match mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id) {
-                    Ok(behaviour) => Some(behaviour),
-                    Err(error) => { warn!(%error, "LAN multicast discovery unavailable; explicit authenticated addresses remain available"); None }
+                let mdns = Toggle::from(if lan_discovery {
+                    match mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id) {
+                        Ok(behaviour) => Some(behaviour),
+                        Err(error) => {
+                            warn!(%error, "LAN discovery unavailable; manual peers remain usable");
+                            None
+                        }
+                    }
+                } else {
+                    None
                 });
 
                 // Request-response — the core Synapse protocol.
@@ -92,10 +106,10 @@ impl SynapseNode {
                     [(super::super::SynapseProtocol, ProtocolSupport::Full)],
                     request_response::Config::default()
                         .with_request_timeout(DEFAULT_REQUEST_TIMEOUT)
-                        .with_max_concurrent_streams(128), // Increased for pipelining support
+                        .with_max_concurrent_streams(8),
                 );
 
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(SynapseBehaviour {
+                SynapseBehaviour {
                     identify,
                     relay,
                     relay_server,
@@ -105,7 +119,8 @@ impl SynapseNode {
                     ping,
                     mdns,
                     request_response,
-                })
+                    connection_limits: crate::network::connectivity::connection_limits(),
+                }
             })
             .map_err(|error| NetworkError::Transport(error.to_string()))?
             .with_swarm_config(|cfg| {
@@ -145,6 +160,14 @@ impl SynapseNode {
             shard_readiness: None,
             worker_assignment: None,
             route_epoch: 0,
+            net_config,
+            pending_requests: Default::default(),
+            traffic_quota: Default::default(),
+            worker_controller: Default::default(),
+            worker_control_handle: None,
+            worker_control_rx: None,
+            local_step_pending: false,
+            admission: crate::inference::admission::CapacityPool::new(memory_limit_bytes, 1).ok(),
             memory_limit_bytes,
             coordinator_only: false,
             role,
@@ -309,6 +332,10 @@ impl SynapseNode {
                 "cannot change budget during active work".into(),
             ));
         }
+        self.admission = Some(
+            crate::inference::admission::CapacityPool::new(bytes, 1)
+                .map_err(|error| NetworkError::Inference(error.to_string()))?,
+        );
         self.memory_limit_bytes = bytes;
         if let Some(capability) = self.local_capability.as_mut() {
             capability.available_ram_mb = Some(bytes / (1024 * 1024));
@@ -395,53 +422,28 @@ impl SynapseNode {
     pub async fn run(mut self) -> Result<(), NetworkError> {
         info!(peer_id = %self.local_peer_id(), "Synapse swarm started");
 
-        // Load bootstrap + relay peers from config/*.toml (no hardcoded panics).
-        let net_config = NetConfig::load_default();
-        for addr in &net_config.bootstrap {
-            if let Some(peer_id) = extract_peer_id(addr) {
-                info!(%peer_id, %addr, "adding DHT bootstrap peer");
-                self.swarm
-                    .behaviour_mut()
-                    .kad
-                    .add_address(&peer_id, addr.clone());
+        let net_config = self.net_config.clone();
+        if net_config.discovery.allow_dht_discovery {
+            for addr in &net_config.bootstrap {
+                if let Some(peer_id) = extract_peer_id(addr) {
+                    self.swarm
+                        .behaviour_mut()
+                        .kad
+                        .add_address(&peer_id, addr.clone());
+                }
+            }
+            if let Err(error) = self.swarm.behaviour_mut().kad.bootstrap() {
+                warn!(%error, "DHT bootstrap unavailable");
             }
         }
-
-        if let Err(e) = self.swarm.behaviour_mut().kad.bootstrap() {
-            warn!(
-                "DHT bootstrap failed: {} (no bootstrap peers configured?)",
-                e
-            );
-        }
-
-        // Dial relays and (for NAT'd masters) reserve a circuit so remote peers
-        // can reach us through the relay. The relay server itself skips this.
         if !matches!(self.role, SynapseRole::RelayServer) {
-            // Geographic relay selection: measure latency and prefer fastest.
-            let relay_infos = measure_relay_latencies(&mut self.swarm, &net_config.relays);
-
-            // Masters listen on circuit address via the best relay.
+            let relays = queue_relay_connections(&mut self.swarm, &net_config.relays);
             if matches!(self.role, SynapseRole::Master { .. }) {
-                if let Some(best_relay) = select_best_relay(&relay_infos) {
-                    let circuit: Multiaddr = best_relay
-                        .addr
-                        .clone()
-                        .with(libp2p::multiaddr::Protocol::P2pCircuit);
-                    match self.swarm.listen_on(circuit.clone()) {
-                        Ok(_) => {
-                            info!(
-                               circuit = %circuit,
-                                 region = ?best_relay.region,
-                                latency_ms = ?best_relay.measured_latency_ms,
-                            "listening on best relay circuit"
-                               );
-                        }
-                        Err(error) => {
-                            warn!(%circuit, %error, "failed to listen on circuit");
-                        }
+                for relay in crate::network::connectivity::relay_candidates(&relays, 2) {
+                    let circuit = relay.with(libp2p::multiaddr::Protocol::P2pCircuit);
+                    if let Err(error) = self.swarm.listen_on(circuit.clone()) {
+                        warn!(%circuit, %error, "relay reservation could not start");
                     }
-                } else {
-                    warn!("no relay available for circuit listening");
                 }
             }
         }
@@ -450,7 +452,7 @@ impl SynapseNode {
 
         match &self.role {
             // Masters advertise that they serve this model so workers can find them.
-            SynapseRole::Master { .. } => {
+            SynapseRole::Master { .. } if net_config.discovery.allow_dht_discovery => {
                 if let Err(e) = self
                     .swarm
                     .behaviour_mut()
@@ -466,7 +468,16 @@ impl SynapseNode {
                 ..
             } => {
                 // Check peer cache first before DHT query.
-                let cached_providers = self.peer_cache.get_providers(&self.model.id);
+                let cached_providers: Vec<_> = self
+                    .peer_cache
+                    .get_providers(&self.model.id)
+                    .into_iter()
+                    .filter(|(peer, _)| {
+                        net_config
+                            .discovery
+                            .allows(peer, crate::netconfig::DiscoverySource::Cache)
+                    })
+                    .collect();
                 if !cached_providers.is_empty() {
                     info!(
                         count = cached_providers.len(),
@@ -488,7 +499,9 @@ impl SynapseNode {
                         "no cached providers, searching DHT for masters serving model {}",
                         self.model.id
                     );
-                    self.swarm.behaviour_mut().kad.get_providers(model_key);
+                    if net_config.discovery.allow_dht_discovery {
+                        self.swarm.behaviour_mut().kad.get_providers(model_key);
+                    }
                 }
             }
             _ => {}
@@ -557,6 +570,13 @@ impl SynapseNode {
                     // publish a fresh snapshot so the GUI updates promptly.
                     self.publish_status();
                 }
+                Some(request) = crate::network::worker::recv_control(&mut self.worker_control_rx) => {
+                    if self.apply_worker_control(request) { return Ok(()); }
+                }
+                _ = std::future::ready(()), if self.local_step_pending => {
+                    self.local_step_pending = false;
+                    self.send_next_activation();
+                }
                 // Listen for prompts from the CLI REPL (master only)
                 Some(prompt) = recv_prompt(&mut self.prompt_rx) => {
                     self.handle_new_prompt(prompt);
@@ -567,6 +587,7 @@ impl SynapseNode {
                 }
                 // Periodic timeout check for self-healing (Phase 9)
                 _ = timeout_interval.tick() => {
+                    self.transport_tick();
                     self.check_worker_timeouts();
                     // Periodic refresh: catches redial countdowns and keeps
                     // the GUI's peer panel live even when idle.

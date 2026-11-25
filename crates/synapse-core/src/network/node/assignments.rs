@@ -15,6 +15,7 @@ pub(super) struct WorkerAssignment {
     pub owner: PeerId,
     pub assignment: ShardAssignment,
     pub expires_at: Instant,
+    pub cursor: crate::inference::admission::CacheCursor,
 }
 
 pub(super) fn unix_now() -> u64 {
@@ -25,10 +26,9 @@ pub(super) fn unix_now() -> u64 {
 
 impl SynapseNode {
     pub(super) fn begin_route_preparation(&mut self, route: &GenerationRoutePlan) -> Result<()> {
-        self.route_epoch = self
-            .route_epoch
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("route epoch exhausted"))?;
+        self.route_epoch = crate::network::session::EpochCounter::advance(
+            &self.identity.key_path().with_extension("epochs.json"),
+        )?;
         let key = LeaseKey {
             session_id: format!("{:016x}", rand::random::<u64>()),
             route_epoch: self.route_epoch,
@@ -39,8 +39,20 @@ impl SynapseNode {
                 .manifest
                 .digest()?,
         };
-        self.load_assigned_range(route.master_layer_range.clone())?;
+        let admission = self
+            .admission
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("local memory capacity is unknown"))?;
+        admission.reserve(
+            key.clone(),
+            &self.local_peer_id().to_string(),
+            self.memory_limit_bytes,
+            Duration::from_secs(300),
+            Instant::now(),
+        )?;
         self.generation_lease = Some(key.clone());
+        self.load_assigned_range(route.master_layer_range.clone())?;
+        admission.mark_ready(&key, &self.local_peer_id().to_string(), Instant::now())?;
         let context_tokens = self
             .token_ids
             .len()
@@ -76,10 +88,7 @@ impl SynapseNode {
                 .get(&hop.peer_id.to_string())
                 .expect("constructed assignment")
                 .clone();
-            self.swarm
-                .behaviour_mut()
-                .request_response
-                .send_request(&hop.peer_id, RequestMessage::PrepareShard(assignment));
+            self.send_tracked_request(hop.peer_id, RequestMessage::PrepareShard(assignment))?;
         }
         if route.worker_hops.is_empty() {
             self.shard_readiness = None;
@@ -116,6 +125,10 @@ impl SynapseNode {
         ensure!(
             self.authenticated_workers.contains(&peer) && !self.revocations.contains(&peer),
             "unauthorized assignment"
+        );
+        ensure!(
+            self.worker_controller.allows_assignment(),
+            "worker is paused, draining or stopped"
         );
         assignment.validate()?;
         ensure!(
@@ -164,21 +177,42 @@ impl SynapseNode {
                 );
             }
         }
-        self.worker_assignment = None;
-        self.load_assigned_range(assignment.layer_range())?;
+        self.release_worker_assignment();
+        let admission = self
+            .admission
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("worker capacity unavailable"))?;
+        admission.reserve(
+            assignment.key.clone(),
+            &peer.to_string(),
+            assignment.memory_limit_bytes,
+            Duration::from_millis(assignment.ttl_ms as u64),
+            now,
+        )?;
+        if let Err(error) = self.load_assigned_range(assignment.layer_range()) {
+            admission.release(&assignment.key, &peer.to_string())?;
+            self.pipeline = None;
+            return Err(error);
+        }
         let bytes = self
             .pipeline
             .as_ref()
             .expect("loaded above")
             .resident_weight_bytes();
-        ensure!(
-            bytes <= assignment.memory_limit_bytes,
-            "loaded weights exceed reserved budget"
-        );
+        if bytes > assignment.memory_limit_bytes
+            || admission
+                .mark_ready(&assignment.key, &peer.to_string(), Instant::now())
+                .is_err()
+        {
+            admission.release(&assignment.key, &peer.to_string())?;
+            self.pipeline = None;
+            anyhow::bail!("loaded weights exceed reservation or preparation lease expired");
+        }
         self.worker_assignment = Some(WorkerAssignment {
             owner: peer,
             expires_at: now + Duration::from_millis(assignment.ttl_ms as u64),
             assignment: assignment.clone(),
+            cursor: crate::inference::admission::CacheCursor::default(),
         });
         info!(%peer,session=%assignment.key.session_id,epoch=assignment.key.route_epoch,
             layer_start=assignment.layer_start,layer_end=assignment.layer_end,resident_weight_bytes=bytes,"shard ready");
@@ -228,8 +262,7 @@ impl SynapseNode {
             .as_ref()
             .is_some_and(|active| active.owner == peer && active.assignment.key == key)
         {
-            self.worker_assignment = None;
-            self.pipeline = None;
+            self.release_worker_assignment();
         }
         self.send_response(channel, ResponseMessage::ShardReleased(key));
     }
@@ -241,17 +274,28 @@ impl SynapseNode {
                 active.owner == peer
                     && active.expires_at > Instant::now()
                     && active.assignment.key.owns_trace(trace_id)
+                    && self.admission.as_ref().is_some_and(|pool| {
+                        pool.is_ready(&active.assignment.key, &peer.to_string(), Instant::now())
+                    })
             })
     }
 
     pub(super) fn release_generation_assignments(&mut self) {
         if let Some(key) = self.generation_lease.take() {
-            if let Some(route) = &self.generation_route_plan {
-                for hop in &route.worker_hops {
-                    self.swarm
-                        .behaviour_mut()
-                        .request_response
-                        .send_request(&hop.peer_id, RequestMessage::ReleaseShard(key.clone()));
+            if let Some(admission) = &self.admission {
+                let _ = admission.release(&key, &self.local_peer_id().to_string());
+            }
+            self.pending_requests.cancel_session(&key.session_id);
+            let peers: Vec<_> = self
+                .generation_route_plan
+                .as_ref()
+                .map(|route| route.worker_hops.iter().map(|hop| hop.peer_id).collect())
+                .unwrap_or_default();
+            for peer in peers {
+                if let Err(error) =
+                    self.send_tracked_request(peer, RequestMessage::ReleaseShard(key.clone()))
+                {
+                    warn!(%peer, %error, "release request failed; remote lease expires independently");
                 }
             }
         }
@@ -263,13 +307,24 @@ impl SynapseNode {
 
     pub(super) fn expire_assignments(&mut self) {
         let now = Instant::now();
+        let expired = self
+            .admission
+            .as_ref()
+            .and_then(|pool| pool.expire(now).ok())
+            .unwrap_or_default();
+        if self
+            .generation_lease
+            .as_ref()
+            .is_some_and(|key| expired.contains(key))
+        {
+            self.fail_generation("session capacity lease expired");
+        }
         if self
             .worker_assignment
             .as_ref()
             .is_some_and(|active| active.expires_at <= now)
         {
-            self.worker_assignment = None;
-            self.pipeline = None;
+            self.release_worker_assignment();
             info!("expired worker lease released");
         }
         if self
@@ -302,10 +357,20 @@ impl SynapseNode {
             .as_ref()
             .is_some_and(|active| active.owner == peer)
         {
-            self.worker_assignment = None;
-            self.pipeline = None;
+            self.release_worker_assignment();
         }
         let _ = self.swarm.disconnect_peer_id(peer);
         Ok(())
+    }
+
+    pub(super) fn release_worker_assignment(&mut self) {
+        if let Some(active) = self.worker_assignment.take()
+            && let Some(admission) = &self.admission
+        {
+            let _ = admission.release(&active.assignment.key, &active.owner.to_string());
+        }
+        if matches!(self.role, SynapseRole::Worker { .. }) {
+            self.pipeline = None;
+        }
     }
 }

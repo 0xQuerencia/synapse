@@ -10,8 +10,6 @@ const MAX_REJECTED_REASON_LEN: usize = 512;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RequestMessage {
-    PrepareShard(crate::inference::assignment::ShardAssignment),
-    ReleaseShard(crate::inference::assignment::LeaseKey),
     NodeHello {
         hello: NodeHello,
         /// Reserved field, empty in protocol 0.4. Shared secrets and static
@@ -35,13 +33,13 @@ pub enum RequestMessage {
     /// Master → Worker: roll the KV cache back after rejected speculative
     /// draft tokens.
     KvTruncate(KvTruncate),
+    // Append-only: codec framing relies on existing data-message ordinals.
+    PrepareShard(crate::inference::assignment::ShardAssignment),
+    ReleaseShard(crate::inference::assignment::LeaseKey),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ResponseMessage {
-    ShardReady(crate::inference::assignment::ShardReady),
-    ShardReleased(crate::inference::assignment::LeaseKey),
-    PairingAccepted(crate::pairing::CoordinatorProof),
     Authenticated,
     ActivationResponse(ActivationResponse),
     ClearCacheAck(ClearCache),
@@ -60,6 +58,9 @@ pub enum ResponseMessage {
     HealthPong(Health),
     /// Worker → Master: KV cache truncated to the requested length.
     KvTruncateAck(KvTruncate),
+    ShardReady(crate::inference::assignment::ShardReady),
+    ShardReleased(crate::inference::assignment::LeaseKey),
+    PairingAccepted(crate::pairing::CoordinatorProof),
 }
 
 impl ResponseMessage {
@@ -96,6 +97,22 @@ impl RequestMessage {
             Self::CapabilityPing(value) => value.validate(),
             Self::HealthPing => Ok(()),
             Self::KvTruncate(value) => value.validate(),
+            Self::PrepareShard(value) => {
+                value
+                    .validate()
+                    .map_err(|_| crate::ProtocolError::InvalidField {
+                        field: "assignment",
+                        reason: "invalid shard assignment",
+                    })
+            }
+            Self::ReleaseShard(value) => {
+                value
+                    .validate()
+                    .map_err(|_| crate::ProtocolError::InvalidField {
+                        field: "lease",
+                        reason: "invalid lease key",
+                    })
+            }
         }
     }
 }
@@ -117,6 +134,32 @@ impl ResponseMessage {
             Self::CapabilityAck { .. } => Ok(()),
             Self::HealthPong(value) => value.validate(),
             Self::KvTruncateAck(value) => value.validate(),
+            Self::ShardReady(value) => {
+                value
+                    .validate()
+                    .map_err(|_| crate::ProtocolError::InvalidField {
+                        field: "ready",
+                        reason: "invalid ready shard",
+                    })
+            }
+            Self::ShardReleased(value) => {
+                value
+                    .validate()
+                    .map_err(|_| crate::ProtocolError::InvalidField {
+                        field: "lease",
+                        reason: "invalid lease key",
+                    })
+            }
+            Self::PairingAccepted(value) => {
+                if value.nonce.len() != 32
+                    || value.proof.len() != 64
+                    || !value.nonce.bytes().all(|b| b.is_ascii_hexdigit())
+                    || !value.proof.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    return Err(crate::ProtocolError::AuthenticationFailed);
+                }
+                Ok(())
+            }
         }
     }
 }
