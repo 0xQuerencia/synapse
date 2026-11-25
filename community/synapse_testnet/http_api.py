@@ -5,6 +5,7 @@ import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
+from pathlib import Path
 from .ledger import Denied, require
 from .service import Service
 
@@ -16,6 +17,7 @@ ROUTES={
  'POST /v1/jobs/status': ('job', ('job',)),
  'POST /v1/jobs/cancel': ('cancel', ('job',)),
  'POST /v1/jobs/settle': ('settle', ('job',)),
+ 'GET /v1/catalog': ('catalog', ()),
  'GET /v1/credits/balance': ('balance', ()),
  'GET /v1/credits/history': ('history', ()),
  'GET /v1/contributor/stats': ('stats', ()),
@@ -76,13 +78,19 @@ class Handler(BaseHTTPRequestHandler):
         raw=json.dumps(data,separators=(',',':'),allow_nan=False).encode()
         self.send_response(status); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(raw)))
         self.send_header('Cache-Control','no-store'); self.send_header('X-Content-Type-Options','nosniff'); self.send_header('Connection','close'); self.end_headers(); self.wfile.write(raw)
+    def static(self,path):
+        names={'/':('index.html','text/html; charset=utf-8'),'/static/style.css':('style.css','text/css; charset=utf-8'),'/static/app.js':('app.js','application/javascript; charset=utf-8')}
+        name,mime=names[path]; raw=(Path(__file__).parent/'static'/name).read_bytes()
+        self.send_response(200); self.send_header('Content-Type',mime); self.send_header('Content-Length',str(len(raw))); self.send_header('Cache-Control','no-store'); self.send_header('X-Content-Type-Options','nosniff'); self.send_header('Referrer-Policy','no-referrer'); self.send_header('X-Frame-Options','DENY'); self.send_header('Content-Security-Policy',"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"); self.end_headers(); self.wfile.write(raw)
     def dispatch(self):
         try:
             host=f'127.0.0.1:{self.server.server_port}'
-            require(self.headers.get_all('Host')==[host] and not self.headers.get('Origin') and not self.headers.get('Forwarded') and not self.headers.get('X-Forwarded-Host'),'ORIGIN_DENIED',403)
+            require(self.headers.get_all('Host')==[host] and self.headers.get('Origin') in (None,'http://'+host) and not self.headers.get('Forwarded') and not self.headers.get('X-Forwarded-Host'),'ORIGIN_DENIED',403)
             path=urlsplit(self.path)
             require(path.path==self.path and not path.query and not path.fragment,'INVALID_PATH')
             require(not self.headers.get('Transfer-Encoding'),'TRANSFER_ENCODING_UNSUPPORTED')
+            if self.command=='GET' and path.path in ('/','/static/style.css','/static/app.js'):
+                return self.static(path.path)
             if self.command=='GET' and path.path=='/health/live':
                 return self.reply(200,{'status':'alive','mode':'local_testnet','real_credits':False})
             route=ROUTES.get(self.command+' '+path.path)

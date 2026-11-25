@@ -182,6 +182,11 @@ class Service(Ledger):
             for j in jobs: self._refund(db,j,'failed')
             self.audit(db,p,a['id'],'revoked_'+kind,target)
 
+    def catalog(self, token):
+        with self.read() as db:
+            a=self.actor(db,token,{'requester','worker'},True)
+            return {'models':[dict(m) for m in db.execute('SELECT digest,layers,max_context FROM models WHERE pool=? AND enabled=1',(a['pool'],))], 'tariffs':[dict(t) for t in db.execute('SELECT version,base,prefill,decode FROM tariffs WHERE pool=? ORDER BY version',(a['pool'],))], 'fake_credits':True}
+
     def quote(self, token, model, tariff, input_units, max_output):
         digest(model); ident(tariff); integer(input_units,1,32768); integer(max_output,1,32768)
         with self.tx() as db:
