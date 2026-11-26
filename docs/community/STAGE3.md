@@ -9,7 +9,7 @@ The first 44 roadmap slices are merged in `main` at `a127c8907113862379e597a84ec
 | [48](https://github.com/0xQuerencia/synapse/pull/48) | Pin-aware cache eviction, verified artifact export and native fixture delivery | Original fixture only, authenticated loopback transport; no third-party distribution rights or multi-host transfer claim. |
 | [49](https://github.com/0xQuerencia/synapse/pull/49) | Recipient-key-bound enrollment and rotation | Local membership tokens, not hosted identity or native peer invitations. |
 | [50](https://github.com/0xQuerencia/synapse/pull/50) | Sharded fixture accounting | Trusted operator-controlled two-worker harness, fake credits, exact split, failure refund. Native process CI must establish the experiment; signatures are not independent remote attestations. |
-| This slice | Recoverable event export, opt-in ranking, dispute interface | Local operator sink; no external integrations, public ranking, payment or hosted operations. |
+| [51](https://github.com/0xQuerencia/synapse/pull/51) | Recoverable event export, opt-in ranking, dispute interface | Local operator sink; no external integrations, public ranking, payment or hosted operations. |
 
 ## Operator event export
 
@@ -22,6 +22,8 @@ PYTHONPATH=community python3 -m synapse_testnet.outbox \
 ```
 
 Use the existing private operator credential file (adjust the example paths to the local testnet). Rankings are disabled by default. A worker can opt in under a lowercase alias and remove it later; only settled verified job counts and chosen aliases appear to consenting members of the same enabled pool. Do not choose an alias containing identifying information. The dispute table is owner-scoped; disputes still require independent verifier review and operator authorization before compensation. Compensation is fake credits only.
+
+See the [integrated draft audit](../evidence/stage3-cloud.md) for the revision-specific tests and remaining roadmap work.
 
 ## Still required for acceptance
 

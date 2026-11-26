@@ -4,6 +4,8 @@ The current tranche covers **34 of the master plan's 56 work-package IDs**: 01â€
 
 The [final tranche record](evidence/final-tranche.md) is the authority for the integrated revision, final test counts, commands, binary/artifact identifiers and unresolved failures. Intermediate records retain their original revisions and limits. Do not attach the original imported SHA to a modified checkout or reuse a filtered branch test count as the final workspace result.
 
+See the [integrated draft audit](evidence/stage3-cloud.md) for later published drafts and their revision-specific results. The counts below describe the original local tranche.
+
 ## Implemented work and evidence boundaries
 
 | Packages | Concrete implementation in this tranche | Local evidence and limits |

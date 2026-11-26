@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -84,6 +85,32 @@ class InstallationTests(unittest.TestCase):
         statement_path = directory / (filename + '.statement.json')
         statement_path.write_bytes(canonical(statement))
         return archive, statement_path, None
+
+    def test_verify_artifact_checks_signed_payload_without_creating_prefix(self):
+        archive, statement, signature = self.package(signed=True)
+        command = [sys.executable, str(Path(installer.__file__).resolve()),
+                   '--prefix', str(self.prefix), 'verify-artifact', str(archive),
+                   '--statement', str(statement), '--signature', str(signature),
+                   '--public-key', str(self.public)]
+        verified = subprocess.run(command, check=True, capture_output=True, text=True)
+        manifest = json.loads(verified.stdout)
+        self.assertEqual(manifest['version'], '1.0.0')
+        binary = next(item for item in manifest['files'] if item['path'] == 'bin/synapse')
+        self.assertEqual(binary['sha256'], digest(self.binary))
+        self.assertFalse(self.prefix.exists())
+
+        data = archive.read_bytes()
+        archive.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+        rejected = subprocess.run(command, capture_output=True, text=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn('archive checksum mismatch', rejected.stderr)
+        self.assertFalse(self.prefix.exists())
+
+    def test_verify_artifact_refuses_untrusted_signature(self):
+        archive, statement, signature = self.package(signed=True)
+        signature.write_bytes(b'0' * 64)
+        with self.assertRaisesRegex(ValueError, 'signature operation failed'):
+            installer.verify_artifact(archive, statement, signature, self.public)
 
     def test_signed_install_creates_executable_without_startup(self):
         release = self.install(self.package(signed=True))

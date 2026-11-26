@@ -572,29 +572,27 @@ impl SynapseNode {
         let mut timeout_interval = tokio::time::interval(TIMEOUT_CHECK_INTERVAL);
         timeout_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // Build a combined shutdown signal (SIGINT + SIGTERM on Unix).
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let shutdown_tx_ctrlc = shutdown_tx.clone();
-        tokio::spawn(async move {
+        // Keep signal subscriptions inside the run future so aborting a session
+        // drops its listeners along with the swarm.
+        let shutdown = async {
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("failed to register SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
             let _ = tokio::signal::ctrl_c().await;
-            info!("SIGINT received");
-            let _ = shutdown_tx_ctrlc.send(()).await;
-        });
-        #[cfg(unix)]
-        {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("failed to register SIGTERM handler");
-            tokio::spawn(async move {
-                sigterm.recv().await;
-                info!("SIGTERM received");
-                let _ = shutdown_tx.send(()).await;
-            });
-        }
+        };
+        tokio::pin!(shutdown);
 
         loop {
             tokio::select! {
-                _ = shutdown_rx.recv() => {
+                _ = &mut shutdown => {
                     info!("initiating graceful shutdown");
                     self.shutdown_cleanup();
                     return Ok(());
@@ -646,5 +644,78 @@ impl SynapseNode {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{process::Command, time::Duration};
+
+    #[test]
+    fn repeated_aborted_sessions_release_runtime_tasks() {
+        const CHILD: &str = "SYNAPSE_TEST_SESSION_TASKS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "network::node::lifecycle::tests::repeated_aborted_sessions_release_runtime_tasks",
+                    "--nocapture",
+                ])
+                .current_dir(root.path())
+                .env("HOME", root.path())
+                .env("SYNAPSE_IDENTITY_PATH", root.path().join("device.key"))
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated session task test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let metrics = runtime.metrics();
+        let baseline = metrics.num_alive_tasks();
+        let retained = runtime.block_on(async {
+            let mut retained = Vec::new();
+            for _ in 0..4 {
+                let node = SynapseNode::new(
+                    SynapseRole::Master {
+                        expected_pairing_code: "synthetic".into(),
+                        max_tokens: 8,
+                    },
+                    ModelIdentity::new("synapse/synthetic"),
+                    "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+                )
+                .await
+                .unwrap();
+                let mut status = node.status_receiver();
+                let run = tokio::spawn(node.run());
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    status.wait_for(|snapshot| !snapshot.listen_addresses.is_empty()),
+                )
+                .await
+                .expect("loopback listener readiness deadline")
+                .expect("node exited before readiness");
+                run.abort();
+                assert!(run.await.unwrap_err().is_cancelled());
+                retained.push(metrics.num_alive_tasks());
+            }
+            retained
+        });
+        assert_eq!(
+            retained,
+            vec![baseline; 4],
+            "tasks retained after each abort"
+        );
     }
 }
