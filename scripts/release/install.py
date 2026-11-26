@@ -280,7 +280,7 @@ def verify_release(directory):
     return manifest
 
 
-def install(archive, statement_path, prefix, signature=None, public_key=None, allow_development=False, expected_sha256=None, allow_downgrade=False, update=False):
+def authenticate_artifact(archive, statement_path, signature, public_key, allow_development, expected_sha256):
     statement, statement_raw = read_document(statement_path)
     validate_statement(statement)
     if statement['target'] != host_target():
@@ -293,9 +293,58 @@ def install(archive, statement_path, prefix, signature=None, public_key=None, al
     if (signature is None) != (public_key is None):
         raise ValueError('both signature and trusted public key are required')
     if signed:
-        verify_signature(statement_path, signature, public_key)
+        # Authenticate the exact bytes used to choose the archive digest.
+        with tempfile.NamedTemporaryFile(prefix='synapse-statement-') as snapshot:
+            snapshot.write(statement_raw)
+            snapshot.flush()
+            verify_signature(snapshot.name, signature, public_key)
     elif not (allow_development and statement['channel'] == 'development' and expected_sha256 == statement['sha256']):
         raise ValueError('trusted signature required; explicit development mode also requires independent --sha256')
+    return statement, statement_raw, signed
+
+
+def snapshot_archive(archive, snapshot, statement):
+    source_fd = os.open(archive, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(source_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != statement['size_bytes']:
+            raise ValueError('archive size/type mismatch')
+        output_fd = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        observed = hashlib.sha256()
+        try:
+            with os.fdopen(source_fd, 'rb', closefd=False) as source, os.fdopen(output_fd, 'wb', closefd=False) as output:
+                count = 0
+                while chunk := source.read(65536):
+                    count += len(chunk)
+                    if count > MAX_ARCHIVE or count > statement['size_bytes']:
+                        raise ValueError('archive exceeds expected size')
+                    observed.update(chunk)
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output_fd)
+        finally:
+            os.close(output_fd)
+        if count != statement['size_bytes'] or observed.hexdigest() != statement['sha256']:
+            raise ValueError('archive checksum mismatch')
+    finally:
+        os.close(source_fd)
+
+
+def verify_artifact(archive, statement_path, signature, public_key, allow_development=False, expected_sha256=None):
+    statement, _, _ = authenticate_artifact(
+        archive, statement_path, signature, public_key, allow_development, expected_sha256)
+    with tempfile.TemporaryDirectory(prefix='synapse-artifact-') as directory:
+        root = Path(directory)
+        snapshot = root / 'archive'
+        stage = root / 'contents'
+        stage.mkdir(mode=0o700)
+        snapshot_archive(archive, snapshot, statement)
+        return extract_verified(snapshot, stage, statement)
+
+
+def install(archive, statement_path, prefix, signature=None, public_key=None, allow_development=False, expected_sha256=None, allow_downgrade=False, update=False):
+    statement, statement_raw, signed = authenticate_artifact(
+        archive, statement_path, signature, public_key, allow_development, expected_sha256)
     prefix = prepare_prefix(prefix, create=not update)
     with locked(prefix):
         stopped(prefix)
@@ -316,30 +365,7 @@ def install(archive, statement_path, prefix, signature=None, public_key=None, al
         stage = Path(tempfile.mkdtemp(prefix='.stage-', dir=prefix / 'releases'))
         snapshot = prefix / ('.archive-' + uuid.uuid4().hex)
         try:
-            source_fd = os.open(archive, os.O_RDONLY | os.O_NOFOLLOW)
-            try:
-                info = os.fstat(source_fd)
-                if not stat.S_ISREG(info.st_mode) or info.st_size != statement['size_bytes']:
-                    raise ValueError('archive size/type mismatch')
-                output_fd = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-                observed = hashlib.sha256()
-                try:
-                    with os.fdopen(source_fd, 'rb', closefd=False) as source, os.fdopen(output_fd, 'wb', closefd=False) as output:
-                        count = 0
-                        while chunk := source.read(65536):
-                            count += len(chunk)
-                            if count > MAX_ARCHIVE or count > statement['size_bytes']:
-                                raise ValueError('archive exceeds expected size')
-                            observed.update(chunk)
-                            output.write(chunk)
-                        output.flush()
-                        os.fsync(output_fd)
-                finally:
-                    os.close(output_fd)
-                if count != statement['size_bytes'] or observed.hexdigest() != statement['sha256']:
-                    raise ValueError('archive checksum mismatch')
-            finally:
-                os.close(source_fd)
+            snapshot_archive(archive, snapshot, statement)
             manifest = extract_verified(snapshot, stage, statement)
             write_owned(stage / 'release-statement.json', statement_raw)
             write_owned(stage / 'verification.json', canonical({'method': 'signature' if signed else 'explicit-development-checksum'}))
@@ -425,7 +451,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--prefix', type=Path, default=Path.home() / '.local/share/synapse')
     commands = parser.add_subparsers(dest='action', required=True)
-    for action in ['install', 'update']:
+    for action in ['install', 'update', 'verify-artifact']:
         command = commands.add_parser(action)
         command.add_argument('archive', type=Path)
         command.add_argument('--statement', type=Path, required=True)
@@ -433,7 +459,8 @@ def main():
         command.add_argument('--public-key', type=Path)
         command.add_argument('--allow-development', action='store_true')
         command.add_argument('--sha256')
-        command.add_argument('--allow-downgrade', action='store_true')
+        if action != 'verify-artifact':
+            command.add_argument('--allow-downgrade', action='store_true')
     commands.add_parser('rollback')
     commands.add_parser('verify')
     remove = commands.add_parser('uninstall')
@@ -445,6 +472,10 @@ def main():
             print(f'Installed verified local package at {location}')
             print(f'Executable: {args.prefix}/bin/synapse')
             print('No process or service was started. Add the bin directory to PATH yourself if desired.')
+        elif args.action == 'verify-artifact':
+            manifest = verify_artifact(args.archive, args.statement, args.signature, args.public_key,
+                                       args.allow_development, args.sha256)
+            print(json.dumps(manifest, indent=2))
         elif args.action == 'rollback':
             print(f'Activated previous verified package: {rollback(args.prefix)}')
         elif args.action == 'verify':

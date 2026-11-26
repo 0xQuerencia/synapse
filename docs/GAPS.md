@@ -1,6 +1,6 @@
 # Remaining gaps and evidence boundaries
 
-The 34-package local tranche implements substantial runtime, network, product and packaging paths. Its [implementation status](IMPLEMENTATION_STATUS.md), [final execution record](evidence/final-tranche.md), and [machine-readable gates](evidence/gates.json) distinguish code, actual local tests and acceptance. No gate is accepted by this register. Planned PR labels identify work packages; **no GitHub PRs or release artifacts have been published, and no production deployment has occurred**.
+The 34-package local tranche implements substantial runtime, network, product and packaging paths. Its [implementation status](IMPLEMENTATION_STATUS.md), [final execution record](evidence/final-tranche.md), and [machine-readable gates](evidence/gates.json) distinguish code, actual local tests and acceptance. No gate is accepted by this register. The [integrated draft audit](evidence/stage3-cloud.md) records later GitHub publication and what the draft stack established. Planned PR labels identify work packages.
 
 ## Required external evidence
 
@@ -12,9 +12,9 @@ The 34-package local tranche implements substantial runtime, network, product an
 | License ownership and model rights | Root MIT preserved; explicit signed model grants, unknown/revoked/unauthorized policy rejection | Authorized maintainer resolution of Apache-2.0 metadata discrepancy; reviewed third-party model rights and approver; no inferred redistribution permission |
 | Production trust and releases | Local signing/checksum tooling, atomic cache/package activation, key-bound verification, rollback and corruption tests | Identified key owners, independently authenticated trust-key distribution, rotation/revocation drills, reproducible artifact/SBOM and release approval |
 | Independent installation/usability | Developer-run actual process/API controls, Linux installer tests, browser keyboard/responsive checks | A fresh independent tester installs, connects physical devices, runs, cancels, upgrades, rolls back and removes each supported package; assistive-technology and physical-mobile checks |
-| Community operation and economics | Local/private inference and safe policy building blocks; planned accounting contracts | Hosted membership and tenant authorization, transactional reservation/settlement, approved hosts/models, explicit consent, cash budget, durable recovery and accountable pilot operator |
+| Community operation and economics | Local/private inference and synthetic fake-credit settlement, refunds and reconciliation | Hosted membership and tenant authorization, transactional reservation/settlement, approved hosts/models, explicit consent, cash budget, durable recovery and accountable pilot operator |
 | Community integrity/privacy | Signed identity and bounded encrypted transport; workers execute model-only operations | Independent adversarial review, approved host verification, explicit data threat model, privacy limits and operational drills. Signatures do not prove correct computation or hide activations from workers. |
-| Published review and remote CI | Local commits, prepared workflows and retained local execution evidence | Authorized GitHub publication followed by actual remote CI/review. Prepared PR descriptions are not published or merged PRs. |
+| Published review and remote CI | Main plus drafts #46–51 and exact-head GitHub checks recorded in the integrated draft audit | Draft review and acceptance of the integrated stack and any later release candidate |
 
 ## Remaining implementation and integration boundaries
 

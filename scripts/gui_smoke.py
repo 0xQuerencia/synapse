@@ -59,6 +59,7 @@ class GuiServer:
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         environment = os.environ.copy()
         environment.update({
+            "HOME": str(self.directory / "home"),
             "HF_HOME": str(self.directory / "home" / "hf"),
             "RUST_LOG": "warn,synapse_core=info,synapse_gui=info",
             "NO_COLOR": "1",

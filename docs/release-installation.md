@@ -26,6 +26,25 @@ An authorized release operator may add `--channel candidate --signing-key /path/
 
 Signature, statement and archive are separate files. A signature authenticates the candidate's origin under the chosen key; it does not settle model rights, license ownership, runtime correctness or release approval. No signed production artifact is claimed by the local test suite.
 
+## Verify a candidate before installation
+
+```sh
+python3 scripts/release/install.py verify-artifact \
+  /path/to/synapse-VERSION-TARGET.tar.gz \
+  --statement /path/to/synapse-VERSION-TARGET.tar.gz.statement.json \
+  --signature /path/to/synapse-VERSION-TARGET.tar.gz.sig \
+  --public-key /path/to/trusted-release-public.pem
+```
+
+The command authenticates the statement, checks the host target, and verifies the bounded archive and every manifest entry in a disposable private directory. It prints the verified manifest and removes its staging files. It has no activation step.
+
+To qualify the actual CLI build locally with a disposable test key and the original offline fixture, use the [low-memory build](development-memory.md) followed by the package smoke check. The smoke check compares the verified package payload's digest with the build and runs that build against eight reference token IDs.
+
+```sh
+python3 scripts/low_memory.py build -p synapse-cli
+python3 scripts/release/smoke_cli.py --binary target/low-memory/debug/synapse
+```
+
 ## Install a verified candidate
 
 Use actual paths/version from the produced artifacts:
