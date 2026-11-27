@@ -92,6 +92,6 @@ npm --prefix web/landing run check
 npm --prefix web/landing run build
 ```
 
-The research landing is a static artifact in `web/landing/dist`. Its resource explorer is clearly labeled fictional; it opens no worker connection and creates no credits. Preview locally through the supported development workflow; deployment is separate.
+The static landing builds to `web/landing/dist`. It shows a recorded two-node fixture run. The separate memory simulator uses fictional profiles and timing estimates. Run `npm --prefix web/landing run dev` from the repository root to preview both pages.
 
 Network model downloads and physical tests are separate from deterministic offline tests. A failed or unavailable download is not evidence of compatibility. For an issue, include source/model revision, OS/backend, exact command, redacted error and artifact location. Do not attach prompts, activations, keys, pairing/invitation codes or access tokens. Use the [security process](../SECURITY.md) for sensitive reports.

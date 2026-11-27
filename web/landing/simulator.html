@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Explore how example layer placements fit per-device memory budgets in Synapse.">
+  <title>Memory simulator · Synapse</title>
+  <link rel="icon" href="./assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./assets/styles.css">
+  <link rel="stylesheet" href="./assets/simulator.css">
+  <script type="module" src="./assets/app.mjs"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header wrap">
+    <a class="brand" href="./" aria-label="Synapse home">
+      <img src="./assets/favicon.svg" width="30" height="30" alt="">
+      <span>synapse</span>
+    </a>
+    <nav aria-label="Main navigation">
+      <a href="./">Back to Synapse</a>
+      <a href="https://github.com/0xQuerencia/synapse">GitHub <span class="arrow" aria-hidden="true"></span></a>
+    </nav>
+  </header>
+
+  <main id="main" class="simulator-page wrap" tabindex="-1">
+    <h1>Memory simulator</h1>
+    <p class="simulator-intro">Change example device budgets, context length and link latency to see which routes can fit. The simulator uses fictional profiles and timing estimates.</p>
+    <div class="simulator">
+      <div class="simulation-banner">
+        <strong>Illustrative simulation</strong>
+        <span>Fictional profiles. No connected devices, requests or credits.</span>
+      </div>
+      <div class="simulator-body">
+        <form id="explorer-form" class="explorer-controls">
+          <fieldset disabled>
+            <legend>Example workload</legend>
+            <div class="control-field">
+              <label for="profile">Model profile</label>
+              <select name="profile" id="profile">
+                <option value="small">Small · 3.5 GiB weights</option>
+                <option value="medium" selected>Medium · 9 GiB weights</option>
+                <option value="large">Large · 16.5 GiB weights</option>
+              </select>
+            </div>
+            <div class="control-pair">
+              <div class="control-field">
+                <label for="network">Link RTT</label>
+                <select name="network" id="network">
+                  <option value="wired">Wired · 2 ms</option>
+                  <option value="wifi" selected>Wi-Fi · 8 ms</option>
+                  <option value="wan">WAN · 60 ms</option>
+                </select>
+              </div>
+              <div class="control-field">
+                <label for="context">Context</label>
+                <select name="context" id="context">
+                  <option value="512">512 tokens</option>
+                  <option value="2048" selected>2,048 tokens</option>
+                  <option value="4096">4,096 tokens</option>
+                </select>
+              </div>
+            </div>
+          </fieldset>
+          <fieldset disabled>
+            <legend>Compatible example devices</legend>
+            <div class="device-control">
+              <div>
+                <label class="toggle-label"><input type="checkbox" name="laptop-enabled" checked> Your laptop</label>
+                <output id="laptop-budget-label" for="laptop-budget">4 GiB</output>
+              </div>
+              <label class="range-label" for="laptop-budget">Usable inference memory</label>
+              <input type="range" aria-label="Your laptop usable inference memory" id="laptop-budget" name="laptop-budget" min="1" max="24" value="4" step="1">
+            </div>
+            <div class="device-control">
+              <div>
+                <label class="toggle-label"><input type="checkbox" name="desktop-enabled" checked> Trusted desktop</label>
+                <output id="desktop-budget-label" for="desktop-budget">8 GiB</output>
+              </div>
+              <label class="range-label" for="desktop-budget">Usable inference memory</label>
+              <input type="range" aria-label="Trusted desktop usable inference memory" id="desktop-budget" name="desktop-budget" min="1" max="24" value="8" step="1">
+            </div>
+            <div class="device-control">
+              <div>
+                <label class="toggle-label"><input type="checkbox" name="gpu-enabled"> Remote GPU host</label>
+                <output id="gpu-budget-label" for="gpu-budget">12 GiB</output>
+              </div>
+              <label class="range-label" for="gpu-budget">Usable inference memory</label>
+              <input type="range" aria-label="Remote GPU host usable inference memory" id="gpu-budget" name="gpu-budget" min="1" max="24" value="12" step="1" disabled>
+            </div>
+          </fieldset>
+        </form>
+        <div class="explorer-result">
+          <div class="result-topline">
+            <span class="mono">EXAMPLE ROUTE</span>
+            <span>Weights <strong id="weight-value">9.00 GiB</strong></span>
+          </div>
+          <h3 id="route-status" role="status" aria-live="polite">A route needs more than pooled RAM.</h3>
+          <div id="route-output">
+            <p>Each device must fit its assigned weights, KV cache and working memory. The sharded coordinator also holds embedding and output weights.</p>
+            <p>Enable JavaScript to explore the example profiles interactively.</p>
+          </div>
+          <details class="math-details">
+            <summary>What this example counts</summary>
+            <p>Per-device memory includes assigned layer weights, context-dependent KV cache and working memory. In a sharded route, the laptop also holds input and output weights. A full-model host holds every component.</p>
+            <p>The fictional decode estimate includes per-layer compute, coordinator overhead and activation round trips. Full-model text streaming avoids the per-token round trip between layers.</p>
+            <p>The budgets assume operating-system headroom and devices that support the same model and format. The estimates omit load, queue and prefill time.</p>
+          </details>
+        </div>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

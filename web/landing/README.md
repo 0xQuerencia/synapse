@@ -1,31 +1,26 @@
-# Synapse research landing page
+# Synapse landing
 
-A buildless HTML/CSS/ES-module site, with no runtime dependencies, remote fonts, analytics, accounts or connection to the worker daemon. All device profiles and timing values in the explorer are explicitly fictional.
+A dependency-free static site for the experimental layer-splitting runtime. The trace records a deterministic laptop-to-Codex Cloud fixture run over private Tailscale. Each machine ran one layer, one prefill pass and seven decode passes. All eight fixture token IDs matched the laptop-only run.
+
+The memory simulator lives at `simulator.html`. Its device profiles and timing estimates are fictional. It evaluates exact contiguous layer coverage, individual memory budgets, cache and working memory, fixed input and output weights, and estimated network overhead.
+
+## Build and preview
+
+From the repository root:
 
 ```sh
-node scripts/build.mjs
-node --test scripts/simulator.test.mjs
-node scripts/check.mjs
+npm --prefix web/landing test
+npm --prefix web/landing run build
+npm --prefix web/landing run check
+npm --prefix web/landing run dev
 ```
 
-Run commands from `web/landing`. The build copies the complete approved plan and related source documents into `dist/docs`; the delivered site is self-contained. `dist` is generated and ignored. The development entrypoint builds once and serves the result; rebuild and reload after edits. In managed environments use the approved preview service rather than starting a second server.
+The development server serves the landing at `/`, the simulator at `/simulator.html`, and a viewport harness at `/_qa.html`. Set `PORT` to override the default port, 4173. Rebuild and reload after edits.
 
-## Simulator contract
+## Publish
 
-Every candidate has exact contiguous layer coverage and satisfies each device's own inference budget. Count per-layer weights, context-dependent KV, scratch and fixed input/output tensors. For sharding the laptop is the coordinator and owns the input/output weights even when assigned zero layers. Full-model routes count all weights/state on their chosen host.
+The complete static output is `web/landing/dist`. For a Git-connected Cloudflare Pages project, use the repository root with build command `npm --prefix web/landing run build` and output directory `web/landing/dist`. For an existing Direct Upload project, run the same build locally and upload the contents of that output directory. The build needs Node.js and the full checkout because it copies project documentation.
 
-The cost model enumerates bounded candidate routes and chooses the lowest fictional decode estimate with deterministic ties. Sharded remote stages add activation round-trip costs. A full-model host streams text without that per-token activation chain. Estimates exclude load, queue and prefill and cannot be presented as measurements. Local and remote examples assume compatible formats/backends and trusted eligible devices.
+Keep `index.html`, `404.html` and `_headers` at the publish root. A fresh build excludes the development QA harness. Confirm the landing, simulator, discrete 404 response and security headers on the intended hostname after publishing.
 
-Tests cover coverage, budgets, fixed-weight overhead, context cost, no-route states, full-model selection and latency sensitivity, including a grid of profile/context/network/budget combinations.
-
-## Status and publishing
-
-The site uses research-stage language, source/roadmap calls to action and no fabricated download, adoption or earnings claims. Production domain/canonical URL, public deployment, model rights, supported-device evidence and signed releases remain separate decisions. This local implementation does not deploy anything.
-
-`dist/_headers` supplies a suggested static-host security policy. A selected host must actually enforce it; placing a file in a bundle is not proof of deployed headers. No production hostname, waitlist or tracking identifier is invented.
-
-## Browser QA
-
-The development server exposes `/_qa.html`, with real 360/768 CSS-pixel iframe viewports and a JavaScript-disabled fallback. It exists only in the local development output; a clean production build excludes it. Development response framing is SAMEORIGIN to permit this harness; the suggested production header remains DENY.
-
-See [the QA report](../../docs/evidence/landing-qa.md) for actual checks and limitations. Semantic checks, selected palette contrast and reduced-motion CSS policy do not replace physical-device or screen-reader review.
+The site bundles Instrument Serif Italic locally. Its [license](assets/fonts/OFL-Instrument-Serif.txt) and [upstream source](https://github.com/google/fonts/tree/main/ofl/instrumentserif) are available alongside the build.

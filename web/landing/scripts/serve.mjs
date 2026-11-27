@@ -7,7 +7,7 @@ import { writeQaHarness } from './qa-harness.mjs';
 await build();
 await writeQaHarness();
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../dist');
-const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.md': 'text/plain; charset=utf-8' };
+const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.ttf': 'font/ttf', '.md': 'text/plain; charset=utf-8' };
 const server = http.createServer(async (request, response) => {
   if (request.method !== 'GET' && request.method !== 'HEAD') { response.writeHead(405, { Allow: 'GET, HEAD' }); response.end(); return; }
   try {

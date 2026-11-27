@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 from urllib.parse import unquote, urlsplit
 
-SITE = Path(__file__).resolve().parents[1]
+DIST = Path(__file__).resolve().parents[1] / 'dist'
 
 
 class Page(HTMLParser):
@@ -71,40 +71,68 @@ def luminance(color):
     return sum(weight * (x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4) for weight, x in zip([.2126, .7152, .0722], values))
 
 
-def main():
-    source = (SITE / 'dist/index.html').read_text()
-    page = Page(source)
-    errors = violations(page)
-    assert not errors, errors
+def check_links(page):
     internal = 0
     for node in page.nodes:
-        attrs = node['attrs']
         for attr in ('href', 'src'):
-            value = attrs.get(attr)
+            value = node['attrs'].get(attr)
             if not value or value.startswith('#') or urlsplit(value).scheme:
                 continue
-            target = (SITE / 'dist' / unquote(urlsplit(value).path)).resolve()
-            assert target.is_relative_to((SITE / 'dist').resolve()) and target.is_file(), f'missing asset/link: {value}'
+            target = (DIST / unquote(urlsplit(value).path)).resolve()
+            if target.is_dir():
+                target /= 'index.html'
+            assert target.is_relative_to(DIST.resolve()) and target.is_file(), f'missing asset/link: {value}'
             internal += 1
-    css = (SITE / 'dist/assets/styles.css').read_text()
-    assert 'prefers-reduced-motion:reduce' in css and 'scroll-behavior:auto' in css and 'animation:none!important' in css
-    assert ':focus-visible' in css and 'outline:3px solid var(--accent)' in css
-    for width in (1100, 800, 520):
-        assert f'max-width:{width}px' in css
-    for foreground, background in [('#edeef2', '#0d0f14'), ('#a5a8b6', '#0d0f14'), ('#b9adff', '#0d0f14'), ('#171322', '#b9adff')]:
-        light, dark = sorted([luminance(foreground), luminance(background)], reverse=True)
-        assert (light + .05) / (dark + .05) >= 4.5
-    for phrase in ['Illustrative simulation', 'Fictional profiles.', 'No connected devices', 'Physical LAN/WAN validation is not attested', 'noncash usage']:
-        assert phrase in source
-    assert 'user-scalable=no' not in source
-    assert '<form' in source and '<main' in source
-    for unsafe in ['https://fonts.googleapis.com', 'google-analytics', 'gtag(', 'fake-live']:
-        assert unsafe not in source
-    # These failures correspond to common real regressions, rather than generated snapshots.
-    assert 'document language missing' in violations(Page(source.replace('lang="en"', '')))
-    assert 'duplicate IDs' in violations(Page(source.replace('<body>', '<body><div id="main"></div>')))
-    assert 'image missing text alternative' in violations(Page(source.replace('<body>', '<body><img src="missing.svg">')))
-    print(json.dumps({'semantic_checks': 'passed', 'internal_assets_and_links': internal, 'palette_contrast': 'four core pairs >= 4.5:1', 'reduced_motion': 'CSS policy checked; OS preference emulation not performed', 'responsive_rules': [1100, 800, 520], 'negative_regressions_rejected': 3}, indent=2))
+    return internal
+
+
+def check_trace(page):
+    controls = [n for n in page.nodes if 'data-trace-step' in n['attrs']]
+    panels = [n for n in page.nodes if 'data-trace-panel' in n['attrs']]
+    expected = ['route', 'prefill', 'decode', 'result']
+    assert [n['attrs']['data-trace-step'] for n in controls] == expected
+    assert [n['attrs']['data-trace-panel'] for n in panels] == expected
+    assert [n['attrs']['aria-pressed'] for n in controls] == ['true', 'false', 'false', 'false']
+    assert ['hidden' in n['attrs'] for n in panels] == [False, True, True, True]
+    assert all(n['tag'] == 'button' and n['attrs'].get('type') == 'button' for n in controls)
+    assert any(n['attrs'].get('class') == 'trace-fallback' and 'hidden' not in n['attrs'] and 'seven decode passes' in n['text'] for n in page.nodes)
+
+
+def main():
+    landing = (DIST / 'index.html').read_text()
+    simulator = (DIST / 'simulator.html').read_text()
+    internal = 0
+    for source in [landing, simulator]:
+        page = Page(source)
+        errors = violations(page)
+        assert not errors, errors
+        internal += check_links(page)
+        for forbidden in ['user-scalable=no', 'https://fonts.googleapis.com', 'google-analytics', 'gtag(']:
+            assert forbidden not in source
+    check_trace(Page(landing))
+    for phrase in ['Recorded fixture run', 'Private Tailscale', 'Layer 0', 'Layer 1', '8 of 8', 'Still experimental']:
+        assert phrase in landing
+    for phrase in ['Illustrative simulation', 'Fictional profiles.', 'No connected devices', '<form']:
+        assert phrase in simulator
+
+    css = (DIST / 'assets/styles.css').read_text()
+    assert '@media (prefers-reduced-motion: reduce)' in css and 'animation: none !important' in css
+    assert ':focus-visible' in css and 'outline: 3px solid var(--accent)' in css
+    colors = dict(re.findall(r'(--[a-z-]+): (#[0-9a-f]{6})', css))
+    pairs = [('ink', 'paper'), ('muted', 'paper'), ('muted', 'paper-deep'), ('accent', 'paper'),
+             ('trace-paper', 'trace-bg'), ('trace-muted', 'trace-bg'), ('trace-accent', 'trace-bg'),
+             ('ink', 'trace-accent')]
+    for foreground, background in pairs:
+        light, dark = sorted([luminance(colors['--' + foreground]), luminance(colors['--' + background])], reverse=True)
+        assert (light + .05) / (dark + .05) >= 4.5, (foreground, background)
+
+    # Exercise common semantic regressions.
+    assert 'document language missing' in violations(Page(landing.replace('lang="en"', '')))
+    assert 'duplicate IDs' in violations(Page(landing.replace('<main', '<div id="main"></div><main')))
+    assert 'image missing text alternative' in violations(Page(landing.replace('<main', '<img src="missing.svg"><main')))
+    print(json.dumps({'semantic_checks': 'passed for both pages', 'internal_assets_and_links': internal,
+                      'palette_contrast_pairs': len(pairs), 'trace_steps': 4, 'reduced_motion': 'CSS policy checked',
+                      'negative_regressions_rejected': 3}, indent=2))
 
 
 if __name__ == '__main__':

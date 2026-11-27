@@ -1,0 +1,181 @@
+.simulator-page {
+  padding-block: clamp(2.5rem, 5vw, 5rem);
+}
+
+.simulator-intro {
+  max-width: 65ch;
+  margin-block: 1rem 1.75rem;
+  color: var(--muted);
+}
+
+.simulator {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  overflow: hidden;
+}
+
+.simulation-banner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  padding: 0.9rem 1.25rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper-deep);
+}
+
+.simulation-banner span { color: var(--muted); }
+
+.simulator-body {
+  display: grid;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+}
+
+.explorer-controls, .explorer-result { padding: clamp(1rem, 3vw, 2rem); }
+
+.explorer-controls { border-right: 1px solid var(--line); }
+
+.explorer-controls fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.explorer-controls fieldset + fieldset { margin-top: 1.5rem; }
+
+.explorer-controls legend {
+  margin-bottom: 0.75rem;
+  font-weight: 650;
+}
+
+.control-field label, .range-label {
+  display: block;
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.control-field select {
+  width: 100%;
+  min-height: 44px;
+  margin-top: 0.25rem;
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--muted);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.control-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.device-control {
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.device-control + .device-control { margin-top: 0.5rem; }
+
+.device-control > div, .result-topline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.85rem;
+}
+
+.toggle-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 44px;
+  font-size: 0.875rem;
+  font-weight: 650;
+}
+
+.toggle-label input {
+  width: 1.125rem;
+  height: 1.125rem;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.device-control output, .mono, .stage-range, .stage-memory {
+  color: var(--muted);
+  font: 0.8125rem/1.5 var(--mono);
+}
+
+.device-control input[type="range"] {
+  width: 100%;
+  min-height: 28px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.result-topline {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.explorer-result h3 {
+  margin-block: 0.8rem 1rem;
+  font-size: clamp(1.3rem, 2.7vw, 2rem);
+  font-weight: 650;
+  line-height: 1.15;
+  letter-spacing: -0.045em;
+}
+
+.route-stages {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr));
+  gap: 0.55rem;
+  margin: 0 0 1rem;
+  padding: 0;
+  list-style: none;
+}
+
+.route-stages li {
+  display: grid;
+  align-content: start;
+  gap: 0.35rem;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-top: 2px solid var(--accent);
+  background: var(--paper-deep);
+}
+
+.route-stages meter { width: 100%; }
+.route-stages small { color: var(--muted); }
+
+.estimate, .empty-state { font-weight: 650; }
+.muted { color: var(--muted); }
+#route-output p + p, .math-details p + p { margin-top: 0.65rem; }
+
+.math-details {
+  margin-top: 1rem;
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--line);
+}
+
+.math-details summary {
+  padding-block: 0.5rem;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.math-details p {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+@media (max-width: 46rem) {
+  .simulator-body { grid-template-columns: 1fr; }
+
+  .explorer-controls {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+}

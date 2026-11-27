@@ -1,5 +1,4 @@
 import { chooseRoute, defaultDevices, MiB } from './simulator.mjs';
-document.documentElement.classList.add('js');
 const form = document.querySelector('#explorer-form');
 form.querySelectorAll('fieldset').forEach(fieldset => { fieldset.disabled = false; });
 const status = document.querySelector('#route-status');
@@ -33,9 +32,8 @@ function update() {
   status.textContent = labels[route.kind];
   const stages = document.createElement('ol');
   stages.className = 'route-stages';
-  route.placements.forEach((device, index) => {
+  route.placements.forEach(device => {
     const stage = document.createElement('li');
-    stage.style.setProperty('--stage-color', ['#b9adff', '#a4d7d2', '#e9c4a1'][index]);
     stage.append(text('strong', device.label));
     stage.append(text('span', device.end > device.start ? `Layers ${device.start}–${device.end - 1}` : 'Coordinator · no layers', 'stage-range'));
     stage.append(text('span', `${formatGiB(device.bytes)} / ${device.budgetGiB} GiB`, 'stage-memory'));
@@ -56,33 +54,3 @@ function update() {
 form.addEventListener('input', update);
 form.addEventListener('change', update);
 update();
-
-const menu = document.querySelector('#menu-toggle');
-const navigation = document.querySelector('#main-nav');
-menu.addEventListener('click', () => {
-  const expanded = menu.getAttribute('aria-expanded') !== 'true';
-  menu.setAttribute('aria-expanded', String(expanded));
-  navigation.classList.toggle('is-open', expanded);
-});
-navigation.querySelectorAll('a').forEach(link => link.addEventListener('click', () => {
-  menu.setAttribute('aria-expanded', 'false');
-  navigation.classList.remove('is-open');
-}));
-document.addEventListener('keydown', event => {
-  if (event.key === 'Escape' && menu.getAttribute('aria-expanded') === 'true') {
-    menu.setAttribute('aria-expanded', 'false');
-    navigation.classList.remove('is-open');
-    menu.focus();
-  }
-});
-
-const copy = document.querySelector('#copy-command');
-copy.disabled = false;
-copy.addEventListener('click', async () => {
-  try {
-    await navigator.clipboard.writeText(document.querySelector('#build-command').textContent);
-    document.querySelector('#copy-status').textContent = 'Build commands copied.';
-  } catch {
-    document.querySelector('#copy-status').textContent = 'Clipboard unavailable. Select the commands to copy them.';
-  }
-});
